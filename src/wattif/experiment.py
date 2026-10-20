@@ -11,7 +11,7 @@ every record with the running arms (from the state file below); the battery
 panel's Experiments tab fits all settings' effects together (report.lever_effects).
 
     wattif experiment list | units | status
-    wattif experiment enable | disable          (automatic experiments, see `automatic`; disable = stock values)
+    wattif experiment enable | disable          (automatic experiments, see `automatic`; disable puts back what they changed)
     wattif experiment pool [<name> ...] [--risky]        (the settings they may vary)
     wattif experiment pool add|remove <name> ... [--risky]
     wattif experiment quarantine | release <name> ... | release all   (settings the watchdog took out)
@@ -26,13 +26,17 @@ panel's Experiments tab fits all settings' effects together (report.lever_effect
     wattif experiment run | auto   (the wattif experiment / wattif experiments service bodies)
 
 catalog() offers only the settings this machine has (PROBES: the kernel's
-files, power-profiles-daemon, the compositor, the throttle unit). Stock values
-are declarative (`Setting.baseline`), never captured from the live state while
-a change of wattif experiment's holds the setting: the kernel command line's
-ASPM policy and APST limit, GPU DPM auto, no CPU cap, Wi-Fi power saving on, no
-app throttle, boost as the profile leaves it, and config [stock]'s profile and
-ABM per power source; your own profile, and ABM where config leaves it as
-found, are captured only while nothing of wattif experiment's holds them.
+files, power-profiles-daemon, the compositor, the throttle unit) and can change
+(root ones only while the root helper can be used: helper_usable). wattif never
+leaves a setting other than it found it. A setting's stock value
+(`Setting.baseline`, per power source) is config [stock]'s where you set one, the
+kernel command line's where it says (ASPM's policy, the APST limit), boost as
+the profile leaves it where power-profiles-daemon sets it with the profile, and
+otherwise what the setting was found at in this boot before wattif experiment
+first changed it: read and saved then (note_found), and never taken from a
+value of its own (found). Only where none of those exists is it a guess (each
+says so). Restores of everything (`disable`, `restore --stock`, the watchdog)
+touch only what it changed in this boot or still holds (stock_names).
 
 Risky settings (config [experiments] risky; by default PCIe ASPM, NVMe APST and
 GPU DPM, which touch the links and the data fabric that died awake three times
@@ -83,6 +87,7 @@ import sys
 import time
 from pathlib import Path
 
+from . import compositor as desktops  # experiment.compositor() below is the refresh rate's.
 from . import config
 from . import qol
 from . import throttle
@@ -106,8 +111,38 @@ STATE = RUNTIME / 'experiment.json'
 REQUEST = RUNTIME / 'experiment-request.json'
 LOCK = RUNTIME / 'experiment.lock'  # Held by whoever changes settings (see `ownership`).
 SOURCE = RUNTIME / 'power-source.json'  # reconcile's view of AC/battery, and when it last changed.
+PROBE = RUNTIME / 'helper.json'  # helper_usable()'s last answer, for this boot.
+
+
+def listed(section, key):
+    """config [section] key as a list of strings: a string alone is one item, never
+    its characters ("steam" would be s, t, e, a, m)."""
+    value = config.get(section, key)
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value]
+    print(f'wattif experiment: config [{section}] {key}: expected a list, not {value!r}; ignoring it',
+          file=sys.stderr)
+    return []
+
+
+def helper_command():
+    """config [helper] command as argv, and what is wrong with it (None: nothing). It
+    must be a list of words: a string is refused, not run as one word or split
+    (no helper then, so the root settings are left out)."""
+    value = config.get('helper', 'command')
+    if isinstance(value, (list, tuple)) and value and all(isinstance(word, str) and word for word in value):
+        return list(value), None
+    why = f'config [helper] command must be a list of words, like ["sudo", "-n", "wattif-helper"], not {value!r}'
+    print(f'wattif experiment: {why}; the root settings are left out', file=sys.stderr)
+    return [], why
+
+
 # The root helper (helper/wattif-helper), as its sudo rule allows it: config [helper] command.
-HELPER = list(config.get('helper', 'command'))
+HELPER, HELPER_PROBLEM = helper_command()
 BUSY_EXIT = 75  # The helper: suspending (its sleep-safe holds), or another change holds its lock.
 SYS = Path('/sys')
 PROC = Path('/proc')
@@ -115,7 +150,7 @@ CMDLINE = Path('/proc/cmdline')
 
 # Settings that can upset some hardware (config [experiments] risky; by default
 # the PCIe links, the SSD's power states and the GPU's and data fabric's clocks).
-RISKY = tuple(config.get('experiments', 'risky') or ())
+RISKY = tuple(listed('experiments', 'risky'))
 RISKY_HOLD = 45 * 60  # s a risky setting keeps a value once changed.
 RISKY_DAILY = 8  # Changes of one risky setting a day (both ways; going back to stock is never refused).
 RESUME_SETTLE = 60  # s after resume without any change (the hooks and the Wi-Fi module settle).
@@ -147,7 +182,43 @@ def run(command, check=True, timeout=15):
 
 def lab(*args):
     """`sudo -n wattif-helper <args>`."""
-    return run(HELPER + list(args), timeout=LAB_TIMEOUT)
+    if not HELPER:
+        raise RuntimeError(HELPER_PROBLEM)
+    try:
+        return run(HELPER + list(args), timeout=LAB_TIMEOUT)
+    except Busy:
+        raise
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        PROBE.unlink(missing_ok=True)  # helper_usable asks again: its sudo rule may be gone.
+        raise
+
+
+HELPER_NEEDED = "root settings need wattif-helper's sudo rule; see the README"
+PROBE_AGAIN = 600  # s before a helper that couldn't be used is asked again (a new sudo rule is noticed).
+
+
+def helper_usable():
+    """Whether the root helper runs for us: `<config [helper] command> status`
+    exits 0 (without its sudo rule `sudo -n` refuses at once rather than ask for a
+    password, and without the helper sudo can't find it). Without it the root
+    settings would only fail and back off, so catalog() leaves them out. Asked
+    once a boot while it can be used (until a helper call fails), every
+    PROBE_AGAIN while it can't: PROBE keeps the answer across processes, so the
+    reconciler's every minute doesn't put a sudo call in the log each time."""
+    if not HELPER:
+        return False
+    now, saved = time.time(), load_json(PROBE)
+    if (saved.get('boot') == boot_id() and saved.get('command') == HELPER and isinstance(saved.get('usable'), bool)
+            and (saved['usable'] or 0 <= now - (saved.get('at') or 0) < PROBE_AGAIN)):
+        return saved['usable']
+    try:
+        run(HELPER + ['status'], timeout=10)
+        usable = True
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        usable = False
+    with contextlib.suppress(OSError):
+        write_state({'boot': boot_id(), 'command': HELPER, 'usable': usable, 'at': now}, PROBE)
+    return usable
 
 
 def systemctl_wait(*args, check=False):
@@ -293,6 +364,18 @@ def apst_paths():
     return sorted(SYS.glob('class/nvme/nvme*/power/pm_qos_latency_tolerance_us'))
 
 
+def apst_get():
+    paths = apst_paths()
+    return read(paths[0]) if paths else None
+
+
+def apst_boot():
+    """nvme_core's default_ps_max_latency_us: the APST limit every drive started this
+    boot with, from the kernel command line or modprobe.d (`options nvme_core
+    default_ps_max_latency_us=0`, a common workaround for SSDs that crash in APST)."""
+    return read(SYS / 'module/nvme_core/parameters/default_ps_max_latency_us')
+
+
 def cgroup(unit):
     return user_slice() / 'app.slice' / unit
 
@@ -315,7 +398,7 @@ def cpu_usec(unit):
 
 def freeze_keep():
     """config [experiments] freeze_keep: scope patterns "Close every app" leaves running."""
-    return [str(pattern) for pattern in config.get('experiments', 'freeze_keep') or ()]
+    return listed('experiments', 'freeze_keep')
 
 
 def freeze_targets(keep):
@@ -412,7 +495,7 @@ def psr_arm():
 class Setting:
     def __init__(self, name, label, description, get, set, alternative, root=False, visible='',
                  sleep_restored=False, unit=None, ac_managed=False, units=None, levels=None, baseline=None,
-                 reset=None):
+                 reset=None, as_found=False):
         self.name, self.label, self.description = name, label, description
         self.get, self.set, self.alternative = get, set, alternative
         # () → (power-saving value, normal value), for `apply name=saving|normal`.
@@ -422,11 +505,14 @@ class Setting:
         # never fight it while plugged in.
         self.ac_managed = ac_managed
         self.units = units
-        # (on_battery) → the stock value restores go back to: declarative, never the live value.
+        # (on_battery) → the stock value restores go back to (never a value of wattif's own).
         self.baseline = baseline
         # (stock value, None while unknown) → None: puts the stock value back another
         # way than set() (ABM as found: the system's power_supply udev rules).
         self.reset = reset
+        # Whether the baseline is (partly) as found: change() saves the value before
+        # wattif experiment's first change in a boot (note_found).
+        self.as_found = as_found
 
     def read(self):
         """The current value, or None while the setting is unavailable (no Wi-Fi
@@ -454,38 +540,83 @@ def command_exists(name):
 
 def stock_value(key, on_battery):
     """config [stock] `key` for this power source (a battery/ac table, or one value
-    for both); None: as found."""
+    for both); None (or "found", as TOML has no null): as found."""
     value = config.get('stock', key)
-    return value.get('battery' if on_battery else 'ac') if isinstance(value, dict) else value
+    value = value.get('battery' if on_battery else 'ac') if isinstance(value, dict) else value
+    return None if value == 'found' else value
 
 
-def held(name):
-    """Whether something of wattif experiment's holds `name`: an applied value, or a
-    change of this boot not yet put back (a run's, a crashed run's)."""
-    return name in (load_applied().get('values') or {}) or name in leftovers(Ledger())
+def touched(name):
+    """Whether wattif experiment changed `name` in this boot (the ledger's): from
+    then on its value may be wattif's own, never to be taken as found."""
+    return name in Ledger().last_values(boot_id())
 
 
-def found(name, on, read_now):
-    """`name`'s value as found on power source `on` (battery or not) before wattif
-    experiment changed it: saved (POOL's 'found'), else read now while nothing of
-    wattif experiment's holds it and the machine is on that source. None until then."""
-    saved = (preferences().get('found') or {}).get(name)
-    value = saved.get('battery' if on else 'ac') if isinstance(saved, dict) else None
-    if value is not None:
-        return value
-    if bool(on) != on_battery() or held(name):
-        return None
-    return remember_found(name, on, read_now())
+def source_key(on):
+    return 'battery' if on else 'ac'
+
+
+def boot_found(prefs=None):
+    """{name: {'battery'|'ac': value}}: what settings were found at in this boot,
+    on each power source, before wattif experiment first changed them."""
+    record = (prefs if prefs is not None else preferences()).get('boot_found')
+    if isinstance(record, dict) and record.get('boot') == boot_id() and isinstance(record.get('values'), dict):
+        return record['values']
+    return {}
+
+
+def found(name, on, read_now, across=True, live=True):
+    """`name`'s value on power source `on` (battery or not) as wattif experiment
+    found it: (`live`) read now while it has changed nothing of it in this boot and
+    the machine is on that source; else as saved in this boot before its first
+    change (note_found) or while it hadn't changed it (capture_profile); else what
+    an earlier boot found on that source; else, with `across` (a setting nothing
+    need switch with the power source), what this boot found on the other one.
+    None until seen."""
+    key = source_key(on)
+    if live and bool(on) == on_battery() and not touched(name):
+        try:
+            value = read_now()
+        except Exception:  # noqa: BLE001 - unavailable now (power-profiles-daemon restarting, no interface)
+            value = None
+        if value is not None:
+            return value
+    here = boot_found().get(name) or {}
+    if here.get(key) is not None:
+        return here[key]
+    earlier = (preferences().get('found') or {}).get(name)
+    if isinstance(earlier, dict) and earlier.get(key) is not None:
+        return earlier[key]
+    return here.get(source_key(not on)) if across else None
 
 
 def remember_found(name, on, value):
-    if value is not None:
-        key = 'battery' if on else 'ac'
-        saved = (preferences().get('found') or {}).get(name)
-        if not isinstance(saved, dict) or saved.get(key) != value:
-            update_preferences(lambda prefs: prefs.update(found=dict(
-                prefs.get('found') or {}, **{name: dict((prefs.get('found') or {}).get(name) or {}, **{key: value})})))
+    """Save `value` as what `name` was found at on power source `on`: for this boot,
+    and as the last found there (POOL's 'found': for later boots, until seen)."""
+    if value is None:
+        return value
+    key, boot = source_key(on), boot_id()
+    prefs = preferences()
+    last = (prefs.get('found') or {}).get(name)
+    if (boot_found(prefs).get(name) or {}).get(key) == value and isinstance(last, dict) and last.get(key) == value:
+        return value
+
+    def update(prefs):
+        everything = dict(prefs.get('found') or {})
+        everything[name] = dict(everything.get(name) or {}, **{key: value})
+        this_boot = dict(boot_found(prefs))
+        this_boot[name] = dict(this_boot.get(name) or {}, **{key: value})
+        prefs.update(found=everything, boot_found={'boot': boot, 'values': this_boot})
+    update_preferences(update)
     return value
+
+
+def note_found(spec):
+    """Before wattif experiment's first change of `spec` in this boot (Setting.as_found
+    ones): its value now, saved as found on this power source. Later changes, and
+    every value of wattif's own, never are."""
+    if spec.as_found and not touched(spec.name):
+        remember_found(spec.name, on_battery(), spec.read())
 
 
 CPUFREQ = SYS / 'devices/system/cpu/cpufreq'
@@ -537,16 +668,21 @@ def profile_set(value):
 PROFILES = ('power-saver', 'balanced', 'performance')
 
 
-def own_profile(on_battery):
-    """Your profile for this power source: captured (capture_profile) only while
-    nothing of wattif experiment's holds it, else config [stock] profile's (what
-    common udev rules set), else balanced (power-profiles-daemon's own default)."""
-    saved = preferences().get('own_profile')
-    value = saved.get('battery' if on_battery else 'ac') if isinstance(saved, dict) else None
+def own_profile(on_battery, live=True):
+    """Your profile for this power source: config [stock] profile's where you set
+    one; else as found (`found`, read now only if `live`: never one of wattif's
+    own; capture_profile and note_found save it), or as captured by an older
+    wattif ('own_profile'); else, a guess, power-saver on battery (what common
+    udev rules set) and balanced on AC (power-profiles-daemon's own default)."""
+    configured = stock_value('profile', on_battery)
+    if configured in PROFILES:
+        return configured
+    value = found('profile', on_battery, profile_get, across=False, live=live)
     if value in PROFILES:
         return value
-    configured = stock_value('profile', on_battery)
-    return configured if configured in PROFILES else 'balanced'
+    saved = preferences().get('own_profile')
+    value = saved.get('battery' if on_battery else 'ac') if isinstance(saved, dict) else None
+    return value if value in PROFILES else 'power-saver' if on_battery else 'balanced'
 
 
 def boost_follows_profile():
@@ -559,28 +695,32 @@ def boost_follows_profile():
 def boost_stock(on=True):
     """config [stock] boost for power source `on`; else what the profile now leaves
     it at (restored before boost) where power-profiles-daemon sets it with the
-    profile (off under power-saver), else on (the kernel's default). Which of
-    those it is, is remembered for battery_stock."""
+    profile (off under power-saver); else as found, and until seen on (a guess:
+    the kernel's default). Whether it follows the profile is remembered for
+    battery_stock."""
     configured = stock_value('boost', on)
     if configured is not None:
         return '1' if int(configured) else '0'
     follows = boost_follows_profile()
     if preferences().get('boost_follows_profile') != follows:
         prefer(boost_follows_profile=follows)
-    return ('0' if profile_get() == 'power-saver' else '1') if follows else '1'
+    if follows:
+        return '0' if profile_get() == 'power-saver' else '1'
+    return found('boost', on, boost_get) or '1'
 
 
 def battery_stock():
     """The profile, ABM and boost as they go back to on battery, from configuration
-    and what was seen before (never a live read): report.own_settings' answer
-    while no battery minute outside experiments says. ABM and boost are left out
-    until seen."""
-    prefs, values = preferences(), {'profile': own_profile(True)}
-    abm, boost, seen = stock_value('abm', True), stock_value('boost', True), (prefs.get('found') or {}).get('abm')
+    and what was found and saved there (never a live read, never a value of
+    wattif's own): report.own_settings' answer while no battery minute outside
+    experiments says. ABM and boost are left out until seen."""
+    prefs, values = preferences(), {'profile': own_profile(True, live=False)}
+    abm, boost = stock_value('abm', True), stock_value('boost', True)
+    seen = found('abm', True, abm_get, across=False, live=False)
     if abm is not None:
         values['abm'] = str(int(abm))
-    elif isinstance(seen, dict) and seen.get('battery') is not None:
-        values['abm'] = seen['battery']
+    elif seen is not None:
+        values['abm'] = seen
     if boost is not None:
         values['boost'] = '1' if int(boost) else '0'
     elif isinstance(prefs.get('boost_follows_profile'), bool):  # As boost_stock found it.
@@ -611,7 +751,7 @@ def wifi_stock(on_battery, interface):
             return run(['iw', 'dev', interface, 'get', 'power_save']).split(':')[-1].strip() or None
         except (OSError, RuntimeError, subprocess.SubprocessError):  # The interface is gone, iw missing.
             return None
-    return found('wifi-ps', on_battery, read_now) or 'on'
+    return found('wifi-ps', on_battery, read_now) or 'on'  # Until seen: a guess (most drivers' default).
 
 
 def abm_stock(on_battery):
@@ -622,7 +762,7 @@ def abm_stock(on_battery):
         if not 0 <= int(configured) <= 4:
             raise ValueError(f'config [stock] abm: {configured} is not 0-4')
         return str(int(configured))
-    return found('abm', on_battery, abm_get)
+    return found('abm', on_battery, abm_get, across=False)  # udev rules often set it per source.
 
 
 def abm_reset(target=None):
@@ -670,6 +810,12 @@ THROTTLE_UNIT = config.UNITS['throttle']
 
 def throttle_get():
     return 'on' if run(['systemctl', '--user', 'is-active', THROTTLE_UNIT], check=False) == 'active' else 'off'
+
+
+def throttle_followable():
+    """Whether wattif throttle can follow this session's windows: compositor.detect()
+    finds a backend (niri, sway). Elsewhere it caps nothing, so there is nothing to test."""
+    return desktops.detect().command is not None
 
 
 def unit_loaded(unit):
@@ -741,7 +887,7 @@ PROBES = {
     'profile': lambda: profile_available(),
     'gpu-dpm': lambda: bool(gpu_dpm_paths()),
     'cpu-cap': lambda: cpu_cap_available(),
-    'throttle-apps': lambda: unit_loaded(THROTTLE_UNIT),
+    'throttle-apps': lambda: unit_loaded(THROTTLE_UNIT) and throttle_followable(),
     'refresh': lambda: refresh_available(),
     'wifi-ps': lambda: wifi_available(),
 }
@@ -764,54 +910,67 @@ SUSPEND_NOTE = ('where the kernel command line sets it (often a workaround for c
                 'back for every suspend and it is set again a minute after resume.')
 
 
+class Catalog(dict):
+    """catalog()'s settings by name, and in `missing` those this machine has but
+    can't change now: {name: (Setting, why)}."""
+    missing = {}
+
+
 def catalog(unit=None, units=None):
-    """Experiment specs of the settings this machine has (available); `unit` / `units`
-    parameterize the wattif freeze experiments."""
+    """Experiment specs of the settings this machine has (available) and can change:
+    root ones only while the root helper can be used (helper_usable; the others
+    are in the result's `missing`). `unit` / `units` parameterize the wattif
+    freeze experiments."""
     wifi = wifi_interface()
     abm_found = stock_value('abm', True) is None or stock_value('abm', False) is None
     specs = [
         Setting('aspm', 'PCIe link power saving (ASPM)',
-                'Lets PCIe links (NVMe, Wi-Fi, GPU) sleep. Stock: pcie_aspm.policy, else the kernel\'s default; '
-                + SUSPEND_NOTE + risky_note('aspm'),
+                'Lets PCIe links (NVMe, Wi-Fi, GPU) sleep. Stock: pcie_aspm.policy, else as found (TLP, say, '
+                'may set it per power source); ' + SUSPEND_NOTE + risky_note('aspm'),
                 aspm_get, lambda v: lab('aspm', v),
                 lambda cur: 'powersupersave' if cur != 'powersupersave' else 'performance',
-                root=True, sleep_restored=True, levels=lambda: ('powersupersave', 'performance'),
-                baseline=lambda on: cmdline_param('pcie_aspm.policy') or 'default'),
+                root=True, sleep_restored=True, levels=lambda: ('powersupersave', 'performance'), as_found=True,
+                # Never seen (a change logged before wattif saved what it found): a guess, the
+                # kernel's usual build default.
+                baseline=lambda on: cmdline_param('pcie_aspm.policy') or found('aspm', on, aspm_get) or 'default'),
         Setting('apst', 'NVMe autonomous power states (APST)',
-                'Lets the SSD drop into low-power states when idle. Stock: nvme_core.default_ps_max_latency_us, '
-                f'else {APST_DEFAULT} µs; ' + SUSPEND_NOTE + risky_note('apst'),
-                lambda: read(apst_paths()[0]) if apst_paths() else None,
-                lambda v: lab('apst', v),
+                'Lets the SSD drop into low-power states when idle. Stock: nvme_core.default_ps_max_latency_us '
+                'on the kernel command line, else as found, else as the drives started (modprobe.d may set it); '
+                + SUSPEND_NOTE + risky_note('apst'),
+                apst_get, lambda v: lab('apst', v),
                 lambda cur: APST_DEFAULT if cur == '0' else '0', root=True, sleep_restored=True,
-                levels=lambda: (APST_DEFAULT, '0'),
-                baseline=lambda on: cmdline_param('nvme_core.default_ps_max_latency_us') or APST_DEFAULT),
+                levels=lambda: (APST_DEFAULT, '0'), as_found=True,
+                # Without nvme_core's parameter to read: a guess, its default.
+                baseline=lambda on: (cmdline_param('nvme_core.default_ps_max_latency_us') or found('apst', on, apst_get)
+                                     or apst_boot() or APST_DEFAULT)),
         Setting('boost', 'CPU boost', 'Clocks above base frequency for short bursts.' + risky_note('boost'),
                 boost_get, lambda v: lab('boost', v),
                 lambda cur: '0' if cur == '1' else '1', root=True, visible='Bursty work gets slower.',
-                levels=lambda: ('0', '1'), baseline=boost_stock),
+                levels=lambda: ('0', '1'), baseline=boost_stock, as_found=True),
         Setting('abm', 'Panel adaptive backlight (ABM)',
                 'Dims the backlight and boosts pixel values to compensate.' + risky_note('abm'),
                 abm_get, lambda v: lab('abm', v),
                 lambda cur: '0' if cur not in (None, '0') else '3', root=True, visible='Slight contrast change.',
                 ac_managed=stock_value('abm', False) is None, levels=lambda: ('3', '0'), baseline=abm_stock,
-                reset=abm_restore if abm_found else None),
+                reset=abm_restore if abm_found else None, as_found=True),
         Setting('profile', 'Power profile', 'power-profiles-daemon profile (platform profile and EPP).'
                 + risky_note('profile'),
                 profile_get, profile_set,
                 lambda cur: 'balanced' if cur == 'power-saver' else 'power-saver',
                 visible='Responsiveness changes.', ac_managed=stock_value('profile', False) is None,
-                levels=lambda: ('power-saver', 'balanced'), baseline=own_profile),
+                levels=lambda: ('power-saver', 'balanced'), baseline=own_profile, as_found=True),
         Setting('gpu-dpm', 'GPU and memory clocks', 'amdgpu DPM low: pins the GPU, memory and fabric clocks at '
                 'their lowest (on a Framework 13 (Ryzen 7040) the fabric otherwise idles at 1600 MHz).'
                 + risky_note('gpu-dpm'),
                 gpu_dpm_get, lambda v: lab('gpudpm', v),
                 lambda cur: 'low' if cur != 'low' else 'auto', root=True,
                 visible='Video, WebGL and memory-heavy work get slower.', levels=lambda: ('low', 'auto'),
-                baseline=lambda on: 'auto'),
+                as_found=True, baseline=lambda on: found('gpu-dpm', on, gpu_dpm_get) or 'auto'),  # Unseen: the driver's.
         Setting('cpu-cap', 'CPU frequency cap', cpu_cap_text() + risky_note('cpu-cap'),
                 cpu_cap_get, lambda v: lab('cpucap', v),
                 lambda cur: CPU_CAP if cur == 'none' else 'none', root=True,
-                visible='Bursty work gets slower.', levels=lambda: (CPU_CAP, 'none'), baseline=lambda on: 'none'),
+                visible='Bursty work gets slower.', levels=lambda: (CPU_CAP, 'none'), as_found=True,
+                baseline=lambda on: found('cpu-cap', on, cpu_cap_get) or 'none'),  # Unseen: a guess, no cap.
         Setting('throttle-apps', 'Throttle background apps',
                 f'Caps every app but the focused one at {throttle.QUOTA}% of a core while on battery (wattif throttle); '
                 'apps playing or recording audio or video, terminals, editors, the input method and those in '
@@ -819,11 +978,13 @@ def catalog(unit=None, units=None):
                 throttle_get, lambda v: run(['systemctl', '--user', 'start' if v == 'on' else 'stop', THROTTLE_UNIT]),
                 lambda cur: 'off' if cur == 'on' else 'on',
                 visible='Background apps update slowly until you switch to them.', levels=lambda: ('on', 'off'),
-                baseline=lambda on: 'off'),
+                as_found=True, baseline=lambda on: found('throttle-apps', on, throttle_get) or 'off'),  # Unseen: off.
         Setting('refresh', 'Display refresh rate', 'Lower internal-panel refresh rate.' + risky_note('refresh'),
                 refresh_get, refresh_set,
                 refresh_alternative, visible='Motion looks slightly less smooth.', levels=refresh_levels,
-                baseline=lambda on: refresh_levels()[1]),
+                # The mode you use, not the highest: a 120 Hz panel you run at 60 Hz stays at 60.
+                # Only never seen (a change logged before wattif saved it) is the highest a guess.
+                as_found=True, baseline=lambda on: found('refresh', on, refresh_get) or refresh_levels()[1]),
     ]
     if wifi:
         specs.append(Setting(
@@ -831,7 +992,7 @@ def catalog(unit=None, units=None):
             lambda: run(['iw', 'dev', wifi, 'get', 'power_save']).split(':')[-1].strip(),  # Raises while gone.
             lambda v: lab('wifips', v),
             lambda cur: 'off' if cur == 'on' else 'on', root=True, visible='Network latency changes.',
-            levels=lambda: ('on', 'off'), baseline=lambda on: wifi_stock(on, wifi)))
+            levels=lambda: ('on', 'off'), baseline=lambda on: wifi_stock(on, wifi), as_found=True))
     if unit:
         specs.append(Setting(
             'freeze', f'Close {unit_label(unit)}', 'Freezes the app (cgroup freezer) to measure its cost.',
@@ -846,7 +1007,28 @@ def catalog(unit=None, units=None):
             'and the difference is what the apps cost in the background.',
             lambda: freeze_all_get(units), lambda v: freeze_all_set(units, v), lambda cur: 'frozen',
             visible='Only runs while the screen is locked.', units=units, baseline=lambda on: 'running'))
-    return {spec.name: spec for spec in specs if available(spec.name)}
+    offered, missing = Catalog(), {}
+    for spec in specs:
+        if not available(spec.name):
+            continue
+        if spec.root and not helper_usable():
+            missing[spec.name] = (spec, HELPER_PROBLEM or HELPER_NEEDED)
+        else:
+            offered[spec.name] = spec
+    offered.missing = missing
+    return offered
+
+
+def listing(specs):
+    """`wattif experiment list`'s and the panel's rows: describe() of every setting in
+    `specs` (a catalog()), then those it left out (its `missing`), with why as their error."""
+    rows = [describe(spec) for spec in specs.values()]
+    for spec, why in getattr(specs, 'missing', {}).values():
+        rows.append({'name': spec.name, 'label': spec.label, 'description': spec.description, 'root': spec.root,
+                     'visible': spec.visible, 'sleep_restored': spec.sleep_restored, 'ac_managed': spec.ac_managed,
+                     'current': None, 'alternative': None, 'saving': None, 'normal': None, 'error': why,
+                     'risky': spec.name in RISKY, 'quarantined': None, 'stock': None})
+    return rows
 
 
 def unit_label(unit):
@@ -897,7 +1079,7 @@ def screen_locked():
 
 
 def locker_running():
-    names = {str(name)[:15] for name in config.get('session', 'lockers') or ()}  # comm keeps 15 characters.
+    names = {name[:15] for name in listed('session', 'lockers')}  # comm keeps 15 characters.
     for comm in PROC.glob('[0-9]*/comm') if names else ():
         try:
             if comm.read_text().strip() in names:
@@ -1297,14 +1479,20 @@ def seen():
 
 
 def stock_names(specs, ledger):
-    """What `disable` and the watchdog put back: every power setting, and the refresh
-    rate (a display preference) only while a change of wattif experiment's holds it."""
-    ours = set(leftovers(ledger))
-    return [name for name, spec in specs.items() if spec.baseline is not None and (name != 'refresh' or name in ours)]
+    """What `disable`, `restore --stock` and the watchdog put back: only settings
+    wattif experiment changed in this boot or still holds (its applied values, the
+    ledger's leftovers), never one it didn't touch (TLP's ASPM, a modprobe.d APST
+    limit, your profile), and the refresh rate (a display preference) only while
+    held."""
+    holds = set(leftovers(ledger)) | set(load_applied().get('values') or {})
+    changed = set(ledger.last_values(boot_id()))
+    return [name for name, spec in specs.items() if spec.baseline is not None
+            and (name in holds or (name in changed and name != 'refresh'))]
 
 
 def trip(found, specs, battery, ledger, restore=True):
-    """The incident brake: every setting back to stock and a notification; the run
+    """The incident brake: every setting wattif experiment changed back to stock
+    (stock_names) and a notification; the run
     that trips it stops. For an incident that may be a setting's doing (the
     kernel's, or a crash reset while awake) also: the suspects (changed in the
     QUARANTINE_WINDOW before it, or off stock at it) quarantined until `release`,
@@ -1376,7 +1564,9 @@ def settled(spec, value):
 
 def change(spec, value, ledger, by):
     """Log, set `spec` to `value` and read it back. The attempt is logged first: one
-    that fails half-way still counts (risky limits, suspects, leftovers)."""
+    that fails half-way still counts (risky limits, suspects, leftovers). Before the
+    first in this boot, what `spec` was is saved as found (note_found)."""
+    note_found(spec)
     if ledger:
         ledger.change(spec.name, value, value == spec.stock_or_none(True), by)
     spec.set(value)
@@ -1384,12 +1574,20 @@ def change(spec, value, ledger, by):
         raise RuntimeError(f'reads {now!r} after setting {value!r}')
 
 
+def still_ours(spec, ledger):
+    """Whether `spec` still reads what wattif experiment last set it to in this boot,
+    off stock: nothing (a udev rule on plugging in, you) has set it since."""
+    last = ledger.last_values(boot_id()).get(spec.name) if ledger else None
+    return bool(last) and last.get('stock') is not True and last.get('value') == spec.read()
+
+
 def restore_settings(specs, names, battery, ledger=None, by='restore', captured=None, patient=False):
     """Put `names` back to their stock values, each on its own, reading every one
     back. {name: why} for those not verified (restore-pending; retried later).
     `patient` (retries: the runner's pauses, the reconciler) skips a setting whose
     last restores failed until its backoff has passed, so a broken one is not
-    written every few seconds."""
+    written every few seconds. On AC, settings the system sets when plugged in
+    (ac_managed) are left to it, unless a value of wattif's is still there."""
     pending, on = {}, battery()
     for name in sorted(dict.fromkeys(names), key=restore_rank):
         spec = specs.get(name)
@@ -1399,17 +1597,25 @@ def restore_settings(specs, names, battery, ledger=None, by='restore', captured=
         if patient and ledger and not ledger.due(name, ledger.clock()):
             pending[name] = 'backing off after failed restores'
             continue
-        if spec.ac_managed and not on:
-            continue  # The system applied the AC value.
+        managed = spec.ac_managed and not on
+        if managed and not still_ours(spec, ledger):
+            continue  # The system applied its AC value (or you set one since).
         attempted, target = False, None
         try:
-            target = spec.stock(on) if spec.baseline is not None else (captured or {}).get(name)
+            if managed:  # Nothing switched it when plugged in: back to what was found on AC, else on
+                # battery (where nothing switches it with the source, that is its value on both).
+                target = found(name, False, lambda: None)
+                if target is None:
+                    continue
+            else:
+                target = spec.stock(on) if spec.baseline is not None else (captured or {}).get(name)
             if target is None and not spec.reset:
                 raise RuntimeError('no stock value')
             now = spec.read()
             if now != target or target is None:
                 if now is None:
                     raise RuntimeError('unavailable')
+                note_found(spec)  # A restore can be the first change in this boot (to config's value, say).
                 attempted = True
                 if target is None:  # As found, but never seen: what the system's own policy (its reset) sets.
                     spec.reset(None)
@@ -1674,9 +1880,30 @@ def next_block(names, present, run=None):
                             'combinations': plan['combinations'], 'value': plan.get('value')}
 
 
+APPLY_STATES = ('saving', 'normal')  # `apply name=saving|normal`: a setting's power-saving or normal state.
+
+
+def has_state(spec, value, state):
+    """Whether `value` of `spec` is in `state` ('saving' or 'normal') as the
+    recommendations judge it (report.saving: ABM 1 is saving as much as 3, the
+    performance profile is as normal as balanced). False when that can't be said."""
+    if value is None or state not in APPLY_STATES:
+        return False
+    try:
+        levels = spec.levels() if spec.levels else ()
+        if value in levels:  # The level values themselves: exactly their own state.
+            return levels.index(value) == APPLY_STATES.index(state)
+        from . import report  # numpy: only once a value needs judging.
+        top = float(refresh_levels()[1].rpartition('@')[2]) if spec.name == 'refresh' else None
+        return report.saving(spec.name, value, top) == (state == 'saving')
+    except Exception:  # noqa: BLE001 - unknown: set it as asked
+        return False
+
+
 def recommended_values(specs, names, chosen=None, recommend=None):
     """The goal's best combination (recommend.json's) as the values of `names`
-    it covers."""
+    it covers. A setting whose stock value already has the state asked for keeps
+    it (what the recommendation calls leaving it as it is)."""
     entry = ((recommend or recommendation)() or {}).get(chosen or goal()) or {}
     values = {}
     for assignment in entry.get('apply') or []:
@@ -1684,6 +1911,9 @@ def recommended_values(specs, names, chosen=None, recommend=None):
         if name in names and name in specs and specs[name].levels:
             levels = specs[name].levels()
             values[name] = levels[0] if value == 'saving' else levels[1] if value == 'normal' else value
+            stock = specs[name].stock_or_none(True)
+            if value in APPLY_STATES and stock is not None and has_state(specs[name], stock, value):
+                values[name] = stock
     return values
 
 
@@ -1771,7 +2001,7 @@ def automatic(specs=None, clock=Clock, battery=on_battery, locked=screen_locked,
     ledger.start('auto')
     try:
         if clean:
-            capture_profile(battery, now=clock.time())
+            capture_profile(battery, now=clock.time(), specs=specs)
         # The pool's settings and whatever an earlier run left start at stock.
         applied = load_applied().get('values') or {}
         current = names(specs)
@@ -1947,7 +2177,8 @@ def load_state(path=None):
 
 
 def command_restore(battery=on_battery, ledger=None, state_path=None, stock=False, patient=False):
-    """Put back what a run left: its settings (all of them with `stock`) to stock.
+    """Put back what a run left: its settings (with `stock` also everything else
+    wattif experiment changed in this boot: stock_names) to stock.
     A run that could not restore everything says 'restore-pending'; this retries it
     (ExecStopPost, the next run, the reconciler: `patient`). Pending settings, if any."""
     ledger = ledger or Ledger()
@@ -1998,15 +2229,26 @@ def not_applied(refused):
         print('wattif experiment: not applied: ' + '; '.join(refused), file=sys.stderr)
 
 
+ALREADY = 'already so, left as they are'
+
+
+def already_so(names):
+    """'wattif experiment: already so, left as they are: name; name' on stderr: the
+    saving|normal settings apply left alone (panel_data.left_alone parses it)."""
+    if names:
+        print(f"wattif experiment: {ALREADY}: {'; '.join(names)}", file=sys.stderr)
+
+
 def running():
     """Whether a run (manual or automatic) owns the settings, by its state file."""
     return load_state().get('status') in ('running', 'paused')
 
 
 def apply_goal(chosen, now=None, recommend=recommendation, risky=False):
-    """Set `chosen`'s best measured combination — every setting in it, so it holds
-    whatever the settings are now — unless automatic experiments own them. Risky
-    settings stay at stock unless `risky`. The assignments set (None: a run owns them)."""
+    """Set `chosen`'s best measured combination — every setting in it not already in
+    its state, so it holds whatever the settings are now — unless automatic
+    experiments own them. Risky settings stay at stock unless `risky`. The
+    assignments set (None: a run owns them)."""
     if running():
         not_applied([OWNED])
         return None
@@ -2014,8 +2256,9 @@ def apply_goal(chosen, now=None, recommend=recommendation, risky=False):
     assignments = recommend.get(chosen, {}).get('apply')
     if not assignments:
         return []
-    refused = {why.partition(' (')[0] for why in command_apply(assignments, risky=risky) or ()}
-    applied = [a for a in assignments if a.partition('=')[0] not in refused]
+    left = []
+    refused = {why.partition(' (')[0] for why in command_apply(assignments, risky=risky, left=left) or ()}
+    applied = [a for a in assignments if a.partition('=')[0] not in refused | set(left)]
     if recommend.get('computed'):  # Not what the menu or the panel showed: say what it was.
         print(f"wattif experiment: recommend.json was stale, so the {chosen} combination was computed now; "
               f"applied: {', '.join(applied) or 'nothing'}", file=sys.stderr)
@@ -2035,7 +2278,10 @@ def reconcile_applied(specs, battery, ledger, exclude=(), now=None, explicit=Fal
     ones that are not in place (the pre-sleep hook put them back to stock, and
     the post-resume one leaves them there) are set again: never within RESUME_SETTLE of `resumed`
     (the last resume) and only as risky_allowed allows, so a held one is tried
-    again on every call (every minute). Quarantined settings are left out.
+    again on every call (every minute). Quarantined settings are left out. One
+    applied on AC as a state (saving|normal: the record's 'states') is decided
+    when it first takes effect on battery: already in that state (not by
+    wattif's doing), it is left as it is and leaves the record.
     {name: why} for those that failed (retried next time)."""
     record = load_applied()
     if not record:
@@ -2044,6 +2290,7 @@ def reconcile_applied(specs, battery, ledger, exclude=(), now=None, explicit=Fal
     now = now or time.time()
     changed = explicit or record.get('on_battery') != on
     backoff = record.setdefault('failing', {})
+    states = record.setdefault('states', {})
     names = [name for name in record['values'] if name not in exclude
              and (explicit or now >= backoff.get(name, {}).get('until', 0))]
     if not changed:
@@ -2053,10 +2300,11 @@ def reconcile_applied(specs, battery, ledger, exclude=(), now=None, explicit=Fal
                  and specs[name].read() != record['values'][name]]
         if not names:
             return {}
-    failures, skipped, later = {}, [], []
+    failures, skipped, later, already = {}, [], [], []
     if on:
         blocked, allowed = quarantined(), set(record.get('risky') or [])
         settling = resumed is not None and now - resumed < RESUME_SETTLE
+        ours = set(leftovers(ledger)) if states else set()
         for name in risky_last(names):
             spec, value = specs.get(name), record['values'][name]
             if spec is None:
@@ -2065,6 +2313,12 @@ def reconcile_applied(specs, battery, ledger, exclude=(), now=None, explicit=Fal
             current = spec.read()
             if name in blocked or (name in RISKY and name not in allowed):
                 skipped.append(name)
+                continue
+            if (current != value and name in states and name not in ours
+                    and has_state(spec, current, states[name])):
+                record['values'].pop(name)  # Already in the state asked for: left as it is.
+                states.pop(name)
+                already.append(name)
                 continue
             if current != value and name in RISKY and (settling or not risky_allowed(
                     name, current, value, ledger, now, spec.stock_or_none(True), hold=not explicit)):
@@ -2075,13 +2329,18 @@ def reconcile_applied(specs, battery, ledger, exclude=(), now=None, explicit=Fal
                     raise RuntimeError('unavailable')
                 if current != value:
                     change(spec, value, ledger, 'apply')
+                states.pop(name, None)  # Decided: from now on it holds.
             except Exception as error:  # noqa: BLE001 - the rest first
                 failures[name] = str(error)
     else:
         failures = restore_settings(specs, names, battery, ledger, by='apply')
     if changed and (skipped or later):
         print(f"wattif experiment: left at stock for now: {', '.join(skipped + later)}", file=sys.stderr)
+    already_so(already)
     for name in names:
+        if name not in record['values']:
+            backoff.pop(name, None)
+            continue
         if name not in failures:
             backoff.pop(name, None)
             continue
@@ -2100,12 +2359,16 @@ def reconcile_applied(specs, battery, ledger, exclude=(), now=None, explicit=Fal
     return failures
 
 
-def command_apply(assignments, risky=False, specs=None, battery=on_battery, ledger=None, resumed=None):
+def command_apply(assignments, risky=False, specs=None, battery=on_battery, ledger=None, resumed=None, left=None):
     """Set settings (`name=value`, value also saving|normal), e.g. the panel's best
     combination: while on battery, until reboot (reconcile puts them back to stock
-    on AC and sets them again on battery). Risky settings move off stock only with
-    `risky`, quarantined ones not at all, and not within RESUME_SETTLE of a resume
-    (the reconciler sets them a minute later). The settings left at stock, with why."""
+    on AC and sets them again on battery). A saving|normal one already in that
+    state, and not by wattif's doing (ABM 1 for saving, the performance profile
+    for normal), is left as it is: decided now on battery, and on AC when it
+    first takes effect on battery (reconcile_applied); `left`, a list, gets the
+    names left now. Risky settings move off stock only with `risky`, quarantined
+    ones not at all, and not within RESUME_SETTLE of a resume (the reconciler
+    sets them a minute later). The settings left at stock, with why."""
     if running():
         raise SystemExit('an experiment is running; stop it first')
     specs = specs if specs is not None else catalog()
@@ -2113,18 +2376,25 @@ def command_apply(assignments, risky=False, specs=None, battery=on_battery, ledg
     blocked = quarantined()
     record = load_applied() or {'boot': boot_id(), 'values': {}, 'risky': []}
     values, allowed = dict(record['values']), set(record.get('risky') or [])
-    to_stock, refused = [], []
+    states = dict(record.get('states') or {})
+    on, ours = battery(), set(leftovers(ledger))
+    to_stock, refused, already = [], [], []
     for assignment in assignments:
         name, _, value = assignment.partition('=')
         if name not in specs or not value:
             raise SystemExit(f'expected NAME=VALUE with NAME one of {", ".join(specs)}, got {assignment!r}')
-        spec = specs[name]
-        if value in ('saving', 'normal'):
+        spec, state = specs[name], None
+        if value in APPLY_STATES:
             if spec.levels is None:
                 raise SystemExit(f'{name} has no {value} value')
-            value = spec.levels()[0 if value == 'saving' else 1]
+            state, value = value, spec.levels()[APPLY_STATES.index(value)]
+        if state and on and name not in values and name not in ours and has_state(spec, spec.read(), state):
+            states.pop(name, None)
+            already.append(name)
+            continue
         if value == spec.stock_or_none(True):
             values.pop(name, None)
+            states.pop(name, None)
             allowed.discard(name)
             to_stock.append(name)
         elif name in blocked:
@@ -2133,26 +2403,36 @@ def command_apply(assignments, risky=False, specs=None, battery=on_battery, ledg
             refused.append(f'{name} (risky: add --risky)')
         else:
             values[name] = value
+            if state and not on:  # Decided on battery, by the value it has there.
+                states[name] = state
+            else:
+                states.pop(name, None)
             if name in RISKY:
                 allowed.add(name)
-    write_state(dict(record, values=values, risky=sorted(allowed), on_battery=None, updated=time.time()), APPLIED)
+    write_state(dict(record, values=values, risky=sorted(allowed), states=states, on_battery=None,
+                     updated=time.time()), APPLIED)
     if resumed is None and any(name in RISKY for name in values):
         resumed = Journal().last_resume()
     failures = restore_settings(specs, to_stock, battery, ledger, by='apply')
     failures.update(reconcile_applied(specs, battery, ledger, explicit=True, resumed=resumed))
     not_applied(refused)
+    already_so(already)
+    if left is not None:
+        left.extend(already)
     if not battery() and values:
-        print('On AC: applied settings take effect on battery.')
+        print('On AC: applied settings take effect on battery (those already so there are left as they are).')
     if failures:
         raise SystemExit('could not set ' + '; '.join(f'{name}: {why}' for name, why in failures.items()))
     return refused
 
 
-def capture_profile(battery, now=None, settle=60):
-    """Remember the profile as yours for this power source, and ABM as found where
-    config [stock] leaves it so, unless wattif experiment holds them (a run, an
-    applied value, a leftover) or the source changed under `settle` seconds ago
-    (udev may still be switching)."""
+def capture_profile(battery, now=None, settle=60, specs=None):
+    """Save as found on this power source (remember_found) the profile, ABM and
+    `specs`' (catalog()'s) settings that wattif experiment hasn't changed in this
+    boot (once it has, their value may be its own), every 5 minutes once the
+    source has been steady for `settle` seconds (udev may still be switching):
+    what they go back to on this source after a change on the other. The
+    profile, or None."""
     now = now or time.time()
     on = battery()
     source = load_json(SOURCE)
@@ -2161,19 +2441,23 @@ def capture_profile(battery, now=None, settle=60):
         return None
     if now - source.get('since', now) < settle or now - source.get('captured', 0) < 300:
         return None
-    if stock_value('abm', on) is None and not held('abm'):
-        remember_found('abm', on, abm_get())
-    if held('profile'):
-        return None
-    try:
-        value = profile_get()
-    except Exception:  # noqa: BLE001 - power-profiles-daemon restarting
-        return None
+    readers = {'abm': abm_get, 'profile': profile_get}
+    readers.update({name: spec.get for name, spec in (specs or {}).items() if spec.as_found})
+    profile = None
+    for name, read_now in readers.items():
+        if touched(name):
+            continue
+        try:
+            value = read_now()
+        except Exception:  # noqa: BLE001 - unavailable now (power-profiles-daemon restarting)
+            continue
+        if name == 'profile':
+            if value not in PROFILES:
+                continue
+            profile = value
+        remember_found(name, on, value)
     write_state(dict(source, captured=now), SOURCE)
-    if value in PROFILES and own_profile(on) != value:
-        update_preferences(lambda prefs: prefs.update(
-            own_profile=dict(prefs.get('own_profile') or {}, **{'battery' if on else 'ac': value})))
-    return value
+    return profile
 
 
 def command_reconcile(battery=on_battery, ledger=None):
@@ -2196,7 +2480,7 @@ def command_reconcile(battery=on_battery, ledger=None):
     pending.update(restore_settings(specs, names, battery, ledger, by='reconcile', patient=True))
     pending.update(reconcile_applied(specs, battery, ledger, resumed=resumed))
     if not pending and load_state().get('status') not in ('running', 'paused', 'restore-pending'):
-        capture_profile(battery)
+        capture_profile(battery, specs=specs)
     return pending
 
 
@@ -2254,7 +2538,8 @@ def command_enable():
 
 
 def command_disable():
-    """Automatic experiments off and every setting back to stock (applied ones too)."""
+    """Automatic experiments off and every setting they or `apply` changed in this
+    boot back to stock (stock_names: what wattif didn't touch is left as it is)."""
     ENABLED.unlink(missing_ok=True)
     # Applied settings end here, whatever happens next: what they changed is in the
     # ledger, so the reconciler puts it back even if the restore below can't run.
@@ -2276,7 +2561,7 @@ def main(argv=None):
     sub.add_parser('units')
     sub.add_parser('status')
     sub.add_parser('enable', help='start automatic experiments (they persist across logins)')
-    sub.add_parser('disable', help='stop automatic experiments and put every setting back to stock')
+    sub.add_parser('disable', help='stop automatic experiments and put back every setting wattif changed')
     chosen = sub.add_parser('pool', help='settings automatic experiments may vary (pool add|remove NAME ...)')
     chosen.add_argument('names', nargs='*', metavar='name')
     chosen.add_argument('--risky', action='store_true', help=f"allow the risky settings ({', '.join(RISKY)})")
@@ -2310,13 +2595,18 @@ def main(argv=None):
     test = sub.add_parser('test-freeze', help='freeze the freeze-apps targets now for a few seconds, then thaw')
     test.add_argument('--seconds', type=float, default=5)
     test.add_argument('--keep', action='append')
-    restore = sub.add_parser('restore', help="put a run's leftovers back to stock (--stock: every setting)")
+    restore = sub.add_parser('restore', help="put a run's leftovers back to stock (--stock: everything wattif "
+                                             'changed in this boot)')
     restore.add_argument('--stock', action='store_true')
     sub.add_parser('reconcile', help='the wattif-reconcile.timer body')
     sub.add_parser('run')
     args = parser.parse_args(argv)
     if args.command == 'list':
-        print(json.dumps([describe(spec) for spec in catalog().values()]))
+        specs = catalog()
+        print(json.dumps(listing(specs)))
+        for why in dict.fromkeys(why for _, why in getattr(specs, 'missing', {}).values()):
+            names = [name for name, (_, reason) in specs.missing.items() if reason == why]
+            print(f"wattif experiment: left out: {', '.join(names)} ({why})", file=sys.stderr)
     elif args.command == 'units':
         print(json.dumps(freezable_units()))
     elif args.command == 'status':

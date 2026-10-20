@@ -157,7 +157,8 @@ class Sandbox:
     """Every path wattif experiment writes, in a temporary directory; no commands
     (sudo, journalctl, notify-send, systemctl), an empty /sys and /proc, no
     compositor or login session, and a fake kernel log. `commands` are the
-    programs on PATH, `units` the user units installed."""
+    programs on PATH, `units` the user units installed; `helper` whether the root
+    helper may be run, `followable` whether wattif throttle can follow the windows."""
 
     def __init__(self, test):
         tmp = tempfile.TemporaryDirectory()
@@ -169,6 +170,7 @@ class Sandbox:
         self.journal, self.notes, self.specs, self.boot = FakeJournal(), [], {}, 'b0'
         self.battery = True
         self.commands, self.units = set(), set()
+        self.helper, self.followable = True, True
 
         def no_commands(*args, **kwargs):
             raise AssertionError(f'a test ran a command: {args}')
@@ -176,6 +178,8 @@ class Sandbox:
                        LOG=saved / 'experiment-log.json', APPLIED=saved / 'applied.json', RUNTIME=runtime,
                        STATE=runtime / 'experiment.json', REQUEST=runtime / 'experiment-request.json',
                        LOCK=runtime / 'experiment.lock', SOURCE=runtime / 'power-source.json',
+                       PROBE=runtime / 'helper.json', helper_usable=lambda: self.helper,
+                       throttle_followable=lambda: self.followable,
                        RECOMMEND=runtime / 'recommend.json', CMDLINE=root / 'cmdline', SYS=root / 'sys',
                        CPUFREQ=root / 'sys/devices/system/cpu/cpufreq', PROC=root / 'proc', READBACK=(1, 0),
                        run=no_commands, command_exists=lambda name: name in self.commands,
@@ -604,7 +608,7 @@ class ExperimentTests(unittest.TestCase):
         self.assertEqual(blocks, [])
         self.assertIn('sync flood', final['watchdog']['reason'])
         self.assertEqual(final['watchdog']['quarantined'], ['cpu-cap'])  # Off stock when it crashed.
-        self.assertEqual(cap.value, 'none')
+        self.assertEqual(cap.history, [])  # Nothing changed in this boot (the reboot reset the cap): nothing written.
         # Handled: the next start runs, and an incident outside any run doesn't count.
         experiment_module.release(['all'])
         self.box.journal.add(9500, 'xhci_hcd 0000:c1:00.3: HC died; cleaning up')
@@ -623,20 +627,28 @@ class ExperimentTests(unittest.TestCase):
             self.run_experiment(cap, 8)
 
     def test_wifi_power_saving_goes_back_to_what_was_found(self):
-        stock = experiment_module.config.SETTINGS['stock']
-        with mock.patch.object(experiment_module, 'run', return_value='\tPower save: off'), \
-                mock.patch.object(experiment_module, 'on_battery', return_value=True), \
-                mock.patch.object(experiment_module, 'held', return_value=False):
-            self.assertEqual(experiment_module.wifi_stock(True, 'wlan0'), 'off')  # Read before any change, kept.
-            with mock.patch.object(experiment_module, 'run', return_value='\tPower save: on'):
-                self.assertEqual(experiment_module.wifi_stock(True, 'wlan0'), 'off')
-            with mock.patch.dict(stock, {'wifi_ps': {'battery': 'on', 'ac': None}}):
-                self.assertEqual(experiment_module.wifi_stock(True, 'wlan0'), 'on')  # Configured wins.
+        stock, live = experiment_module.config.SETTINGS['stock'], {'ps': 'off'}
+
+        def run(command, check=True, **_):  # iw, and wattif-helper wifips.
+            if command[:2] == ['iw', 'dev']:
+                return f"\tPower save: {live['ps']}"
+            live['ps'] = command[-1]
+            return ''
+        self.assertEqual(experiment_module.wifi_stock(False, 'wlan0'), 'on')  # Never seen anywhere: the default.
+        spec = self.machine({**MINIMAL, 'class/net/wlan0/wireless/': ''}, ['iw'])['wifi-ps']
+        with mock.patch.object(experiment_module, 'run', run):
+            self.assertEqual(spec.stock(), 'off')  # Untouched: as it is (the driver's, NetworkManager's).
+            live['ps'] = 'on'
+            self.assertEqual(spec.stock(), 'on')  # Changed by you or your system: as it is now.
+            experiment_module.change(spec, 'off', Ledger(), 'manual')  # wattif's first change saves it first,
+            self.assertEqual((spec.stock(), live['ps']), ('on', 'off'))  # and its own value never counts.
+            self.assertEqual(spec.stock(False), 'on')  # Not seen on AC: as found on battery.
+            with mock.patch.dict(stock, {'wifi_ps': {'battery': 'off', 'ac': 'found'}}):
+                self.assertEqual((spec.stock(), spec.stock(False)), ('off', 'on'))  # Configured wins; "found" is None.
             with mock.patch.dict(stock, {'wifi_ps': 'maybe'}), self.assertRaises(ValueError):
-                experiment_module.wifi_stock(True, 'wlan0')
-        with mock.patch.object(experiment_module, 'on_battery', return_value=True), \
-                mock.patch.object(experiment_module, 'held', return_value=True):
-            self.assertEqual(experiment_module.wifi_stock(False, 'wlan0'), 'on')  # Never seen on AC: the default.
+                spec.stock()
+            self.box.boot = 'b2'  # After a reboot: as it is again, until wattif changes it in that boot.
+            self.assertEqual(spec.stock(), 'off')
 
     def test_corrected_pcie_errors_count_only_after_a_link_change_on_a_quiet_boot(self):
         message = 'pcieport 0000:00:1c.0: AER: Correctable error message received from 0000:01:00.0'
@@ -762,7 +774,7 @@ class ExperimentTests(unittest.TestCase):
         best = {'battery': {'apply': ['aspm=saving', 'apst=normal']}, 'comfort': {'apply': []}}
         with mock.patch.object(experiment_module, 'command_apply') as apply:
             experiment_module.apply_goal('battery', recommend=lambda now: best)
-            apply.assert_called_once_with(['aspm=saving', 'apst=normal'], risky=False)
+            apply.assert_called_once_with(['aspm=saving', 'apst=normal'], risky=False, left=[])
             experiment_module.apply_goal('comfort', recommend=lambda now: best)  # Nothing measured.
             experiment_module.write_state({'mode': 'auto', 'status': 'paused'})
             experiment_module.apply_goal('battery', recommend=lambda now: best)
@@ -785,15 +797,18 @@ class ExperimentTests(unittest.TestCase):
         self.box.boot = 'b2'  # A reboot ends it.
         self.assertEqual(experiment_module.load_applied(), {})
 
-    def test_disable_puts_every_setting_back_to_stock(self):
+    def test_disable_puts_back_every_setting_wattif_changed(self):
         self.box.specs = specs = self.specs_for_pool()
         experiment_module.command_apply(['cpu-cap=saving', 'gpu-dpm=saving'], risky=True, battery=lambda: True)
-        specs['boost'].value = 'y'  # Left over from anything.
+        specs['wifi-ps'].value = 'y'  # A crashed run's leftover,
+        Ledger().change('wifi-ps', 'y', False, 'auto')
+        specs['boost'].value = 'y'  # and something else's doing: not wattif's to put back.
         experiment_module.ENABLED.parent.mkdir(parents=True, exist_ok=True)
         experiment_module.ENABLED.touch()
         with mock.patch.object(experiment_module, 'run', lambda *a, **k: ''):
             experiment_module.main(['disable'])
-        self.assertEqual({name: spec.value for name, spec in specs.items()}, dict.fromkeys(specs, 'x'))
+        self.assertEqual({name: spec.value for name, spec in specs.items()}, dict(dict.fromkeys(specs, 'x'), boost='y'))
+        self.assertEqual(specs['boost'].history, [])
         self.assertFalse(experiment_module.APPLIED.exists())
         self.assertFalse(experiment_module.ENABLED.exists())
 
@@ -839,9 +854,11 @@ class ExperimentTests(unittest.TestCase):
                                  'throttle-apps': 'off', 'wifi-ps': 'on'})
         self.assertEqual((catalog['abm'].stock(False), catalog['profile'].stock(False)), ('0', 'balanced'))
         (self.box.root / 'cmdline').write_text('quiet pcie_aspm.policy=powersave pcie_aspm.policy=performance\n')
-        self.assertEqual((catalog['aspm'].stock(), catalog['apst'].stock()), ('performance', '100000'))
+        self.assertEqual((catalog['aspm'].stock(), catalog['apst'].stock()), ('performance', '0'))  # APST: as found.
         (self.box.root / 'cmdline').write_text('quiet\n')
-        self.assertEqual(catalog['aspm'].stock(), 'default')
+        self.assertEqual(catalog['aspm'].stock(), 'default')  # As found.
+        Ledger().change('apst', '0', False, 'auto')  # A change logged before anything was saved (an older wattif):
+        self.assertEqual(catalog['apst'].stock(), experiment_module.APST_DEFAULT)  # nothing better than the guess.
         self.assertEqual(experiment_module.HELPER, ['sudo', '-n', 'wattif-helper'])  # config [helper] command's default.
         self.assertEqual(experiment_module.RISKY, ('aspm', 'apst', 'gpu-dpm'))
 
@@ -875,7 +892,7 @@ class ExperimentTests(unittest.TestCase):
         self.assertEqual(catalog['boost'].stock(), '0')
         with mock.patch.object(experiment_module, 'profile_get', lambda: 'balanced'):
             self.assertEqual(catalog['boost'].stock(), '1')
-        catalog['abm'].stock()
+        experiment_module.note_found(catalog['abm'])  # Saved before a first change (or by capture_profile).
         # What report.own_settings takes for battery without a battery minute outside experiments.
         self.assertEqual(experiment_module.battery_stock(), {'profile': 'power-saver', 'abm': '3', 'boost': '0'})
         experiment_module.prefer(risky=['aspm'])
@@ -923,12 +940,16 @@ class ExperimentTests(unittest.TestCase):
     def test_stock_values_come_from_configuration(self):
         catalog = self.real_catalog()
         abm, panel = catalog['abm'], self.box.root / 'sys/class/drm/card1-eDP-1/amdgpu/panel_power_savings'
-        # By default ABM is left as found: read on battery while nothing of ours holds it, left to the system on AC.
+        # By default ABM is as found: as it is on battery while wattif hasn't changed it, left to the system on AC.
         self.assertEqual((abm.stock(True), abm.stock(False), abm.ac_managed, bool(abm.reset)), ('3', None, True, True))
-        self.assertEqual(self.box.prefs()['found'], {'abm': {'battery': '3'}})
-        panel.write_text('0\n')
-        self.assertEqual(abm.stock(True), '3')  # Kept once found.
-        self.assertFalse(catalog['profile'].ac_managed)  # config's AC profile: wattif puts it back on AC.
+        panel.write_text('1\n')
+        self.assertEqual(abm.stock(True), '1')  # Until wattif first changes it,
+        with mock.patch.object(experiment_module, 'run', lambda command, check=True, **_: panel.write_text('0\n')):
+            experiment_module.change(abm, '0', Ledger(), 'manual')
+        self.assertEqual(self.box.prefs()['found'], {'abm': {'battery': '1'}})
+        self.assertEqual((abm.stock(True), panel.read_text()), ('1', '0\n'))  # then kept: never its own value.
+        # The profile, by default, too: on AC left to your system (not put back to balanced).
+        self.assertTrue(catalog['profile'].ac_managed)
         self.assertEqual((catalog['profile'].stock(True), catalog['profile'].stock(False)), ('power-saver', 'balanced'))
         with mock.patch.dict(config.SETTINGS['stock'], profile={'battery': 'balanced', 'ac': None},
                              abm={'battery': 2, 'ac': 0}, boost={'battery': 0, 'ac': 1}), \
@@ -1192,7 +1213,7 @@ class ExperimentTests(unittest.TestCase):
         self.assertIn('while asleep', final['watchdog']['reason'])
         self.assertEqual((final['watchdog']['quarantined'], experiment_module.quarantined()), ([], {}))
         self.assertTrue(experiment_module.ENABLED.exists())  # On again at the next login.
-        self.assertEqual(cap.value, 'none')
+        self.assertEqual(cap.history, [])  # Nothing of this boot's to put back.
         self.assertIn('nothing (not a sign of any setting)', self.box.notes[0][1])
         final, _ = self.run_automatic({'cpu-cap': cap}, FakeClock(9200), 9200 + 600, ['cpu-cap'],
                                       choose=lambda *a: blocks.append(a) or ({'cpu-cap': True}, {}))
@@ -1295,6 +1316,239 @@ class ExperimentTests(unittest.TestCase):
         self.assertIn('wattif experiment: recommend.json was stale, so the battery combination was computed now; '
                       'applied: cpu-cap=saving\n', written)
 
+    # --- Review fixes (October 20): settings go back as wattif found them ---------------------------
+
+    def commands(self, live, calls):
+        """`run` for the AMD laptop: wattif-helper over the sandbox's /sys (aspm, apst, abm,
+        cpucap; trigger changes nothing: no udev rule sets anything), powerprofilesctl over
+        live['profile'], and systemctl doing nothing."""
+        sys_root, helper = self.box.root / 'sys', len(experiment_module.HELPER)
+
+        def write(pattern, value):
+            for path in sys_root.glob(pattern):
+                path.write_text(f'{value}\n')
+
+        def run(command, check=True, **_):
+            calls.append(command)
+            if command[:helper] == experiment_module.HELPER:
+                what, value = command[helper], command[-1]
+                if what == 'aspm':
+                    write('module/pcie_aspm/parameters/policy', ' '.join(
+                        f'[{p}]' if p == value else p for p in ('default', 'performance', 'powersave', 'powersupersave')))
+                elif what == 'apst':
+                    write('class/nvme/nvme*/power/pm_qos_latency_tolerance_us', value)
+                elif what == 'abm':
+                    write('class/drm/card*-eDP-*/amdgpu/panel_power_savings', value)
+                elif what == 'cpucap':
+                    write(f'{CPU}cpufreq/policy*/scaling_max_freq', '4972435' if value == 'none' else f'{value}000')
+                return ''
+            if command[:2] == ['powerprofilesctl', 'set']:
+                live['profile'] = command[2]
+                return ''
+            if command[:2] == ['systemctl', '--user']:
+                return ''
+            raise AssertionError(f'unexpected command {command}')
+        return run
+
+    def test_tlp_aspm_and_a_modprobe_apst_limit_are_left_alone_and_go_back_as_found(self):
+        # TLP sets ASPM powersupersave on battery, and modprobe.d's nvme_core
+        # default_ps_max_latency_us=0 works around an SSD that crashes in APST: neither is
+        # on the kernel command line. Before, the panel's Off switch wrote ASPM default and
+        # APST 100000 (risky, never opted in) until reboot.
+        (self.box.root / 'cmdline').write_text('quiet\n')
+        files = dict(AMD_LAPTOP, **{'module/pcie_aspm/parameters/policy': 'default performance powersave [powersupersave]',
+                                    'module/nvme_core/parameters/default_ps_max_latency_us': '0'})
+        self.box.specs = specs = self.machine(files, EVERYTHING, [experiment_module.THROTTLE_UNIT])
+        calls = []
+        with mock.patch.object(experiment_module, 'run', self.commands({}, calls)):
+            self.assertEqual((specs['aspm'].stock(), specs['apst'].stock()), ('powersupersave', '0'))
+            experiment_module.main(['disable'])  # wattif never changed them:
+            self.assertEqual([c for c in calls if c[0] != 'systemctl'], [])  # nothing is written.
+            for name, value in (('aspm', 'performance'), ('apst', experiment_module.APST_DEFAULT)):  # A run's blocks.
+                experiment_module.change(specs[name], value, Ledger(), 'manual')
+            self.assertEqual((specs['aspm'].read(), specs['apst'].read()), ('performance', '100000'))
+            experiment_module.main(['restore', '--stock'])
+            self.assertEqual((specs['aspm'].read(), specs['apst'].read()), ('powersupersave', '0'))  # As found.
+        # Nothing saved (an older wattif's change): the limit the drives started with, not 100000.
+        self.box.boot = 'b2'
+        experiment_module.update_preferences(lambda prefs: prefs.pop('found', None))
+        Ledger().change('apst', experiment_module.APST_DEFAULT, False, 'auto')
+        self.assertEqual(specs['apst'].stock(), '0')
+
+    def test_a_performance_profile_on_ac_is_left_alone(self):
+        # Before, every automatic start and pause on AC set balanced (config's AC profile by default).
+        live, calls = {'profile': 'performance'}, []
+        self.enterContext(mock.patch.object(experiment_module, 'profile_get', lambda: live['profile']))
+        self.enterContext(mock.patch.object(experiment_module, 'run', self.commands(live, calls)))
+        self.box.battery = False
+        self.box.specs = specs = self.real_catalog()
+        profile = specs['profile']
+        self.assertEqual((profile.ac_managed, profile.stock(False)), (True, 'performance'))
+        self.run_automatic(specs, FakeClock(), 1000 + 10 * 60, ['profile', 'cpu-cap'], battery=lambda: False)
+        experiment_module.main(['disable'])
+        self.assertEqual((live['profile'], [c for c in calls if c[0] == 'powerprofilesctl']), ('performance', []))
+        experiment_module.capture_profile(lambda: False, now=time.time() + 3600, specs=specs)  # Seen on AC.
+        # A block on battery sets power-saver; plugged in with no udev rule, it stays: back to yours.
+        self.box.battery, live['profile'] = True, 'performance'
+        experiment_module.change(profile, 'power-saver', Ledger(), 'auto')
+        self.box.battery = False
+        self.assertEqual(experiment_module.restore_settings(specs, ['profile'], lambda: False, Ledger()), {})
+        self.assertEqual(live['profile'], 'performance')
+        # With a udev rule that sets balanced on AC, the system's is left to it.
+        self.box.battery = True
+        experiment_module.change(profile, 'power-saver', Ledger(), 'auto')
+        self.box.battery, live['profile'] = False, 'balanced'
+        experiment_module.restore_settings(specs, ['profile'], lambda: False, Ledger())
+        self.assertEqual(live['profile'], 'balanced')
+        with mock.patch.dict(config.SETTINGS['stock'], profile={'battery': 'found', 'ac': 'balanced'}):
+            catalog = CATALOG()  # A configured AC profile is put back there; "found" is as found.
+            self.assertEqual((catalog['profile'].ac_managed, catalog['profile'].stock(False)), (False, 'balanced'))
+
+    def test_a_120_hz_panel_used_at_60_hz_goes_back_to_60(self):
+        socket = self.box.root / 'sway.sock'
+        socket.touch()
+        os.environ['SWAYSOCK'] = str(socket)
+        output = json.loads(json.dumps(SWAY_OUTPUTS[0]))
+        output['current_mode'] = dict(output['modes'][1])  # 60 Hz, of 120 and 60.
+
+        def run(command, check=True, **_):
+            if command[:2] == ['swaymsg', '-r']:
+                return json.dumps([output])
+            rate = float(command[-1].removesuffix('Hz').rpartition('@')[2])  # swaymsg output eDP-1 mode …
+            output['current_mode'] = next(m for m in output['modes'] if abs(m['refresh'] / 1000 - rate) < 0.01)
+            return ''
+        with mock.patch.object(experiment_module, 'run', run):
+            spec = self.real_catalog()['refresh']
+            self.assertEqual(spec.stock(), '2560x1600@60.000')  # The mode you use, not the highest.
+            experiment_module.change(spec, '2560x1600@120.000', Ledger(), 'manual')
+            self.assertEqual((spec.read(), spec.stock()), ('2560x1600@120.000', '2560x1600@60.000'))
+            self.assertEqual(experiment_module.stock_names({'refresh': spec}, Ledger()), ['refresh'])  # Held.
+            self.assertEqual(experiment_module.restore_settings({'refresh': spec}, ['refresh'], lambda: True, Ledger()),
+                             {})
+            self.assertEqual(spec.read(), '2560x1600@60.000')
+            self.assertEqual(experiment_module.stock_names({'refresh': spec}, Ledger()), [])  # Put back: not held.
+
+    def test_abm_applied_on_ac_then_disabled_goes_back_to_what_it_was(self):
+        # No udev rule sets ABM: before, disable left wattif's 3, logged it as stock and
+        # saved it as the ABM found on battery for good.
+        panel = self.box.root / 'sys/class/drm/card1-eDP-1/amdgpu/panel_power_savings'
+        self.enterContext(mock.patch.object(experiment_module, 'run', self.commands({}, [])))
+        self.box.specs = specs = self.real_catalog()
+        panel.write_text('0\n')
+        self.box.battery = False
+        with mock.patch('sys.stdout'):
+            experiment_module.command_apply(['abm=saving'], battery=lambda: False)
+        self.assertEqual(panel.read_text(), '0\n')  # On AC: not yet.
+        self.box.battery = True
+        experiment_module.command_reconcile(battery=lambda: True)
+        self.assertEqual(panel.read_text(), '3\n')  # Unplugged: applied.
+        experiment_module.main(['disable'])
+        self.assertEqual(panel.read_text(), '0\n')  # As it was before wattif changed it.
+        for later in (100, 500):  # The reconciler's captures afterwards (once the power source is steady).
+            experiment_module.capture_profile(lambda: True, now=time.time() + later, specs=specs)
+        self.assertEqual(self.box.prefs()['found']['abm'], {'battery': '0'})  # Never wattif's own 3.
+
+    def test_apply_leaves_settings_already_in_the_state_asked_for(self):
+        # An "already set" combination moved the profile performance → balanced and ABM 1 → 3.
+        panel = self.box.root / 'sys/class/drm/card1-eDP-1/amdgpu/panel_power_savings'
+        live, calls = {'profile': 'performance'}, []
+        self.enterContext(mock.patch.object(experiment_module, 'profile_get', lambda: live['profile']))
+        self.enterContext(mock.patch.object(experiment_module, 'run', self.commands(live, calls)))
+        self.box.specs = specs = self.real_catalog()
+        panel.write_text('1\n')  # Saving, as much as 3 is.
+        combination, left = ['profile=normal', 'abm=saving', 'cpu-cap=saving'], []
+        with mock.patch('sys.stderr') as err:
+            experiment_module.command_apply(combination, battery=lambda: True, left=left)
+        written = ''.join(call.args[0] for call in err.write.call_args_list)
+        self.assertEqual(left, ['profile', 'abm'])
+        self.assertIn('wattif experiment: already so, left as they are: profile; abm\n', written)
+        self.assertEqual((live['profile'], panel.read_text(), specs['cpu-cap'].read()), ('performance', '1\n', '2000'))
+        self.assertEqual([c[len(experiment_module.HELPER):] for c in calls], [['cpucap', '2000']])
+        self.assertEqual(experiment_module.load_applied()['values'], {'cpu-cap': '2000'})
+        # The paused runner sets the goal's combination alike.
+        self.assertEqual(experiment_module.recommended_values(specs, ['profile', 'abm', 'cpu-cap'], 'battery',
+                                                               lambda: {'battery': {'apply': combination}}),
+                         {'profile': 'performance', 'abm': '1', 'cpu-cap': '2000'})
+        # Applied on AC, it is judged by its value on battery: a udev rule's ABM 1 there is left.
+        experiment_module.APPLIED.unlink()
+        self.box.battery = False
+        panel.write_text('0\n')
+        with mock.patch('sys.stdout'):
+            experiment_module.command_apply(['abm=saving'], battery=lambda: False)
+        self.box.battery = True
+        panel.write_text('1\n')
+        with mock.patch('sys.stderr'):
+            experiment_module.command_reconcile(battery=lambda: True)
+        self.assertEqual((panel.read_text(), experiment_module.load_applied()['values']), ('1\n', {}))
+
+    def test_root_settings_are_left_out_without_the_helpers_sudo_rule(self):
+        self.box.helper = False
+        self.box.specs = specs = self.real_catalog()
+        self.assertEqual(list(specs), ['profile', 'throttle-apps'])
+        self.assertEqual(list(specs.missing), ['aspm', 'apst', 'boost', 'abm', 'gpu-dpm', 'cpu-cap', 'wifi-ps'])
+        with mock.patch.object(experiment_module, 'run', lambda command, check=True, **_: ''), \
+                mock.patch('sys.stdout') as out, mock.patch('sys.stderr') as err:
+            experiment_module.main(['list'])
+        rows = {row['name']: row for row in json.loads(''.join(call.args[0] for call in out.write.call_args_list))}
+        self.assertEqual(set(rows), set(specs) | set(specs.missing))
+        self.assertEqual((rows['aspm']['error'], rows['profile']['error']), (experiment_module.HELPER_NEEDED, None))
+        self.assertIn("wattif experiment: left out: aspm, apst, boost, abm, gpu-dpm, cpu-cap, wifi-ps (root settings "
+                      "need wattif-helper's sudo rule; see the README)", ''.join(c.args[0] for c in err.write.call_args_list))
+        from wattif import panel_data  # The panel's row for it says why.
+        row = panel_data.lever_rows([rows['aspm']], {'effects': []}, None, set())[0]
+        self.assertEqual((row['detail'].split(' · ')[0], row['sensitive']),
+                         (f'Unavailable: {experiment_module.HELPER_NEEDED}', False))
+
+    def test_the_helper_is_asked_once_while_it_works_and_again_later_while_it_doesnt(self):
+        probes, allowed, now = [], [False], [1000.0]
+
+        def run(command, check=True, timeout=15):
+            probes.append(command)
+            if not allowed[0]:
+                raise RuntimeError(f"{' '.join(command)}: sudo: a password is required")
+            return ''
+        with mock.patch.object(experiment_module, 'run', run), mock.patch.object(experiment_module.time, 'time',
+                                                                                lambda: now[0]):
+            self.assertEqual((HELPER_USABLE(), HELPER_USABLE()), (False, False))
+            self.assertEqual(probes, [experiment_module.HELPER + ['status']])  # Asked once,
+            allowed[0] = True  # then its sudo rule is added:
+            now[0] += experiment_module.PROBE_AGAIN
+            self.assertTrue(HELPER_USABLE())  # noticed within PROBE_AGAIN.
+            now[0] += 86400
+            self.assertEqual((HELPER_USABLE(), len(probes)), (True, 2))  # While it works: once a boot,
+            allowed[0] = False
+            with self.assertRaises(RuntimeError):
+                experiment_module.lab('cpucap', 'none')
+            self.assertFalse(HELPER_USABLE())  # or until a helper call fails.
+            with mock.patch.object(experiment_module, 'HELPER', []):
+                self.assertFalse(HELPER_USABLE())  # No helper configured: never asked.
+            self.assertEqual(len(probes), 4)
+        # config [helper] command and [experiments] risky as strings: never their characters.
+        with mock.patch.dict(config.SETTINGS['helper'], command='sudo -n wattif-helper'), mock.patch('sys.stderr') as err:
+            command, why = experiment_module.helper_command()
+        self.assertEqual(command, [])
+        self.assertIn('must be a list of words', why)
+        self.assertIn(why, ''.join(c.args[0] for c in err.write.call_args_list))
+        with mock.patch.object(experiment_module, 'HELPER', []), \
+                mock.patch.object(experiment_module, 'HELPER_PROBLEM', why), self.assertRaises(RuntimeError) as refused:
+            experiment_module.lab('cpucap', 'none')
+        self.assertEqual(str(refused.exception), why)
+        with mock.patch.dict(config.SETTINGS['experiments'], risky='aspm', freeze_keep='t3code'):
+            self.assertEqual((experiment_module.listed('experiments', 'risky'), experiment_module.freeze_keep()),
+                             (['aspm'], ['t3code']))
+        with mock.patch.dict(config.SETTINGS['session'], lockers='swaylock'):
+            tree(self.box.root / 'proc', {'12/comm': 's'})
+            self.assertFalse(experiment_module.locker_running())  # Not "s", "w", "a" …
+
+    def test_throttle_apps_is_offered_only_where_throttle_can_follow_the_windows(self):
+        self.box.followable = False  # Hyprland, GNOME, KDE, X11: wattif throttle caps nothing there.
+        self.assertNotIn('throttle-apps', self.real_catalog())
+        self.assertFalse(THROTTLE_FOLLOWABLE())
+        socket = self.box.root / 'niri.sock'
+        socket.touch()
+        os.environ['NIRI_SOCKET'] = str(socket)
+        self.assertTrue(THROTTLE_FOLLOWABLE())
+
     # --- Unchanged helpers ----------------------------------------------------------------------
 
     def test_a_stale_recommendation_is_computed_again(self):
@@ -1379,6 +1633,7 @@ class ExperimentTests(unittest.TestCase):
 
 # The real ones (the sandbox replaces them).
 CATALOG, JOURNAL, ON_BATTERY = experiment_module.catalog, experiment_module.Journal, experiment_module.on_battery
+HELPER_USABLE, THROTTLE_FOLLOWABLE = experiment_module.helper_usable, experiment_module.throttle_followable
 
 
 if __name__ == '__main__':

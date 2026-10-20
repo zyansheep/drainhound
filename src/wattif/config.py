@@ -45,8 +45,9 @@ UNITS = {
 }
 
 DEFAULTS = {
-    # How power experiments run the root helper (see helper/wattif-helper). Its
-    # sudo rule must allow exactly this command without a password.
+    # How power experiments run the root helper (see helper/wattif-helper), as a
+    # list of words. Its sudo rule must allow exactly this command without a
+    # password; without one, the root-only settings are left out.
     'helper': {'command': ['sudo', '-n', 'wattif-helper']},
     'apps': {
         # Executable (or Electron app directory) → the name logged and shown;
@@ -90,26 +91,33 @@ DEFAULTS = {
         # first amdgpu sensor, whatever GPU it is), 'rapl', 'none'.
         'sensor': 'auto',
     },
-    # What a setting goes back to when experiments end, where it isn't simply
-    # the boot-time value. These copy common udev rules; set them to yours. A
-    # None leaves the setting as found on that power source (on AC: to whatever
-    # your system sets when plugged in).
+    # What a setting goes back to when experiments end, on each power source.
+    # None, or the string "found" (TOML has no null): as wattif found it in this
+    # boot before it first changed it, on that power source (where wattif only
+    # changed it on battery, on AC it is left to whatever your system sets when
+    # plugged in). A value instead is put back whatever was found; the original
+    # author's udev rules, say: profile = {battery = "power-saver", ac =
+    # "balanced"}, abm = {battery = 3, ac = 0}.
     'stock': {
-        # power-profiles-daemon's profile, until wattif has seen yours (it keeps
-        # the one you use on each power source).
-        'profile': {'battery': 'power-saver', 'ac': 'balanced'},
-        'abm': {'battery': None, 'ac': None},  # amdgpu panel power savings 0-4 (None: leave as found).
-        # CPU boost 0/1. None: as the profile leaves it (power-profiles-daemon on
-        # amd-pstate turns it off under power-saver), else on.
+        # power-profiles-daemon's profile. As found; on battery, until seen there,
+        # power-saver (what common udev rules set).
+        'profile': {'battery': None, 'ac': None},
+        'abm': {'battery': None, 'ac': None},  # amdgpu panel power savings 0-4.
+        # CPU boost 0/1. As found: as the profile leaves it where power-profiles-daemon
+        # sets it with the profile (on amd-pstate: off under power-saver), else as
+        # found (on until seen).
         'boost': {'battery': None, 'ac': None},
-        # Wi-Fi power saving 'on'/'off'. None: as found before the first change
-        # (drivers and NetworkManager differ), else on.
+        # Wi-Fi power saving 'on'/'off'. As found (drivers and NetworkManager differ;
+        # on until seen).
         'wifi_ps': {'battery': None, 'ac': None},
-        'cpu_cap_mhz': 2000,  # The CPU frequency cap's power-saving value.
+        # The CPU frequency cap's power-saving value in MHz (not a stock value: the
+        # cap goes back to what was found, by default none).
+        'cpu_cap_mhz': 2000,
     },
     'experiments': {
         # Settings that can upset some hardware (link power management, the GPU's
-        # clocks): never in automatic runs unless added with --risky.
+        # clocks): never in automatic runs unless added with --risky (a list; one
+        # name alone may be a string).
         'risky': ['aspm', 'apst', 'gpu-dpm'],
         'freeze_keep': [],  # Scope patterns "Close every app" leaves running.
         # Boot entries for boot-level experiments: arm → systemd-boot entry

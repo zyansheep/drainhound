@@ -183,8 +183,8 @@ comfort|battery --apply` switches.
 - Settings are always restored in a fixed order, risky ones first.
 - A watchdog reads the kernel log every 30 s while experiments run, and the
   previous boot's at start. On a dead USB controller, a Bluetooth timeout, a
-  PCIe, GPU or NVMe error, or a crash reset while awake, it restores stock
-  settings, quarantines what changed in the 15 minutes before, and turns
+  PCIe, GPU or NVMe error, or a crash reset while awake, it puts back what
+  wattif changed, quarantines what changed in the 15 minutes before, and turns
   experiments off until you turn them on again. A boot that died asleep only
   pauses the run.
 - Applied settings (`apply`, `goal --apply`) last until reboot, on battery

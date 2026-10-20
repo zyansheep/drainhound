@@ -346,8 +346,8 @@ def collect(start, end, history, on_period, part, errors, timings, began):
                   psr=part('panel self-refresh', lambda: cached('psr', lambda: report.boot_effect(
                       minutes_all, energy, typical)) if 'psr' in experiment.boot_arms() else None, None),
                   psr_arm=part('boot arm', experiment.psr_arm, None),
-                  catalog=part('settings', lambda: [experiment.describe(spec)
-                                                    for spec in experiment.catalog().values()], []),
+                  # With the settings left out (root ones without the helper's sudo rule), and why.
+                  catalog=part('settings', lambda: experiment.listing(experiment.catalog()), []),
                   units=part('app scopes', experiment.freezable_units, []))  # All: the picker keeps the chosen one.
     result['health'] = dict(battery=len(rows_all), tested=sum(1 for m in rows_all if m.get('exp')),
                             first=rows_all[0]['t'] if rows_all else None,
@@ -635,21 +635,35 @@ def refused(err):
     return found
 
 
+def left_alone(err):
+    """The settings `wattif experiment apply` left as they were, already in the state
+    asked for (its 'already so, left as they are: a; b' line)."""
+    found = []
+    for notice in notices(err):
+        if notice.startswith(experiment.ALREADY + ':'):
+            found += [name.strip() for name in notice[len(experiment.ALREADY) + 1:].split(';') if name.strip()]
+    return found
+
+
 def apply_note(assignments, out, err):
     """The note after `wattif experiment apply <assignments>` (or `goal --apply`,
     whose combination may be unknown here: None), and for how long (None: until
-    the next command). Settings it refused are never called applied."""
+    the next command). Settings it refused, or left as they were (already so),
+    are never called applied."""
     names = None if assignments is None else list(dict.fromkeys(a.partition('=')[0] for a in assignments))
-    left, rest = refused(err), [n for n in notices(err) if not n.startswith('not applied:')]
+    left, kept = refused(err), left_alone(err)
+    rest = [n for n in notices(err) if not n.startswith(('not applied:', experiment.ALREADY + ':'))]
     if names == [] and not left and not rest:
         return 'Nothing measured to apply yet.', None
-    applied = None if names is None else [name for name in names if name not in left]
+    applied = None if names is None else [name for name in names if name not in left and name not in kept]
     when = ' (it takes effect on battery)' if 'On AC' in (out or '') else ''
     parts = []
     if applied is None:
         parts.append(f'Applied until reboot{when}.')
     elif applied:
         parts.append(f"Applied until reboot{when}: {', '.join(applied)}.")
+    if kept:
+        parts.append(f"Already so, left as they are: {', '.join(kept)}.")
     if left:
         parts.append(('Nothing applied' if applied == [] else 'Not applied') + ': '
                      + '; '.join(f'{name} ({why})' if why else name for name, why in left.items()) + '.')
