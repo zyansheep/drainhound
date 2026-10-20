@@ -29,20 +29,27 @@ Only do this on a machine whose users you trust.
 ## Settings experiments can vary
 
 Each is offered only if the machine has it. Root settings go through
-`wattif-helper`, the others run as you.
+`wattif-helper`, the others run as you; without the helper's sudo rule the
+root ones are left out (the panel and `wattif experiment list` say so).
+
+wattif never leaves a setting other than it found it. "As found" below is the
+value a setting had in this boot before wattif first changed it, on that power
+source (saved then); `disable`, `restore --stock` and the watchdog put back only
+what wattif changed in this boot. In parentheses: the guess used where nothing
+was ever seen.
 
 | Setting | Needs | Root | Stock (restored after experiments) |
 | --- | --- | --- | --- |
-| `aspm`: PCIe link power saving | `/sys/module/pcie_aspm` (firmware granting the OS ASPM control) | yes | `pcie_aspm.policy=` on the kernel command line, else `default` |
-| `apst`: NVMe power states | an NVMe drive | yes | `nvme_core.default_ps_max_latency_us=`, else 100000 µs |
-| `boost`: CPU boost/turbo | `cpufreq/boost` (amd-pstate, acpi-cpufreq) or `intel_pstate/no_turbo` | yes | `[stock] boost`, else following the profile where power-profiles-daemon does that, else on |
-| `cpu-cap`: a frequency cap | cpufreq | yes | no cap; the cap is `[stock] cpu_cap_mhz` |
-| `profile`: power profile | power-profiles-daemon or tuned-ppd (`powerprofilesctl`) | no | the profile you use on that power source, else `[stock] profile` |
-| `abm`: panel power savings | amdgpu with an internal panel | yes | `[stock] abm`, else the value found before the first change |
-| `gpu-dpm`: GPU and memory clocks | amdgpu | yes | `auto` |
-| `wifi-ps`: Wi-Fi power saving | a wireless interface and `iw` | yes | on |
-| `refresh`: refresh rate | niri or sway, and an internal panel with more than one rate | no | the highest rate |
-| `throttle-apps` | the `wattif-throttle` unit | no | off |
+| `aspm`: PCIe link power saving | `/sys/module/pcie_aspm` (firmware granting the OS ASPM control) | yes | `pcie_aspm.policy=` on the kernel command line, else as found (TLP may set it; `default`) |
+| `apst`: NVMe power states | an NVMe drive | yes | `nvme_core.default_ps_max_latency_us=` on the kernel command line, else as found, else the limit the drives started with (modprobe.d may set it; 100000 µs) |
+| `boost`: CPU boost/turbo | `cpufreq/boost` (amd-pstate, acpi-cpufreq) or `intel_pstate/no_turbo` | yes | `[stock] boost`, else following the profile where power-profiles-daemon does that, else as found (on) |
+| `cpu-cap`: a frequency cap | cpufreq | yes | as found (no cap); the cap is `[stock] cpu_cap_mhz` |
+| `profile`: power profile | power-profiles-daemon or tuned-ppd (`powerprofilesctl`) | no | `[stock] profile`, else as found on that power source (power-saver on battery); on AC whatever your system sets when plugged in |
+| `abm`: panel power savings | amdgpu with an internal panel | yes | `[stock] abm`, else as found on that power source |
+| `gpu-dpm`: GPU and memory clocks | amdgpu | yes | as found (`auto`) |
+| `wifi-ps`: Wi-Fi power saving | a wireless interface and `iw` | yes | `[stock] wifi_ps`, else as found (on) |
+| `refresh`: refresh rate | niri or sway, and an internal panel with more than one rate | no | the mode found (the highest) |
+| `throttle-apps` | the `wattif-throttle` unit, and niri or sway (what it follows) | no | as found (off) |
 | `freeze`, `freeze-apps` | systemd app scopes (manual runs only) | no | running |
 
 ASPM, APST and GPU clocks are risky by default (`[experiments] risky`): some

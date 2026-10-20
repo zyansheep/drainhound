@@ -116,7 +116,7 @@ Then set `helper.command = ["sudo", "-n", "/usr/local/bin/wattif-helper"]` in
 ```sh
 wattif panel                 # the panel (toggle); `wattif panel experiments` opens that tab
 wattif vote up | down        # 👍 especially good right now / 👎 worse than it should be
-wattif experiment enable     # automatic experiments while on battery (disable: back to stock)
+wattif experiment enable     # automatic experiments while on battery (disable: puts back what they changed)
 wattif experiment status
 wattif experiment apply wifi-ps=saving cpu-cap=saving   # set a combination (until reboot, on battery)
 wattif check                 # gather every panel period from your data, timed
@@ -141,7 +141,7 @@ are:
 
 - `battery.poweroff`: power off cleanly before the battery cuts out.
 - `freeze.apps`: which apps to freeze when long unused.
-- `stock.*`: what settings return to after experiments, if not their boot-time values.
+- `stock.*`: what settings return to after experiments, if not as wattif found them (`"found"`).
 - `experiments.risky`: settings kept out of automatic runs.
 - `apps.groups`: your timeline groups.
 

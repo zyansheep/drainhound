@@ -680,6 +680,18 @@ class CommandTests(unittest.TestCase):
         note, _ = panel_data.apply_note(None, 'comfort\n', self.REFUSED)  # goal --apply, combination computed by the CLI.
         self.assertTrue(note.startswith('Applied until reboot. Not applied: aspm (risky: add --risky); apst'))
 
+    def test_apply_never_calls_a_setting_it_left_as_it_was_applied(self):
+        already = 'wattif experiment: already so, left as they are: profile; abm\n'
+        self.assertEqual(panel_data.left_alone(already), ['profile', 'abm'])
+        self.assertEqual(panel_data.apply_note(['profile=normal', 'abm=saving', 'cpu-cap=saving'], '', already),
+                         ('Applied until reboot: cpu-cap. Already so, left as they are: profile, abm.', None))
+        self.assertEqual(panel_data.apply_note(['profile=normal', 'abm=saving'], '', already)[0],
+                         'Already so, left as they are: profile, abm.')  # "Already set": nothing changed.
+        note, _ = panel_data.apply_note(['aspm=saving', 'abm=saving'], '',
+                                        self.REFUSED + 'wattif experiment: already so, left as they are: abm\n')
+        self.assertEqual(note, 'Already so, left as they are: abm. Nothing applied: aspm (risky: add --risky); '
+                               'apst (quarantined: `wattif experiment release apst`).')
+
     def test_failures_and_notices_stay_and_plain_notes_wait_for_the_next_command(self):
         self.assertEqual(panel_data.command_note(False, '', 'watchdog: xHCI controller died; quarantined: aspm.\n'),
                          ('Command failed: watchdog: xHCI controller died; quarantined: aspm.', panel_data.NOTE_SECONDS))

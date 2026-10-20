@@ -1671,7 +1671,9 @@ def recommendations(levers, quality, energy=None, power=None, exclude=()):
     they are: 'battery' the lowest draw, 'comfort' the likeliest 👍 (to a
     percentage point; then Battery's changes; Battery's until a 👍 exists to
     learn from). Each: the combination, `apply` (wattif experiment apply
-    arguments for all of it), what it changes from your settings (`change`,
+    arguments for all of it, as saving|normal states: apply sets those not in
+    their state then and leaves the rest as they are, so an 'already set' one
+    changes nothing), what it changes from your settings (`change`,
     with `gain` and `interval` per full charge, and for comfort `delight`, the
     👍 chance per block now → then) and all of it as `text`."""
     measured = {e['experiment'] for e in levers['effects']}
@@ -1684,7 +1686,7 @@ def recommendations(levers, quality, energy=None, power=None, exclude=()):
         best = best_config(levers, measured, energy, power, feasible=fine, key=key, exclude=exclude)
         entry = {'best': best, 'apply': [], 'change': 'nothing measured yet', 'gain': '', 'interval': '',
                  'delight': ''}
-        if best:  # Every setting in it: applying must hold wherever the settings are now.
+        if best:  # Every setting in it, as states: applying holds wherever the settings are now.
             entry['apply'] = [f"{n}={'saving' if on else 'normal'}" for n, on in best['config'].items()]
             # Non-breaking inside each setting, so wrapped lines break only between settings.
             entry['change'] = ', '.join(PHRASES.get(n, (n, n))[0 if best['config'][n] else 1].replace(' ', '\u00a0')
