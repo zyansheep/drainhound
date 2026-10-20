@@ -1,6 +1,8 @@
-/* Shared GTK4 palette, matched to nm-sidebar's dark Libadwaita theme.
- * Consumed by audio-sidebar and SwayNC. Keep these in sync with the
- * Wi-Fi panel when changing the desktop theme. */
+/* The battery panel's colours (GTK4 CSS), read after panel.py's built-in
+ * PALETTE: edit this file, or replace it with your desktop's shared palette,
+ * to restyle the panel to match other panels. It is optional: without it the
+ * panel uses the same values, built in. The panel is dark (its charts are drawn
+ * on #222226), so keep these dark too. */
 @define-color menu_bg #222226;
 @define-color menu_card #343437;
 @define-color menu_hover #414144;

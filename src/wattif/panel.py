@@ -30,15 +30,11 @@ from . import report  # noqa: E402
 from .panel_data import (GONE, NOTE_SECONDS, History, apply_note, banner_text, command_note, duration,  # noqa: E402
                         gather, health_text, interaction_clear, lever_rows, no_levers, picker, read_battery,
                         read_estimate, status_line, typical_text, value_text, what_if_note)
+from .panel_data import BLUE, GREEN, ORANGE, chart_colors  # noqa: E402
 from .report import PHRASES  # noqa: E402
 
-# Categorical slots in validated order (dark surface #222226): adjacent stack
-# pairs clear CVD ΔE 8.4 / normal 19.3. Neutrals carry the always-on baseline.
-COLORS = {
-    'Idle chip': '#707076', 'Rest of system': '#aaaab0',
-    'Browser': '#3987e5', 'Builds & EDA': '#d95926', 'Coding tools': '#199e70', 'Display': '#c98500',
-    'Chat & media': '#d55181', 'Other apps': '#008300', 'Desktop & system': '#9085e9',
-}
+# The stack's colours, bottom up; the app groups' follow their configured names (panel_data.chart_colors).
+COLORS = chart_colors(report.GROUPS)
 STACK = list(COLORS)
 SURFACE, CARD = (0x22 / 255, 0x22 / 255, 0x26 / 255), (0x34 / 255, 0x34 / 255, 0x37 / 255)
 INK, MUTED, GRID = (1, 1, 1), (1, 1, 1, .68), (1, 1, 1, .08)
@@ -363,7 +359,7 @@ class SleepChart(Chart):
             cr.set_source_rgb(*SURFACE)
             cr.fill()  # 2px surface ring keeps overlapping dots distinct.
             cr.arc(x, y, radius, 0, 2 * math.pi)
-            cr.set_source_rgba(*rgb(COLORS['Browser']))
+            cr.set_source_rgba(*rgb(BLUE))
             cr.fill()
             if self.hover and math.hypot(self.hover[0] - x, self.hover[1] - y) < best:
                 nearest, best = s, math.hypot(self.hover[0] - x, self.hover[1] - y)
@@ -371,7 +367,7 @@ class SleepChart(Chart):
             text(cr, label, sx(t), height - 18, 8, MUTED, align='center')
         if nearest:
             s = nearest
-            tooltip(cr, [(f"{s['pct_per_hour']:.1f} %/h", f"{s['watts']:.2f} W while asleep", COLORS['Browser']),
+            tooltip(cr, [(f"{s['pct_per_hour']:.1f} %/h", f"{s['watts']:.2f} W while asleep", BLUE),
                          (duration(s['hours']), f"{clock(s['start'], True)} → {clock(s['end'], True)}", None),
                          (f"{s['pct_before']:.0f}% → {s['pct_after']:.0f}%", 'battery', None)],
                     *self.hover, width, height)
@@ -431,7 +427,7 @@ class WhatIfChart(Chart):
                 text(cr, row['pending'], plot_x0, y + 6, 9, (*rgb(COLORS['Display'])[:3], .9))
                 continue
             measured = row['evidence'] in ('experiment', 'boot')
-            color = COLORS['Coding tools'] if measured else COLORS['Browser']
+            color = GREEN if measured else BLUE
             x0, x1 = sorted((sx(0), sx(row['minutes'])))
             rounded(cr, x0, y + 6, max(2, x1 - x0), self.ROW - 12, 3)
             if measured:
@@ -467,12 +463,12 @@ class WhatIfChart(Chart):
         lines = [(f"{row['minutes']:+.1f} min", 'per full charge', None),
                  (f"{row['watts']:+.2f} W", 'average saving', None)]
         if row['evidence'] == 'experiment':
-            lines.append((f"{row['pairs']} pairs", 'of randomized A/B blocks', COLORS['Coding tools']))
+            lines.append((f"{row['pairs']} pairs", 'of randomized A/B blocks', GREEN))
         elif row['evidence'] == 'boot':
             lines.append((f"{row['boots']['on']}+{row['boots']['off']} boots", 'with / without, load-adjusted',
-                          COLORS['Coding tools']))
+                          GREEN))
         else:
-            lines.append(('Model', 'removes activity; ×chip cost', COLORS['Browser']))
+            lines.append(('Model', 'removes activity; ×chip cost', BLUE))
         if row.get('low') is not None:
             lines.append((f"{row['low']:+.0f} … {row['high']:+.0f}", '90% interval (min)', None))
         return lines
@@ -530,7 +526,7 @@ class GainBar(Gtk.DrawingArea):
         cr.stroke()
         if not bar.gain or bar.gain.get('minutes') is None or not math.isfinite(bar.gain['minutes']):
             return
-        color = COLORS['Coding tools'] if bar.gain['minutes'] >= 0 else COLORS['Builds & EDA']
+        color = GREEN if bar.gain['minutes'] >= 0 else ORANGE
         x0, x1 = sorted((sx(0), sx(bar.gain['minutes'])))
         rounded(cr, x0, 4, max(2, x1 - x0), height - 8, 3)
         cr.set_source_rgba(*rgb(color))
@@ -589,8 +585,7 @@ class BatteryPanel(Adw.Application):
         show.connect('activate', self.show_page)
         self.add_action(show)
         css = Gtk.CssProvider()
-        palette = Path(__file__).with_name('menu-theme.css')
-        css.load_from_data((palette.read_bytes() if palette.exists() else b'') + CSS)
+        css.load_from_data(stylesheet())
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), css,
                                                   Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         self.build()
@@ -1514,6 +1509,25 @@ class BatteryPanel(Adw.Application):
                              + (f'\n{self.note}' if self.note else ''))
 
 
+# The panel's palette (dark: it forces Adwaita's dark style, and its charts are
+# drawn on SURFACE). A menu-theme.css beside this file, defining the same
+# @menu_* colours, overrides it, to match other panels of a desktop theme.
+PALETTE = b"""
+@define-color menu_bg #222226;
+@define-color menu_card #343437;
+@define-color menu_hover #414144;
+@define-color menu_active #343f4f;
+@define-color menu_active_hover #3a485c;
+@define-color menu_accent #3584e4;
+@define-color menu_fg #ffffff;
+@define-color menu_muted rgba(255, 255, 255, 0.68);
+@define-color menu_border rgba(255, 255, 255, 0.06);
+@define-color menu_border_strong rgba(255, 255, 255, 0.12);
+"""
+# Font Awesome's thumbs (qol.GLYPHS) need its font; plain emoji need none.
+THUMB_FONT = b"""
+#battery-card .thumb { font-family: "Font Awesome 7 Free"; font-weight: 900; }
+"""
 CSS = b"""
 window { background: transparent; }
 #battery-card { background: @menu_bg; color: @menu_fg; border: 1px solid @menu_border;
@@ -1527,11 +1541,20 @@ window { background: transparent; }
 #battery-card .result { font-weight: bold; font-size: 12px; }
 #battery-card list { background: @menu_card; border-radius: 10px; }
 #battery-card button:hover { background: @menu_hover; }
-#battery-card .thumb { font-family: "Font Awesome 7 Free"; font-weight: 900; }
 popover.hint > contents { background: @menu_card; color: @menu_fg; padding: 6px 9px; font-size: 12px; }
 #battery-card button.vote-up .thumb { color: #8fdf8f; }
 #battery-card button.vote-down .thumb { color: #e5484d; }
 """
+
+
+def stylesheet(theme=Path(__file__).with_name('menu-theme.css'), glyphs=None):
+    """PALETTE, then a theme's colours if there is one (a later @define-color wins), then the rules."""
+    glyphs = config.get('waybar', 'glyphs') if glyphs is None else glyphs
+    try:
+        overrides = Path(theme).read_bytes()
+    except OSError:
+        overrides = b''
+    return PALETTE + overrides + CSS + (THUMB_FONT if glyphs == 'fontawesome' else b'')
 
 
 def main(argv):

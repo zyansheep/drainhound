@@ -51,9 +51,15 @@ DEFAULTS = {
         # Executable (or Electron app directory) → the name logged and shown;
         # added to the built-in table (collector.APP_NAMES).
         'names': {},
-        # Timeline groups: name → executable or app-name prefixes (lower case).
-        # Replaces the built-in groups (report.GROUPS) when given.
+        # Timeline groups: name → executable or app-name prefixes (matched
+        # ignoring case), in the order the chart stacks and colours them.
+        # Replaces the built-in groups (report.GROUPS) when given; apps in none
+        # are "Other apps". The group that matches 'kernel' is the desktop's own:
+        # never suggested for closing.
         'groups': None,
+        # Where contrib/firefox-bridge.js writes which site each Firefox-family
+        # content process shows (empty: $XDG_RUNTIME_DIR/firefox-processes).
+        'firefox_processes': '',
     },
     # Processes whose presence means the screen is locked (also logind's LockedHint).
     'session': {'lockers': ['swaylock', 'hyprlock', 'gtklock', 'waylock', 'i3lock', 'physlock']},
@@ -95,7 +101,12 @@ DEFAULTS = {
     'panel': {'margin': 32},  # px between the screen's top edge and the panel (your bar's height).
     'waybar': {
         'signal': 12,  # The vote modules refresh on SIGRTMIN+signal.
-        'glyphs': 'fontawesome',  # 'fontawesome' or 'text'.
+        # 'fontawesome' (Font Awesome's icons, in the bar and the panel) or 'text'
+        # (plain Unicode: ⚡ 🔌 ⏳ 👍 👎, for bars without Font Awesome).
+        'glyphs': 'fontawesome',
+        # `wattif waybar battery`: a tooltip with the time left, sleep and battery
+        # use (turn it off if your bar shows its own panel on hover).
+        'tooltip': True,
     },
     'log': {
         # Small JSON state files logged with every record, as display.<name>.

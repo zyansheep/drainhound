@@ -5,6 +5,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import sys
 import time
@@ -17,17 +18,55 @@ TICKS = os.sysconf('SC_CLK_TCK')
 PAGE = os.sysconf('SC_PAGE_SIZE')
 
 
-APP_NAMES = {
-    'floorp': 'Floorp', 'firefox': 'Firefox', 'chromium': 'Chromium',
-    'chrome': 'Chrome', 'chatgpt': 'ChatGPT', 'codium': 'VSCodium',
-    'code': 'VS Code', 'vesktop': 'Vesktop', 'vesktop.bin': 'Vesktop', 'obsidian': 'Obsidian',
-    't3code': 'T3 Code', 'electron': 'Electron', 'niri': 'Niri',
-    'waybar': 'Waybar', 'swaync': 'Notifications',
-    'wattif': 'wattif',
-    'pipewire': 'PipeWire', 'pipewire-pulse': 'PipeWire audio',
-    'wireplumber': 'WirePlumber', 'cc1': 'C compiler', 'cc1plus': 'C++ compiler',
+# Executable (lower case, '-wrapped' and a leading '.' gone) → the name logged and
+# shown; anything else is logged by its executable's name. [apps] names adds to it.
+BUILTIN_NAMES = {
+    # Firefox and its forks: content processes share the browser's executable.
+    'firefox': 'Firefox', 'firefox-esr': 'Firefox', 'firefox-bin': 'Firefox', 'firefox-nightly': 'Firefox',
+    'firefox-developer-edition': 'Firefox', 'librewolf': 'LibreWolf', 'floorp': 'Floorp', 'zen': 'Zen Browser',
+    'zen-bin': 'Zen Browser', 'waterfox': 'Waterfox', 'mullvadbrowser': 'Mullvad Browser',
+    # Chromium and its relatives: helpers say what they are with --type=.
+    'chromium': 'Chromium', 'chromium-browser': 'Chromium', 'chrome': 'Chrome', 'google-chrome': 'Chrome',
+    'brave': 'Brave', 'vivaldi-bin': 'Vivaldi', 'msedge': 'Microsoft Edge', 'opera': 'Opera',
+    'epiphany': 'GNOME Web', 'falkon': 'Falkon', 'qutebrowser': 'qutebrowser',
+    # Editors and coding apps.
+    'code': 'VS Code', 'code-oss': 'Code - OSS', 'codium': 'VSCodium', 'vscodium': 'VSCodium', 'cursor': 'Cursor',
+    'windsurf': 'Windsurf', 'zed': 'Zed', 'zeditor': 'Zed', 'zed-editor': 'Zed', 't3code': 'T3 Code',
+    'emacs': 'Emacs', 'nvim': 'Neovim', 'neovide': 'Neovide', 'sublime_text': 'Sublime Text', 'kate': 'Kate',
+    'gnome-text-editor': 'Text Editor', 'electron': 'Electron',
+    'cc1': 'C compiler', 'cc1plus': 'C++ compiler',
+    'gnome-terminal-server': 'GNOME Terminal', 'kgx': 'Console', 'wezterm-gui': 'WezTerm',
+    # Chat and media.
+    'vesktop': 'Vesktop', 'vesktop.bin': 'Vesktop', 'discord': 'Discord', 'signal-desktop': 'Signal',
+    'slack': 'Slack', 'element-desktop': 'Element', 'element': 'Element', 'telegram-desktop': 'Telegram',
+    'teams-for-linux': 'Teams', 'mattermost-desktop': 'Mattermost',
+    'zoom': 'Zoom', 'thunderbird': 'Thunderbird', 'spotify': 'Spotify', 'vlc': 'VLC', 'obs': 'OBS Studio',
+    'pipewire': 'PipeWire', 'pipewire-pulse': 'PipeWire audio', 'wireplumber': 'WirePlumber',
+    # Notes and other apps.
+    'obsidian': 'Obsidian', 'logseq': 'Logseq', 'joplin': 'Joplin', 'bitwarden': 'Bitwarden',
+    # The desktop itself.
+    'niri': 'Niri', 'sway': 'Sway', 'hyprland': 'Hyprland', 'gnome-shell': 'GNOME Shell',
+    'kwin_wayland': 'KWin', 'kwin_x11': 'KWin', 'plasmashell': 'Plasma', 'waybar': 'Waybar',
+    'swaync': 'Notifications', 'mako': 'Notifications', 'dunst': 'Notifications', 'wattif': 'wattif',
 }
-BROWSERS = {'Floorp', 'Firefox', 'Chromium', 'Chrome'}
+
+
+def configured_names(names=None):
+    """[apps] names (or `names`): {executable or Electron app directory, lower case: name}."""
+    names = config.get('apps', 'names') if names is None else names
+    return {str(exe).lower(): str(name) for exe, name in (names if isinstance(names, dict) else {}).items()}
+
+
+APP_NAMES = {**BUILTIN_NAMES, **configured_names()}
+FIREFOXES = {'Firefox', 'LibreWolf', 'Floorp', 'Zen Browser', 'Waterfox', 'Mullvad Browser'}
+CHROMIUMS = {'Chromium', 'Chrome', 'Brave', 'Vivaldi', 'Microsoft Edge', 'Opera'}
+BROWSERS = FIREFOXES | CHROMIUMS | {'GNOME Web', 'Falkon', 'qutebrowser'}
+# Directories that name an app run by a shared electron binary (in its app.asar's
+# or main script's path), as distributions install them; the first match wins.
+# The [apps] names keys count too.
+ELECTRON_APPS = ('vesktop', 'discord', 'obsidian', 't3code', 'codium', 'vscodium', 'code-oss', 'cursor',
+                 'signal-desktop', 'element-desktop', 'element', 'slack', 'teams-for-linux', 'logseq', 'joplin',
+                 'bitwarden', 'mattermost-desktop') + tuple(configured_names())
 
 
 def executable_name(value):
@@ -43,7 +82,7 @@ def process_identity(directory, comm):
         exe = executable_name(comm)
     app = APP_NAMES.get(exe.lower())
     args = []
-    if exe.lower().startswith('electron') or app in {'Chromium', 'Chrome'}:
+    if exe.lower().startswith('electron') or app in CHROMIUMS:
         try:
             with (directory / 'cmdline').open('rb') as command:
                 args = command.read(16384).decode(errors='replace').split('\0')
@@ -56,9 +95,9 @@ def process_identity(directory, comm):
         for arg in args[:4]:
             if arg.startswith('/') and arg.endswith(('.asar', '.js')):
                 parts = {part.lower() for part in Path(arg).parts}
-                for key in ('vesktop', 'obsidian', 't3code', 'codium'):
+                for key in ELECTRON_APPS:
                     if key in parts:
-                        app = APP_NAMES[key]
+                        app = APP_NAMES.get(key, key)
                         break
     role = next((a.partition('=')[2] for a in args if a.startswith('--type=')), '')
     return app, role
@@ -199,11 +238,25 @@ class History:
         return {'cpu': cpu, 'memory': ram, 'coverage': round(covered), 'timestamp': time.time()}
 
 
+def browser_directory():
+    """Where contrib/firefox-bridge.js writes each Firefox-family browser's
+    content processes ([apps] firefox_processes, else $XDG_RUNTIME_DIR/firefox-processes)."""
+    if configured := config.get('apps', 'firefox_processes'):
+        return Path(os.path.expandvars(str(configured))).expanduser()
+    runtime = os.environ.get('XDG_RUNTIME_DIR')
+    return Path(runtime) / 'firefox-processes' if runtime else None
+
+
+BRIDGED = re.compile(r'(.+) (?:web|worker) · PID \d+')  # process_label's rows for a browser's content processes.
+
+
 def browser_labels(state, current, directory, now=None):
-    """Enrich display rows after accounting; changing titles cannot split CPU history."""
+    """Enrich display rows after accounting; changing titles cannot split CPU history.
+    Rows of FIREFOXES' content processes get the site they show, from the files
+    the bridge writes in `directory` (None: no bridge)."""
     now = time.time() if now is None else now
     labels = {}
-    for path in directory.glob('*.json'):
+    for path in directory.glob('*.json') if directory is not None else ():
         try:
             if path.stat().st_size > 1024 * 1024:
                 continue
@@ -213,7 +266,8 @@ def browser_labels(state, current, directory, now=None):
             for row in data['processes'][:2048]:
                 key = (int(row['pid']), int(row['start']))
                 process = current.get(key)
-                if not process or not process[0].startswith(('Floorp web · PID ', 'Floorp worker · PID ')):
+                bridged = BRIDGED.fullmatch(process[0]) if process else None
+                if not bridged or bridged[1] not in FIREFOXES:
                     continue
                 origin = str(row['origin']).split('^')[0]
                 if not origin:
@@ -221,7 +275,7 @@ def browser_labels(state, current, directory, now=None):
                 title = next((t for t in row.get('titles', []) if isinstance(t, str) and t), '')
                 detail = origin + (' · ' + title if title else '')
                 detail = ' '.join(detail.split())[:160]
-                labels[process[0]] = f'Floorp · {detail} · PID {key[0]}'
+                labels[process[0]] = f'{bridged[1]} · {detail} · PID {key[0]}'
         except (OSError, ValueError, TypeError, KeyError, AttributeError):
             continue
     for kind in ('cpu', 'memory'):
@@ -248,7 +302,7 @@ def single_instance(state):
     return handle
 
 
-def collect(power, history, directory, began, scan=processes, sensors=temperatures):
+def collect(power, history, directory, began, scan=processes, sensors=temperatures, browsers=browser_directory):
     """One sample: scan processes, then read the clocks, so a record's interval
     ends where its process and counter readings do. A suspend during the scan
     (uptime jumped) discards the sample (None): the next one reports the gap."""
@@ -257,7 +311,7 @@ def collect(power, history, directory, began, scan=processes, sensors=temperatur
     if boot - began > RECORD:
         return None
     state = history.sample(boot, current)
-    browser_labels(state, history.previous, directory.parent / 'floorp-monitor')
+    browser_labels(state, history.previous, browsers())
     state['temperature'] = sensors()
     state['battery'] = power.update(boot, wall, current)
     temporary = directory / 'snapshot.tmp'
