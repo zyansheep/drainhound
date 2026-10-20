@@ -9,6 +9,7 @@ manual and automatic experiments, votes, suspends) with everyday app names.
 """
 import contextlib
 import sys
+import time
 from pathlib import Path
 
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parents[1] / 'src')]
@@ -26,7 +27,8 @@ def main(directory):
     db = state / 'power.sqlite3'
     if db.exists():
         sys.exit(f'{db} exists; give an empty directory')
-    minutes, events = month()
+    # The month's last day began 8 hours ago, so 'Now' shows its battery time.
+    minutes, events = month(now=time.time() + 16 * 3600)
     for m in minutes:
         if m.get('apps'):
             apps = {NAMES.get(name, name): values for name, values in m['apps'].items()}

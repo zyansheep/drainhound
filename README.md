@@ -31,6 +31,12 @@ and fits what each one saves.
   Firefox: +38 min per charge") and the experiments. There's also a Waybar
   module, and a CLI for everything.
 
+![The panel's timeline: average watts by part and app group, battery level, sleep](docs/images/timeline.png)
+
+![The panel's experiments: each setting's measured gain per full charge, with its 90% interval](docs/images/experiments.png)
+
+<sub>(Synthetic data from `tools/demo.py`.)</sub>
+
 Everything stays on your machine: a SQLite database in `~/.local/state/wattif`.
 App names are coarse (no command lines, URLs or window titles).
 
