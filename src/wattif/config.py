@@ -106,7 +106,9 @@ DEFAULTS = {
         'glyphs': 'fontawesome',  # 'fontawesome' or 'text'.
     },
     'log': {
-        # Small JSON state files logged with every record, as display.<name>.
+        # Small JSON state files logged with every record, as display.<name>
+        # (name → path; ~ and $VARS expand). A file with {"night": …,
+        # "grayscale": …} logged as `panel` fills the night_light and grayscale columns.
         'extra': {},
     },
 }

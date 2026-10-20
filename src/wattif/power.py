@@ -1409,12 +1409,16 @@ class Monitor:
             'locked': any(entry[3] == 'swaylock' for entry in processes.values()),
             **thermal(self.sys),
         }
-        panel = Path(os.environ.get('XDG_STATE_HOME', Path.home() / '.local/state')) / 'display-panel/state.json'
-        try:
-            if panel.stat().st_size < 4096:
-                record['display']['panel'] = json.loads(panel.read_text())
-        except (OSError, ValueError):
-            pass
+        for name, path in (config.get('log', 'extra') or {}).items():
+            # Small JSON state files the config names, logged as display.<name>: a
+            # display panel's {night, grayscale} as `panel` fills the store's
+            # night_light and grayscale columns.
+            path = Path(os.path.expandvars(os.path.expanduser(str(path))))
+            try:
+                if path.stat().st_size < 4096:
+                    record['display'][name] = json.loads(path.read_text())
+            except (OSError, ValueError):
+                pass
         if (assignment := experiment_assignment(self.experiment, record['t0'], record['t1'])) is not None:
             record['exp'] = assignment
         if self.clock() - boot > RECORD:

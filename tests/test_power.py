@@ -669,6 +669,20 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(self.rows('SELECT mhz_active, active_n, min_mhz FROM records'), [(3000.0, 1.0, 406.0)])
         self.assertEqual(self.rows('SELECT ghz_active, purity FROM minutes'), [(3.0, 1.0)])
 
+    def test_configured_state_files_are_logged_with_each_record(self):
+        state = Path(self.tmp.name) / 'panel.json'
+        state.write_text(json.dumps({'night': True, 'grayscale': False}))
+        extra = {'panel': str(state), 'missing': str(Path(self.tmp.name) / 'nothing.json')}
+        with mock.patch.dict(power.config.SETTINGS['log'], {'extra': extra}):
+            monitor = self.monitor()
+            for _ in range(6):
+                self.tick(monitor)
+            monitor.close()
+        (record,) = monitor.log.recent(0)
+        self.assertEqual(record['display']['panel'], {'night': True, 'grayscale': False})
+        self.assertNotIn('missing', record['display'])
+        self.assertEqual(self.rows('SELECT night_light, grayscale FROM records'), [(1, 0)])
+
     def test_counters_are_rated_over_their_own_snapshots(self):
         # 12 cores flat out. The record's counter snapshot is read 0.5 s after the
         # record's end (a slow scan): 10.5 s of CPU time against dt = 10 s.
