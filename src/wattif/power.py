@@ -21,6 +21,7 @@ from sys import stderr
 from pathlib import Path
 
 from . import battery as batteries
+from . import compositor
 from . import config
 from . import qol
 from . import store
@@ -289,7 +290,8 @@ class FastSampler:
 
     Device paths are looked up again after MISSES failed reads in a row (or while
     missing): hwmon and power-supply directories can be re-created and renumbered.
-    `battery` is every battery (batteries.find), their watts summed. The chip's
+    `battery` is every battery (batteries.find), their watts summed, and looked up
+    again every MISSES samples whatever their reads (battery_paths). The chip's
     source (find_chip) goes into the record as soc.src; one that counts energy
     (RAPL) gives the record's mean by time.
     """
@@ -301,6 +303,7 @@ class FastSampler:
                      'chip': lambda: find_chip(sys, self.known, sensor),
                      'gpu_busy': lambda: find_gpu_busy(sys, self.known), 'metrics': lambda: find_metrics(sys, self.known)}
         self.misses = collections.Counter()
+        self.looks = 0  # Samples taken: the batteries are looked up again every MISSES.
         self.battery, self.chip, self.gpu_busy, self.metrics = (
             self.find[name]() for name in ('battery', 'chip', 'gpu_busy', 'metrics'))
         self.reset()
@@ -320,13 +323,28 @@ class FastSampler:
             self.misses[name] += 1
         return path
 
+    def battery_paths(self):
+        """The batteries, as path('battery'), and also looked up again every
+        MISSES samples: a set of them is more than one path, and each can read
+        well while another is put in (a second battery, a removable one back in
+        its bay), which failed reads never show."""
+        self.looks += 1
+        if self.battery is not None and self.looks % MISSES == 0:
+            self.battery = self.find['battery']()
+        return self.path('battery')
+
     def got(self, name, value):
         self.misses[name] = 0 if value is not None else self.misses[name] + 1
         return value
 
     def sample(self):
-        if (paths := self.path('battery')) is not None:
+        if (paths := self.battery_paths()) is not None:
             self.status, watts = batteries.watts(paths)
+            if watts is None and not all(path.exists() for path in paths):
+                # One has gone (taken out): the rest at once, not MISSES samples of none.
+                self.battery = self.find['battery']()
+                if self.battery is not None:
+                    self.status, watts = batteries.watts(self.battery)
             if self.got('battery', watts) is not None:
                 self.values['bat'].append(watts)
         if (chip := self.path('chip')) is not None and self.got('chip', value := chip.read()) is not None:
@@ -630,12 +648,8 @@ class Commands:
                 state = self.run(['iw', 'dev', iface, 'get', 'power_save'])
                 if 'Power save:' in state:
                     self.value.setdefault('wifi_ps', {})[iface] = state.split(':')[1].strip()
-        if shutil.which('niri') and os.environ.get('NIRI_SOCKET'):
-            try:
-                outputs = json.loads(self.run(['niri', 'msg', '-j', 'outputs']) or '{}')
-                self.value['niri'] = [niri_output(o) for o in outputs.values() if isinstance(o, dict)]
-            except ValueError:
-                pass
+        if (outputs := compositor_outputs(self.run)) is not None:
+            self.value['compositor'] = outputs
         return self.value
 
     @staticmethod
@@ -653,6 +667,42 @@ def niri_output(output):
     return {'name': output.get('name'), 'w': mode.get('width'), 'h': mode.get('height'),
             'hz': mode.get('refresh_rate') and round(mode['refresh_rate'] / 1000, 2),
             'vrr': output.get('vrr_enabled'), 'scale': logical.get('scale'), 'on': bool(mode)}
+
+
+def sway_output(output):
+    """One output of `swaymsg -t get_outputs`, as niri_output has niri's. A
+    disabled output has no mode (on: False); one sway has powered down (DPMS:
+    `power`, `dpms` before sway 1.8) keeps its mode but isn't on."""
+    mode = (output.get('current_mode') if output.get('active', True) else None) or {}
+    awake = output.get('power', output.get('dpms', True)) is not False
+    return {'name': output.get('name'), 'w': mode.get('width'), 'h': mode.get('height'),
+            'hz': mode.get('refresh') and round(mode['refresh'] / 1000, 2),
+            'vrr': output.get('adaptive_sync_status') == 'enabled' if 'adaptive_sync_status' in output else None,
+            'scale': output.get('scale') if mode else None, 'on': bool(mode) and awake}
+
+
+# The compositors whose outputs the collector logs, by compositor.detect()'s name:
+# the command and how its reply lists outputs.
+OUTPUTS = {'niri': (['niri', 'msg', '-j', 'outputs'], lambda reply: reply.values(), niri_output),
+           'sway': (['swaymsg', '-r', '-t', 'get_outputs'], lambda reply: reply, sway_output)}
+
+
+def compositor_outputs(run, environ=None):
+    """The record's display.compositor: {'name': 'niri' or 'sway', 'outputs':
+    [{'name', 'w', 'h', 'hz', 'vrr', 'scale', 'on'}]} from the compositor this
+    session runs, chosen as throttle and freeze choose it (compositor.detect()),
+    or None (another, none, or no reply). Records before sway was logged have
+    niri's outputs, in the same shape, as display.niri (store.edp reads either)."""
+    if (name := compositor.detect(environ).name) not in OUTPUTS:
+        return None
+    command, listed, shape = OUTPUTS[name]
+    if not shutil.which(command[0]):
+        return None
+    try:
+        return {'name': name, 'outputs': [shape(o) for o in listed(json.loads(run(command) or 'null'))
+                                          if isinstance(o, dict)]}
+    except (ValueError, TypeError, AttributeError):  # No reply, or not the shape asked for.
+        return None
 
 
 # --- Per-process GPU and IO ----------------------------------------------------
@@ -1382,8 +1432,8 @@ class Monitor:
         disk = device_deltas(counters['disk'], before['disk'], scale)
         slow = self.commands.read(boot)
         shown = display(self.sys)
-        if 'niri' in slow:
-            shown['niri'] = slow['niri']
+        if 'compositor' in slow:
+            shown['compositor'] = slow['compositor']
         system = settings(self.sys)
         if self.throttle is not None:
             system['throttle'] = throttle_state(self.throttle)

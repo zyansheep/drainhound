@@ -158,6 +158,19 @@ class StoreTests(unittest.TestCase):
                          ('balanced', '0', 'on', 60.0, True))
         self.assertEqual(store.active_apps(raw), [('nix', None, None, None, None, 4096)])
 
+    def test_the_internal_panel_is_any_built_in_connector_from_either_compositor(self):
+        raw, external = record(1000.0), {'name': 'DP-3', 'hz': 144.0, 'on': True}
+        for display, hz, on in (
+                ({'niri': [external, {'name': 'eDP-1', 'hz': 60.0, 'on': True}]}, 60.0, True),   # Before sway.
+                ({'compositor': {'name': 'sway', 'outputs': [external, {'name': 'LVDS-1', 'hz': 59.95, 'on': True}]}},
+                 59.95, True),
+                ({'compositor': {'name': 'niri', 'outputs': [{'name': 'DSI-1', 'hz': 60.0, 'on': False}]}}, 60.0, False),
+                ({'niri': [external]}, None, None), ({'compositor': {'outputs': 'odd'}}, None, None),
+                ({'niri': 5}, None, None), ({}, None, None)):
+            raw['display'] = display
+            row = store.record_row(raw)
+            self.assertEqual((row['hz'], row['screen_on']), (hz, on), display)
+
     def test_reading_without_a_database_is_empty(self):
         self.assertEqual(store.load_range(*self.span, self.db), ([], []))
         self.assertFalse(self.db.exists())
