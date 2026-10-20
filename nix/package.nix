@@ -8,6 +8,7 @@
   gtk4-layer-shell,
   adwaita-icon-theme,
   makeWrapper,
+  makeFontsConf,
   # What drainhound runs: Wi-Fi power save, PipeWire's stream list, notifications,
   # pkill (Waybar refresh) and systemd's tools. The compositor's own CLI (niri
   # msg, swaymsg) comes from the session's PATH.
@@ -69,6 +70,8 @@ in
     nativeCheckInputs = [python3Packages.numpy];
     checkPhase = ''
       runHook preCheck
+      # The panel's test draws text: a fontconfig of its own, quiet in the sandbox.
+      export FONTCONFIG_FILE=${makeFontsConf {fontDirectories = [];}} XDG_CACHE_HOME=$TMPDIR/cache
       ${python3Packages.python.interpreter} -m unittest discover -s tests -t .
       runHook postCheck
     '';
