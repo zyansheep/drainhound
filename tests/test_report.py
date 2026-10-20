@@ -593,11 +593,13 @@ class AttributionTests(unittest.TestCase):
     MODEL = dict(report.PRIOR, floor=2.5, load=.15, clock=3.0, idle_ghz=1.0, chip=1.4, bl=3.0,
                  **{'idle_ghz:low-power': 1.0, 'idle_ghz:balanced': 1.5, 'idle_ghz:balanced:ac': 1.9})
 
-    def steady(self, mhz, status='Discharging', profile='balanced', active=None, bat=20.0):
+    def steady(self, mhz, status='Discharging', profile='balanced', active=None, bat=20.0, chip=True):
         records = []
         for i in range(6):
             r = record(T0 + 10 * (i + 1) - 5, bat=bat, soc=8.0, busy=3.0, mhz=mhz, status=status, bl=.5,
                        apps={'Floorp': {'cpu': 12.0, 'gpu': 1.0}, 'yosys': {'cpu': 6.0}})
+            if not chip:
+                r['soc'] = {}  # No chip power reading (FastSampler found none).
             r['settings'] = {'platform_profile': profile}
             r['net'] = {'wlan0': {'rx': 2e6, 'tx': 1e6}}
             if active:
@@ -916,6 +918,314 @@ class SmallerFixesTests(unittest.TestCase):
         self.assertIn('experiment', model)
         self.assertLess(report.qol_risk({'down': model}, {}, experiment=False),
                         report.qol_risk({'down': model}, {}, experiment=True) + 1e-9)
+
+
+
+# --- Laptops without chip power ------------------------------------------------------------
+
+# A one-stage truth, in battery W: the idle laptop, per GHz of mean clock above
+# the profile's idle placeholder, per busy core·GHz², per share of GPU time,
+# per unit of brightness and per MB/s of Wi-Fi.
+ONE_STAGE = {'floor': 4.0, 'clock': 4.2, 'load': 0.2, 'gpu': 6.0, 'bl': 3.5, 'wifi': 0.4}
+ASPM_SAVES = 1.2  # W, in the ASPM experiment's saving blocks.
+
+
+def battery_only_minutes(n, seed, noise=0.2):
+    """Minutes of a laptop without a chip power reading (no 'soc'), whose
+    battery draw follows ONE_STAGE: chip_minutes' clock and load (16 CPUs,
+    two profiles), GPU and Wi-Fi, two apps sharing the load, and in the
+    second half an ASPM experiment whose saving blocks save ASPM_SAVES."""
+    rng, out = np.random.default_rng(seed), []
+    for i, m in enumerate(chip_minutes(n, seed)):
+        del m['soc']
+        placeholder = 1.12 if m['set']['profile'] == 'balanced' else 0.41
+        gpu, wifi, heavy = rng.uniform(0, .3), rng.uniform(0, 2), rng.uniform(0, 1)
+        aspm = i >= n // 2 and (i // 4) % 2 == 1
+        value = 'powersupersave' if aspm else 'performance'
+        m.update(gpu=gpu, wifi=wifi, set=dict(m['set'], aspm=value),
+                 apps={'yosys': [m['load'] * heavy, 0, 0], 'Floorp': [m['load'] * (1 - heavy) * .3, gpu, 0]},
+                 truth=(ONE_STAGE['floor'] + ONE_STAGE['clock'] * (m['ghz'] - placeholder)
+                        + ONE_STAGE['load'] * m['load'] + ONE_STAGE['gpu'] * gpu + ONE_STAGE['bl'] * m['bl']
+                        + ONE_STAGE['wifi'] * wifi - ASPM_SAVES * aspm))
+        m['bat'] = m['truth'] + rng.normal(0, noise)
+        if i >= n // 2:
+            m['exp'] = ['auto-1', 'aspm', i // 4, 'B' if aspm else 'A', i % 4 == 0, value]
+        out.append(m)
+    return out
+
+
+def without_chip(minutes):
+    """The same minutes as a laptop without a chip power reading would log them."""
+    return [{k: v for k, v in m.items() if k not in ('soc', 'vdd', 'fabric')} for m in minutes]
+
+
+def battery_error(model, rows):
+    """Battery prediction error (W) of a one-stage `model` on `rows`, against their noise-free truth."""
+    x, chip_y, battery_x, _ = report.design(rows, model)
+    assert chip_y is None
+    coef = np.array([model[n] for n in report.ONE_STAGE_TERMS]
+                    + [model[f'bat:{n}'] for n in report.model_levers(model)])
+    return battery_x @ coef - np.array([m['truth'] for m in rows])
+
+
+class OneStageTests(unittest.TestCase):
+    """Without chip power (most Intel laptops: RAPL is root-only) the battery is
+    fitted directly on the chip model's columns and the devices'."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.minutes = battery_only_minutes(1600, 21)
+        cls.rows = report.battery_rows(cls.minutes)
+        cls.model = report.fit_rows(cls.rows, minutes=cls.minutes)
+
+    def test_the_fit_recovers_a_known_one_stage_truth(self):
+        model = self.model
+        self.assertEqual(len(self.rows), 1600 - 200)  # Every minute but the experiment's washout
+        self.assertEqual((model['stages'], model['chip'], model['base'], model['chip_rows']), (1.0, 1.0, 0.0, 0.0))
+        self.assertNotIn('soc:aspm', model)
+        for term in ('clock', 'load', 'gpu', 'bl', 'wifi'):
+            self.assertAlmostEqual(model[term], ONE_STAGE[term], delta=.1 * ONE_STAGE[term], msg=term)
+        self.assertAlmostEqual(model['bat:aspm'], -ASPM_SAVES, delta=.1)
+        self.assertEqual(model['own:aspm'], 0.0)
+        self.assertAlmostEqual(model['usb'], report.ONE_STAGE_PRIOR['usb'], delta=.01)  # Never varied → prior
+        # The idle laptop at its idle clock: the floor, and the clock up to the pooled idle clock.
+        self.assertAlmostEqual(model['floor'] + model['clock'] * model['idle_ghz'],
+                               ONE_STAGE['floor'] + ONE_STAGE['clock'] * (model['idle_ghz:low-power'] - .41), delta=.3)
+        self.assertGreater(model['idle_ghz:balanced'] - model['idle_ghz:low-power'], .4)
+        for profile in ('balanced', 'low-power'):
+            error = battery_error(model, [m for m in self.rows if m['set']['profile'] == profile])
+            self.assertLess(abs(error.mean()), .25, profile)
+        self.assertFalse(any(k.startswith('rail:') for k in model))
+
+    def test_attribution_sums_to_the_battery_draw(self):
+        for m in self.rows[::37]:
+            parts = report.attribute(m, self.model)
+            self.assertAlmostEqual(sum(parts['groups'].values()), m['bat'], delta=.03)
+            self.assertGreater(parts['apps']['yosys'], 0)
+            # Scaled down where the draw was below the model's (noise, or ASPM's saving, which the collector
+            # can't tell: it doesn't know the settings' columns).
+            self.assertTrue(0 < parts['groups']['Display'] <= self.model['bl'] * m['bl'] + 1e-9)
+            self.assertEqual(set(parts['idle']), {report.IDLE})  # No rails to split it by
+        m = self.rows[0]
+        plenty = report.attribute(dict(m, bat=99.0), self.model)  # More than modelled: the rest is the system's
+        modelled = sum(plenty['groups'].values()) - plenty['groups']['Rest of system'] + sum(
+            w for name, w in plenty['devices'].items() if name != 'Display')
+        self.assertAlmostEqual(plenty['groups']['Display'], self.model['bl'] * m['bl'])
+        parts = report.attribute(dict(m, bat=4.0), self.model)  # Less: every part scaled down to the draw
+        self.assertAlmostEqual(sum(parts['groups'].values()), 4.0, delta=.03)
+        for name, watts in plenty['apps'].items():
+            self.assertAlmostEqual(parts['apps'][name], watts * 4.0 / modelled, msg=name)
+        self.assertAlmostEqual(parts['groups']['Display'], plenty['groups']['Display'] * 4.0 / modelled)
+        # On AC nothing is measured without the chip's draw: nothing to split.
+        plugged = report.attribute(dict(m, st='C', bat=-20.0), self.model)
+        self.assertEqual((dict(plugged['groups']), plugged['idle']), ({}, {}))
+        (point,) = report.timeline([dict(m, st='C', bat=-20.0)], self.model)
+        self.assertEqual(point['groups'], {})
+
+    def test_typical_power_what_if_and_recommendations_work_without_chip_power(self):
+        model, rows = self.model, self.rows
+        aspm_on = np.mean([report.minute_states(m, report.model_top(model))['aspm'] for m in rows])
+        typical = report.typical_power(rows, model)
+        self.assertAlmostEqual(typical - np.mean([m['bat'] for m in rows]), ASPM_SAVES * aspm_on, delta=.1)
+        estimates, info = report.what_if(rows[-600:], 50, replicates=40, model=model, train_rows=rows)
+        self.assertEqual((info['stages'], info['rows'], info['train_rows']), (1, 600, len(rows)))
+        by_name = {e['name']: e for e in estimates}
+        self.assertGreater(by_name['Close yosys']['minutes'], 0)
+        for e in estimates:
+            self.assertLessEqual(e['low'], e['minutes'] + 1e-6)
+            self.assertGreaterEqual(e['high'], e['minutes'] - 1e-6)
+        dim = np.mean([ONE_STAGE['bl'] * max(m['bl'] - .05, 0) for m in rows[-600:]])
+        self.assertAlmostEqual(by_name['Brightness at minimum']['watts'], dim, delta=.1 * dim)
+        # Unfitted: what_if fits the one-stage model itself.
+        _, fitted = report.what_if(rows[-600:], 50, replicates=5, train_rows=rows)
+        self.assertEqual(report.stages(fitted['model']), 1)
+        # A recommendation gets its gain per charge from that draw.
+        levers = report.lever_effects(self.minutes, 50, typical, replicates=50)
+        aspm = next(e for e in levers['effects'] if e['experiment'] == 'aspm')
+        self.assertAlmostEqual(aspm['watts'], ASPM_SAVES, delta=.3)
+        recs = report.recommendations(levers, report.qol_model(self.minutes, []), 50, typical)
+        self.assertIn('ASPM on', recs['battery']['change'])
+        self.assertTrue(recs['battery']['gain'].endswith(' min'))
+
+    def test_existing_synthetic_data_with_its_chip_power_removed(self):
+        # test_what_if_ranks_and_brackets' minutes: chip = 3 + 2·GHz + 0.2·load, battery = 0.5 + 1.4·chip + 3·bl.
+        rng, rows = np.random.default_rng(2), []
+        for i in range(300):
+            heavy = rng.uniform(0, 20)
+            load, ghz = 2 + heavy, 1 + heavy / 20
+            bl = rng.uniform(.3, 1)
+            rows.append({'t': i * 60, 'dt': 60, 'st': 'D', 'load': load, 'ghz': ghz, 'bl': bl,
+                         'apps': {'openroad': [heavy, 0, 0], 'Floorp': [1.0, 0, 0]},
+                         'bat': .5 + 1.4 * (3 + 2 * ghz + .2 * load) + 3 * bl + rng.normal(0, .2)})
+        model = report.fit_rows(report.battery_rows(rows))
+        self.assertEqual(report.stages(model), 1)
+        # The chip's terms come out at 1.4 battery W per chip W: GHz and load are collinear here, so their sum.
+        self.assertAlmostEqual(model['clock'] / 20 + model['load'], 1.4 * (2 / 20 + .2), delta=.02)
+        self.assertAlmostEqual(model['bl'], 3, delta=.2)
+        estimates, info = report.what_if(rows, 48, replicates=50)
+        by_name = {e['name']: e for e in estimates}
+        self.assertGreater(by_name['Close openroad']['minutes'], by_name['Close Floorp']['minutes'])
+        for e in estimates:
+            self.assertLessEqual(e['low'], e['minutes'] + 1e-6)
+            self.assertGreaterEqual(e['high'], e['minutes'] - 1e-6)
+        self.assertAlmostEqual(info['runtime_h'], 48 / info['power'])
+        # chip_minutes (two profiles' idle clocks) and the ASPM experiment of ModelDataTests, chip power removed.
+        train = without_chip(chip_minutes(1200, 5))
+        model = report.fit_rows(report.battery_rows(train))
+        self.assertEqual(report.stages(model), 1)
+        self.assertAlmostEqual(model['clock'], 1.4 * 3, delta=.4)
+        self.assertAlmostEqual(model['bl'], 3, delta=.2)
+        rng, minutes = np.random.default_rng(3), []
+        for block in range(150):
+            aspm = bool(rng.integers(2))
+            for i in range(4):
+                load, bl = rng.uniform(1, 20), rng.uniform(.2, 1)
+                ghz = 0.9 + 0.08 * load + rng.normal(0, .15)
+                soc = 2 + 3 * ghz + .1 * load + rng.normal(0, .1)
+                minutes.append(minute(T0 + 60 * len(minutes), ghz=ghz, load=load, bl=bl,
+                                      bat=(30.0 if i == 0 else .5 + 1.4 * soc + 3 * bl - 1.5 * aspm + rng.normal(0, .1)),
+                                      set={'profile': 'low-power', 'aspm': 'powersupersave' if aspm else 'performance'},
+                                      exp=['auto-1', 'aspm', block, 'B' if aspm else 'A', i == 0,
+                                           'powersupersave' if aspm else 'performance']))
+        minutes = without_chip(minutes)
+        rows = report.battery_rows(minutes)
+        model = report.fit_rows(rows, minutes=minutes)
+        self.assertEqual((model['rows'], model['stages']), (450, 1))
+        self.assertAlmostEqual(model['bat:aspm'], -1.5, delta=.2)
+        self.assertAlmostEqual(model['clock'], 1.4 * 3, delta=.4)
+        self.assertAlmostEqual(model['bl'], 3, delta=.2)
+        typical = report.typical_power(rows, model)
+        _, info = report.what_if(rows, 50, replicates=10, model=model)
+        self.assertAlmostEqual(info['power'], typical)
+
+    def test_the_collector_and_the_panel_split_alike_without_chip_power(self):
+        tests = AttributionTests()
+        one = dict(AttributionTests.MODEL, chip=1.0, base=0.0, stages=1.0, floor=4.0, load=.2, clock=4.2)
+        for status in ('Discharging', 'Charging'):
+            for model in (one, AttributionTests.MODEL):  # One-stage, and a two-stage model on such records
+                with self.subTest(status=status, stages=report.stages(model)):
+                    records, m = tests.steady(2400, status, chip=False)
+                    self.assertAlmostEqual(sum(report.attribute(m, model)['groups'].values()),
+                                           20.0 if status == 'Discharging' else 0.0, delta=.03)
+                    if status == 'Charging':  # On AC nothing is measured without the chip's draw.
+                        self.assertEqual(dict(report.attribute(m, model)['groups']), {})
+                        self.assertEqual(dict(power.attribute(records[0], model)), {})
+                    tests.assert_agree(records, m, model)
+            with self.subTest(status=status, measured=True):  # One-stage on battery: the estimate, not the reading
+                records, m = tests.steady(2400, status)
+                parts = tests.assert_agree(records, m, one)
+                if status == 'Charging':
+                    self.assertAlmostEqual(sum(parts['groups'].values()), 8.0)  # On AC: the chip's reading, split
+                else:
+                    without = report.attribute(dict(m, soc=None), one)
+                    self.assertEqual(dict(parts['groups']), dict(without['groups']))
+        parts = tests.assert_agree(*tests.steady(2400, chip=False, bat=9.0), one)  # Less than modelled
+        self.assertAlmostEqual(sum(parts['groups'].values()), 9.0, delta=.03)
+
+
+def golden_minutes(seed=11, n=600):
+    """A two-stage truth with chip power, settings (an ASPM experiment), apps, GPU, Wi-Fi and rails."""
+    rng, out = np.random.default_rng(seed), []
+    for i, m in enumerate(chip_minutes(n, seed)):
+        aspm = (i // 4) % 3 == 0
+        gpu, wifi = rng.uniform(0, .3), rng.uniform(0, 2)
+        m['soc'] += 4 * gpu - .4 * aspm
+        m['bat'] += 1.4 * (4 * gpu - .4 * aspm) + .3 * wifi - .8 * aspm
+        m.update(gpu=gpu, wifi=wifi, vdd=.4 * m['soc'], fabric=.3 * m['soc'],
+                 set=dict(m['set'], aspm='powersupersave' if aspm else 'performance'),
+                 apps={'Floorp': [m['load'] * .5, gpu, 0], 'yosys': [m['load'] * .3, 0, 0]})
+        if i >= n // 2:
+            m['exp'] = ['auto-1', 'aspm', i // 4, 'B' if aspm else 'A', i % 4 == 0,
+                        'powersupersave' if aspm else 'performance']
+        out.append(m)
+    return out
+
+
+# What the code before the one-stage model gave on golden_minutes(): the two-stage
+# results must stay exactly these.
+GOLDEN_MODEL = {
+    'active_rows': 0.0, 'audio': 0.5, 'base': 0.5224265700786102, 'bat:aspm': -0.7659385671906686,
+    'bat:profile': -0.007512182690486622, 'bl': 2.977351037435055, 'chip': 1.3975007573520837,
+    'clock': 3.0318847339252257, 'clock_active': 1.0, 'disk': 2.0, 'experiment_rows': 225.0,
+    'floor': 0.6703691219442128, 'gpu': 4.580115014905864, 'idle_ghz': 0.5150248086079916,
+    'idle_ghz:balanced': 1.2453023879687775, 'idle_ghz:low-power': 0.5137574475407137, 'kbd': 0.3, 'kept': 0.0,
+    'load': 0.14869679349606874, 'own:aspm': 0.0, 'own:profile': 1.0, 'prior': 0.0, 'rail:cores': 0.4000000000000007,
+    'rail:fabric': 0.29999999999999966, 'rail:links': 0.29999999999999966, 'rail_rows': 525.0, 'rows': 525.0,
+    'soc:aspm': -0.40013907676817784, 'soc:profile': -0.0444838483274508, 't0': 1790000040.0, 't1': 1790035980.0,
+    'usb': 0.29999999999999966, 'video': 0.9999999999999996, 'wifi': 0.2982796135730895}
+GOLDEN_TYPICAL = 8.749513557545683
+GOLDEN_WHAT_IF = [  # name, minutes, low, high (rows[-200:], 50 Wh, 20 replicates)
+    ('Close the browser', 100.32823427236517, 97.62472194848975, 103.06890027683532),
+    ('Close Floorp', 100.32823427236517, 97.62472194848975, 103.06890027683532),
+    ('Brightness at minimum', 75.93187860041502, 72.1013537687258, 77.74824983219452),
+    ('No builds or EDA jobs', 27.573273640893042, 27.212968638555523, 29.72639112365928),
+    ('Close yosys', 27.573273640893042, 27.212968638555523, 29.72639112365928),
+    ('Brightness −20 points', 23.692304531353486, 22.13919572844455, 24.005643875972243)]
+GOLDEN_POWER = 8.94082383609107
+GOLDEN_GROUPS = {'Browser': 1.6279760250777622, 'Builds & EDA': 0.49104797258541094,
+                 'Desktop & system': 0.3273653150569406, 'Idle chip': 3.119032995323463,
+                 'Display': 1.9957349322340596, 'Rest of system': 0.9547546813670251}
+GOLDEN_IDLE = {'Memory & I/O links': 0.6695594930266624, 'Fabric & display engine': 0.6695594930266624,
+               'Cores & graphics': 0.892745990702219, 'Power delivery & board': 0.8871680185679193}
+
+
+class TwoStageUnchangedTests(unittest.TestCase):
+    def assert_close(self, a, b, msg=None):
+        self.assertAlmostEqual(a, b, delta=1e-9 * max(1.0, abs(b)), msg=msg)
+
+    def test_results_with_chip_power_are_as_before(self):
+        minutes = golden_minutes()
+        rows = report.battery_rows(minutes)
+        model = report.fit_rows(rows, minutes=minutes)
+        self.assertEqual(set(model) - set(GOLDEN_MODEL), {'stages', 'chip_rows'})  # Only added: the kind and its rows
+        self.assertEqual((model['stages'], model['chip_rows']), (2.0, 525.0))
+        for key, value in GOLDEN_MODEL.items():
+            self.assert_close(model[key], value, key)
+        self.assert_close(report.typical_power(rows, model), GOLDEN_TYPICAL)
+        estimates, info = report.what_if(rows[-200:], 50.0, replicates=20, model=model, train_rows=rows)
+        self.assertEqual([e['name'] for e in estimates], [name for name, *_ in GOLDEN_WHAT_IF])
+        for e, (name, *values) in zip(estimates, GOLDEN_WHAT_IF):
+            for got, want in zip((e['minutes'], e['low'], e['high']), values):
+                self.assert_close(got, want, name)
+        self.assert_close(info['power'], GOLDEN_POWER)
+        self.assertEqual(info['stages'], 2)
+        parts = report.attribute(rows[5], model)
+        self.assertEqual(set(parts['groups']), set(GOLDEN_GROUPS))
+        for name, watts in GOLDEN_GROUPS.items():
+            self.assert_close(parts['groups'][name], watts, name)
+        for name, watts in GOLDEN_IDLE.items():
+            self.assert_close(parts['idle'][name], watts, name)
+
+    def test_the_switch_between_the_models(self):
+        minutes = golden_minutes()
+        rows = report.battery_rows(minutes)
+        model = report.fit_rows(rows, minutes=minutes)
+        # A few minutes without a chip reading (a sensor that was briefly missing): still two-stage,
+        # on the minutes with it, exactly as before.
+        gaps = [m if i % 50 else {k: v for k, v in m.items() if k != 'soc'} for i, m in enumerate(minutes)]
+        mixed = report.fit_rows(report.battery_rows(gaps), minutes=gaps)
+        self.assertEqual(mixed['stages'], 2.0)
+        self.assertEqual(mixed['rows'], mixed['chip_rows'])
+        self.assertLess(mixed['rows'], model['rows'])
+        estimates, _ = report.what_if(report.battery_rows(gaps)[-200:], 50.0, replicates=5, model=mixed,
+                                      train_rows=report.battery_rows(gaps))
+        self.assertTrue(estimates)
+        self.assertEqual(report.fit_rows(report.battery_rows(gaps[:100]))['stages'], 2.0)  # A short history too
+        # The sensor gone for the latest minutes: one-stage, on all of them.
+        lost = minutes[:200] + without_chip(minutes[200:])
+        self.assertEqual(report.fit_rows(report.battery_rows(lost), minutes=lost)['stages'], 1.0)
+        # A sensor that appeared lately: two-stage once CHIP_MINUTES (most of the latest) have it.
+        found = without_chip(minutes[:300]) + minutes[300:]
+        self.assertEqual(report.fit_rows(report.battery_rows(found), minutes=found)['stages'], 2.0)
+        late = without_chip(minutes[:-60]) + minutes[-60:]
+        self.assertEqual(report.fit_rows(report.battery_rows(late), minutes=late)['stages'], 1.0)
+        # A two-stage model has nothing to evaluate on minutes without chip power; the what-if says so.
+        self.assertEqual(report.what_if(report.battery_rows(without_chip(minutes)), 50.0, replicates=5, model=model),
+                         ([], None))
+        # The kind survives keeping the last model, and an old model without 'stages' is two-stage.
+        one = report.fit_rows(report.battery_rows(lost), minutes=lost)
+        self.assertEqual(report.fit_rows(report.battery_rows(lost)[:5], previous=one)['stages'], 1.0)
+        self.assertEqual(report.stages({k: v for k, v in model.items() if k != 'stages'}), 2)
 
 
 if __name__ == '__main__':

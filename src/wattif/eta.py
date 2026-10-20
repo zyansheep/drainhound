@@ -609,7 +609,9 @@ def fit(minutes, known=None, previous=None, running=None, endings=None):
 MODELS = report.LOG / 'models.json'
 # 4: per-horizon σ factors, the level's variance by run, the Jensen centre, 'typical'.
 # 5: report.fit_rows' attribution: profile idle clocks, the active clock, setting columns, data health.
-MODELS_VERSION = 5
+# 6: the attribution's 'stages': 1 for the one-stage model of a laptop without chip power, whose terms
+#    are battery W (an older reader would take them for chip W); 5's, without it, are all two-stage.
+MODELS_VERSION = 6
 WINDOW_DAYS = 30
 
 
