@@ -16,6 +16,7 @@ from unittest import mock
 import numpy as np
 
 from wattif import battery as batteries
+from wattif import config
 from wattif import eta
 from wattif import store
 
@@ -68,11 +69,13 @@ def mains(root, online):
 
 
 def make_live(root, clock=None, **options):
-    """A Live on a fake /sys and /proc, every path in `root`, the clocks fake."""
+    """A Live on a fake /sys and /proc, every path in `root`, the clocks fake.
+    Allowed to power off (as with [battery] poweroff = true; off by default),
+    since most tests here are of the power-off."""
     (root / 'sys/kernel/random').mkdir(parents=True, exist_ok=True)
     (root / 'sys/kernel/random/boot_id').write_text('cc72fcaf-0000\n')
     clock = clock or Clock()
-    options = {'notify': lambda *n: None, 'poweroff': lambda: True, **options}
+    options = {'notify': lambda *n: None, 'poweroff': lambda: True, 'allow_poweroff': True, **options}
     return eta.Live(root, proc=root, gasp=root / 'lastgasp.json', deaths=root / 'deaths.json',
                     models=root / 'models.json', db=root / 'power.sqlite3', runtime=root / 'run',
                     clock=clock.wall, monotonic=clock.mono, **options)
@@ -1083,7 +1086,7 @@ class EtaTests(unittest.TestCase):
         eta.remember([old], self.root / 'deaths.json')
         battery(self.root, **dict(ENERGY, energy_now=2000000, capacity=4))
         live = make_live(self.root)
-        self.assertTrue(live.warns_off())                                    # Until it reads the battery:
+        self.assertFalse(live.warns_off())                                   # It reads the battery at once,
         live.estimate()
         self.assertFalse(live.warns_off())
         self.assertEqual(live.params['cutoff'], 0.0)
@@ -1091,6 +1094,123 @@ class EtaTests(unittest.TestCase):
         live.load_cutoff()
         self.assertTrue(live.warns_off())
         self.assertAlmostEqual(live.params['cutoff'], death['cut'])
+
+    def test_before_the_battery_is_read_the_cutoff_keeps_its_unit(self):
+        deaths = self.root / 'deaths.json'
+        eta.remember([{'boot': 'old', 't': 1, 'cut': 0.056}, {'boot': 'wh', 't': 2, 'cut': 0.9, 'unit': 'Wh'}], deaths)
+        live = make_live(self.root)                                          # No battery to read yet:
+        self.assertEqual((live.params['cutoff_unit'], live.params['cutoff'], live.params['deaths']), ('Wh', 0.9, 1))
+        self.assertTrue(live.warns_off())                                    # the last death's unit.
+        battery(self.root, **dict(LOW, charge_now=1000000))                  # The battery counts charge:
+        live.estimate()
+        self.assertEqual((live.params['cutoff_unit'], live.params['cutoff'], live.params['deaths']), ('Ah', 0.056, 1))
+        # No death in deaths.json, models.json's cutoff in Wh (main() loads it, then the cutoff): kept, not
+        # taken for Ah and dropped until the battery is read.
+        other = self.root / 'other'
+        live = make_live(other)
+        live.params = {**eta.DEFAULTS, 'cutoff': 0.9, 'cutoff_spread': 0.02, 'cutoff_unit': 'Wh', 'deaths': 2}
+        live.load_cutoff()
+        self.assertEqual((live.params['cutoff_unit'], live.params['deaths']), ('Wh', 2))
+        battery(other, **ENERGY)
+        live.estimate()
+        self.assertEqual((live.params['cutoff_unit'], live.params['cutoff'], live.params['deaths']), ('Wh', 0.9, 2))
+        self.assertEqual(live.cutoff_read, 'Wh')
+
+    def test_a_battery_taken_out_starts_the_trends_over(self):
+        # Two batteries, one taken out: the combined charge falls 20 Wh in one step. A trend across it
+        # read that as the cut seconds away: a "Powering off" warning, then a power-off at 4.5%.
+        internal = battery(self.root, 'BAT0', **dict(ENERGY, energy_full=80000000, energy_now=3600000))
+        removable = battery(self.root, 'BAT1', **dict(ENERGY, status='Unknown', power_now=0, energy_now=20000000))
+        notes, offs, clock = [], [], Clock()
+        live = make_live(self.root, clock, notify=lambda *n: notes.append(n[0]), poweroff=lambda: offs.append(1) or True)
+        live.params = dict(self.params, cutoff=0.86, cutoff_spread=0.017, deaths=5, cutoff_unit='Wh')
+        live.forecast = lambda *args: None                                   # The gauge alone times it.
+        energy = 3.6
+
+        def steps(n):
+            nonlocal energy
+            for _ in range(n):
+                (internal / 'energy_now').write_text(str(int(energy * 1e6)))
+                out = live.estimate()
+                clock.tick()
+                energy -= 10.0 / 3600 * 2                                    # 10 W.
+            return out
+        steps(75)
+        self.assertEqual((live.pack, len(live.samples)), ((('BAT0', 'BAT1'), 'Wh'), 75))
+        for child in removable.iterdir():
+            child.unlink()
+        removable.rmdir()
+        out = steps(10)
+        self.assertEqual((notes, offs), ([], []))                            # Neither a warning nor a power-off,
+        self.assertEqual((live.pack, len(live.samples)), ((('BAT0',), 'Wh'), 10))   # only its own samples,
+        self.assertLess(out['detail']['pct'], eta.LOW_BATTERY)
+        steps(60)
+        self.assertAlmostEqual(live.estimate()['detail']['hours'], (energy - 0.86) / 10, delta=0.02)   # its own fall.
+        self.assertEqual((notes, offs), ([], []))
+        removable.mkdir()                                                    # Put back, in Ah:
+        for name, value in {'type': 'Battery', 'status': 'Unknown', 'charge_now': 1000000, 'charge_full': 3000000,
+                            'voltage_now': 12000000, 'current_now': 0}.items():
+            (removable / name).write_text(str(value))
+        steps(1)
+        self.assertEqual((live.pack, len(live.samples)), ((('BAT0', 'BAT1'), 'Wh'), 1))
+        for name in ('energy_now', 'energy_full'):                           # Then read in another unit.
+            (internal / name).unlink()
+        for name, value in (('charge_now', 300000), ('charge_full', 6000000)):
+            (internal / name).write_text(str(value))
+        live.estimate()
+        self.assertEqual((live.pack, len(live.samples)), ((('BAT0', 'BAT1'), 'Ah'), 1))
+
+    def test_it_powers_off_only_with_battery_poweroff(self):
+        battery(self.root, **dict(LOW, charge_now=62000))
+        notes, offs = [], []
+
+        def run(**options):
+            """Three readings 30 s from a learned cutoff; the label of the last."""
+            del notes[:], offs[:]
+            clock = Clock()
+            live = make_live(self.root, clock, notify=lambda *n: notes.append(n[0]),
+                             poweroff=lambda: offs.append(1) or True, **options)
+            live.params = dict(self.params, volts=[13.8] * 101, cutoff=0.056, cutoff_spread=0.0018, deaths=5)
+            for i in range(60, 0, -1):  # 0.2 mAh/s, to 62 mAh.
+                live.samples.append((clock.m - 2 * i, 11.3, 'Discharging', 0.062 + 0.0002 * 2 * i))
+            for _ in range(3):
+                out = live.estimate()
+                clock.tick()
+            (self.root / 'lastgasp.json').unlink(missing_ok=True)
+            return live, out
+        live, out = run(allow_poweroff=None)                                 # As configured: off by default.
+        self.assertFalse(live.allow_poweroff or live.warns_off())
+        self.assertEqual(offs, [])
+        self.assertIn(eta.HOURGLASS, out['text'])                            # The countdown is the cutoff's,
+        self.assertNotIn(eta.POWER, out['text'])
+        self.assertNotIn('poweroff', out['detail'])                          # with no power-off in it,
+        self.assertAlmostEqual(out['detail']['cutout'] - out['detail']['updated'], 26, delta=4)
+        self.assertTrue(notes)
+        self.assertTrue(all(n.startswith('Battery cuts out as soon as') for n in notes))   # nor in what it says.
+        with mock.patch.dict(config.SETTINGS['battery'], {'poweroff': True}):
+            live, out = run(allow_poweroff=None)
+        self.assertEqual(offs, [1])
+        self.assertIn(eta.POWER, out['text'])
+        self.assertIn('poweroff', out['detail'])
+        self.assertIn('Powering off', notes)
+        with mock.patch.dict(config.SETTINGS['battery'], {'notify': False}):
+            live, out = run(allow_notify=None)
+        self.assertEqual((notes, offs), ([], [1]))                           # No notifications; the power-off still.
+        with mock.patch.dict(config.SETTINGS['battery'], {'notify': False, 'poweroff': False}):
+            run(allow_notify=None, allow_poweroff=None)
+        self.assertEqual((notes, offs), ([], []))
+        errors = io.StringIO()
+        with mock.patch.dict(config.SETTINGS['battery'], {'poweroff': 'false', 'notify': 'no'}), \
+                contextlib.redirect_stderr(errors):                          # Not true or false: the defaults.
+            self.assertEqual((eta.battery_switch('poweroff'), eta.battery_switch('notify')), (False, True))
+        self.assertIn("[battery] poweroff = 'false' is not true or false; taking false", errors.getvalue())
+
+    def test_a_gauge_with_energy_now_but_no_energy_full_is_read_in_ah(self):
+        # bq27xxx: before, read in Wh with no full charge, it had no forecast.
+        battery(self.root, **dict(LOW, charge_now=1500000, energy_now=20000000, capacity=48))
+        out = make_live(self.root).estimate()
+        self.assertEqual((out['detail']['pct'], out['detail']['energy_pct']), (48.0, 48))
+        self.assertGreater(out['detail']['hours'], 0.5)
 
     def test_the_black_box_of_a_battery_that_counts_energy(self):
         battery(self.root, **dict(ENERGY, energy_now=1000000, capacity=2))
