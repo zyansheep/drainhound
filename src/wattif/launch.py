@@ -23,6 +23,8 @@ def panel(argv):
     """`wattif panel [TAB]` toggles the panel (or shows TAB); `serve` runs it
     (the unit's ExecStart); `render DIR [6 h|Day|Week]` draws its charts to PNGs."""
     if argv[:1] in (['serve'], ['render']):
+        if argv[:1] == ['serve']:
+            preload(['panel', *argv])
         from . import panel as resident
         return resident.main(argv)
     if len(argv) > 1 or (argv and argv[0] not in TABS):
@@ -38,6 +40,28 @@ def panel(argv):
         time.sleep(0.1)
     print('wattif: the panel did not answer on D-Bus', file=sys.stderr)
     return 1
+
+
+def layer_shell_library():
+    """gtk4-layer-shell's library: WATTIF_LAYER_SHELL_LIB (packages set it), else
+    wherever the system keeps it."""
+    import ctypes.util
+    return os.environ.get('WATTIF_LAYER_SHELL_LIB') or ctypes.util.find_library('gtk4-layer-shell')
+
+
+def preload(argv):
+    """Run again with gtk4-layer-shell preloaded, unless it is: it must load before
+    libwayland-client, so before GTK, which a running Python can't arrange (the
+    library's own documentation says to LD_PRELOAD it). WATTIF_PRELOADED keeps
+    the LD_PRELOAD from before, for the panel to give its children."""
+    library = layer_shell_library()
+    loaded = os.environ.get('LD_PRELOAD', '')
+    if not library or 'WATTIF_PRELOADED' in os.environ or library in loaded.replace(' ', ':').split(':'):
+        return
+    os.environ['WATTIF_PRELOADED'] = loaded
+    os.environ['LD_PRELOAD'] = ':'.join(filter(None, (library, loaded)))
+    command = config.self_command()
+    os.execv(command[0], [*command, *argv])
 
 
 def bus():

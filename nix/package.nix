@@ -42,8 +42,8 @@ in
     buildInputs = [gtk4 libadwaita gtk4-layer-shell];
 
     # One wrapper for every command: GTK's typelibs and icons are harmless to the
-    # others, and the panel preloads gtk4-layer-shell itself (WATTIF_LAYER_SHELL_LIB)
-    # so the collector never loads GTK.
+    # others, and `wattif panel serve` re-runs itself with gtk4-layer-shell
+    # preloaded (WATTIF_LAYER_SHELL_LIB, launch.preload), so nothing else loads GTK.
     dontWrapGApps = true;
     preFixup = ''
       makeWrapperArgs+=(

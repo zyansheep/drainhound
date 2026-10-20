@@ -11,6 +11,7 @@ manager they imply a private user namespace, which hides the session's
 /proc/PID/{fd,fdinfo,io,exe} (per-app GPU time and disk IO).
 """
 import argparse
+import os
 import shlex
 import subprocess
 import sys
@@ -19,7 +20,13 @@ from pathlib import Path
 from . import config
 
 SESSION = 'graphical-session.target'
-DEFAULT_ENABLED = ('collector', 'eta', 'panel', 'experiments', 'reconcile.timer')
+DEFAULT_ENABLED = ('collector', 'eta', 'panel', 'experiments', 'reconcile.timer', 'freeze')
+
+
+def state_dir():
+    """config.STATE as the units see it: %S/wattif (the user manager's state
+    directory, XDG_STATE_HOME's) unless WATTIF_STATE_DIR moved it."""
+    return str(config.STATE) if os.environ.get('WATTIF_STATE_DIR') else f'%S/{config.NAME}'
 
 
 def units(wattif):
@@ -61,7 +68,7 @@ def units(wattif):
         u['experiments']: (
             {'Description': 'wattif: automatic power experiments', **session,
              'After': f"{SESSION} {u['collector']} {u['experiment']}", 'Conflicts': u['experiment'],
-             'ConditionPathExists': f'%S/{config.NAME}/experiments-enabled',
+             'ConditionPathExists': f'{state_dir()}/experiments-enabled',
              # A runner that keeps crashing stops trying: at most 5 starts an hour.
              'StartLimitIntervalSec': '3600', 'StartLimitBurst': '5'},
             {'ExecStart': f'{wattif} experiment auto', 'ExecStopPost': f'{wattif} experiment restore',

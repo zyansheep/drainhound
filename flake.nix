@@ -68,6 +68,7 @@
           sudo = c.security.sudo.extraRules;
           sleep = c.powerManagement.powerDownCommands;
           wanted = c.systemd.user.services.wattif-collector.wantedBy;
+          panel = c.systemd.user.services.wattif-panel.wantedBy;
           timer = c.systemd.user.timers.wattif-reconcile.wantedBy;
         });
     });

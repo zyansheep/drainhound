@@ -44,7 +44,7 @@ change from your settings), `gain` (minutes per full charge) with its 90%
 `interval`, `delight` (👍 chance per block now → then), `apply` (the
 assignments `wattif experiment apply` takes), `text`.
 
-**`experiment.json`** (the runner): `mode` (manual/auto), `status`
+**`experiment.json`** (the runner): `mode` (`auto` for automatic runs), `status`
 (running/paused/done), `reason`, `block`, `block_start`/`block_end`,
 `washout_until`, `name`, `arm`, `value`, `tested` (seconds of battery time
 tested), `settled`, `worth {rows: [{hours, saves, costs}]}`.

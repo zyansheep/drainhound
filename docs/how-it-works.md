@@ -191,9 +191,10 @@ comfort|battery --apply` switches.
   only: the reconciler puts them back to stock on AC and sets them again on
   battery.
 
-**Boot-level settings** (e.g. panel self-refresh on amdgpu) can't change at
-runtime. With `experiments.boot_arms` configured, the panel picks the boot
-entry for the next restart only. Boots are compared on their baselines, with a
+**Boot-level settings** can't change at runtime. Panel self-refresh on amdgpu
+is the one wattif compares: with a `psr` arm in `experiments.boot_arms` (a boot
+entry that sets `amdgpu.dcdebugmask` without its 0x10 bit), the panel picks the
+entry for the next restart only, the arm with less battery time first. Boots are compared on their baselines, with a
 Welch t interval over boots once each arm has 5.
 
 ## What-if

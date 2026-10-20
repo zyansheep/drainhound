@@ -97,14 +97,15 @@ wattif units --install              # writes ~/.config/systemd/user/wattif-*, en
 ```
 
 For root-only settings install the helper and give yourself a sudo rule for it
-(as root):
+(run as yourself; `$USER` is you):
 
 ```sh
-install -m755 helper/wattif-helper /usr/local/bin/wattif-helper
-echo "$USER ALL=(root) NOPASSWD: /usr/local/bin/wattif-helper" > /etc/sudoers.d/wattif
+sudo install -m755 helper/wattif-helper /usr/local/bin/wattif-helper
+echo "$USER ALL=(root) NOPASSWD: /usr/local/bin/wattif-helper" | sudo tee /etc/sudoers.d/wattif
+sudo visudo -cf /etc/sudoers.d/wattif
 # Suspend hooks, so experiments never change link power management on the way into suspend:
 printf '#!/bin/sh\ncase "$1" in pre) exec /usr/local/bin/wattif-helper sleep-safe ;; post) exec /usr/local/bin/wattif-helper sleep-restore ;; esac\n' \
-  > /usr/lib/systemd/system-sleep/wattif && chmod 755 /usr/lib/systemd/system-sleep/wattif
+  | sudo tee /usr/lib/systemd/system-sleep/wattif && sudo chmod 755 /usr/lib/systemd/system-sleep/wattif
 ```
 
 Then set `helper.command = ["sudo", "-n", "/usr/local/bin/wattif-helper"]` in
@@ -117,7 +118,7 @@ wattif panel                 # the panel (toggle); `wattif panel experiments` op
 wattif vote up | down        # 👍 especially good right now / 👎 worse than it should be
 wattif experiment enable     # automatic experiments while on battery (disable: back to stock)
 wattif experiment status
-wattif experiment apply aspm=saving wifi-ps=saving   # set a combination (until reboot, on battery)
+wattif experiment apply wifi-ps=saving cpu-cap=saving   # set a combination (until reboot, on battery)
 wattif check                 # gather every panel period from your data, timed
 ```
 

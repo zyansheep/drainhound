@@ -68,8 +68,8 @@ in {
           Users who may run wattif-helper as root without a password, which
           experiments need for root-only settings (ASPM, NVMe APST, CPU boost
           and frequency cap, Wi-Fi power saving, amdgpu panel power savings and
-          clocks). Without any, experiments vary only what a user can change
-          (the power profile, the refresh rate, app throttling).
+          clocks). Without any, experiments leave those out and vary only what
+          a user can change (the power profile, the refresh rate, app throttling).
         '';
       };
       sleepHooks = lib.mkOption {
@@ -77,9 +77,10 @@ in {
         default = true;
         description = ''
           Run `wattif-helper sleep-safe` before every suspend and
-          `sleep-restore` after resume: the boot-time ASPM policy, NVMe APST
-          limit and GPU DPM level hold on the way into suspend, and changes
-          wait until resume.
+          `sleep-restore` after resume: ASPM and NVMe APST go back to what the
+          kernel command line sets (where it sets them; on some machines they
+          are workarounds for crashes on the way into suspend) and GPU DPM to
+          auto, and changes wait until resume.
         '';
       };
     };
@@ -125,7 +126,7 @@ in {
       cfg.settings);
 
     systemd.packages = [cfg.package];
-    systemd.user.services = wanted // started;
+    systemd.user.services = lib.recursiveUpdate started wanted;
     systemd.user.timers.${units.reconcile}.wantedBy = ["graphical-session.target"];
 
     security.sudo.extraRules = lib.mkIf (cfg.helper.users != [] && !config.security.sudo-rs.enable) [rule];
