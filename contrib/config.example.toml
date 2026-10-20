@@ -1,9 +1,9 @@
-# ~/.config/wattif/config.toml (or /etc/wattif/config.toml). Every key is
-# optional; `wattif config` prints what is in effect.
+# ~/.config/drainhound/config.toml (or /etc/drainhound/config.toml). Every key is
+# optional; `drainhound config` prints what is in effect.
 
 [battery]
 # Power off cleanly just before the battery cuts out, once one cut-out has
-# taught wattif where that is. Off by default (UPower may already act on low battery).
+# taught drainhound where that is. Off by default (UPower may already act on low battery).
 poweroff = false
 notify = true
 
@@ -25,7 +25,7 @@ profile = { battery = "power-saver", ac = "balanced" }
 
 [experiments]
 # Settings that can upset some hardware stay out of automatic runs unless
-# added with `wattif experiment pool add NAME --risky`.
+# added with `drainhound experiment pool add NAME --risky`.
 risky = ["aspm", "apst", "gpu-dpm"]
 
 [apps]

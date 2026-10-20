@@ -46,7 +46,7 @@ RANGES = {'6 h': 6 * 3600, 'Day': 24 * 3600, 'Week': 7 * 24 * 3600}
 BATTERY_HOURS = [1, 2, 4, 8, 24]  # Experiment length choices, in hours of battery time.
 DEBOUNCE = 0.15  # s: reloads this close together (holding ← or →) load only the last one.
 RUNTIME = config.RUNTIME
-WATTIF = config.self_command()  # The panel's buttons run `wattif experiment …` and `wattif vote …`.
+DRAINHOUND = config.self_command()  # The panel's buttons run `drainhound experiment …` and `drainhound vote …`.
 
 
 def rgb(color, alpha=1.0):
@@ -584,7 +584,7 @@ class BatteryPanel(Adw.Application):
         action = Gio.SimpleAction.new('toggle', None)
         action.connect('activate', self.toggle)
         self.add_action(action)
-        # `wattif panel <tab>` opens directly on timeline or experiments.
+        # `drainhound panel <tab>` opens directly on timeline or experiments.
         show = Gio.SimpleAction.new('show', GLib.VariantType.new('s'))
         show.connect('activate', self.show_page)
         self.add_action(show)
@@ -605,10 +605,10 @@ class BatteryPanel(Adw.Application):
         if self.layered:
             self.window.set_decorated(False)
             GtkLayerShell.init_for_window(self.window)
-            GtkLayerShell.set_namespace(self.window, 'wattif-panel')
+            GtkLayerShell.set_namespace(self.window, 'drainhound-panel')
             GtkLayerShell.set_layer(self.window, GtkLayerShell.Layer.OVERLAY)
-            # WATTIF_PANEL_PASSIVE=1 shows the panel without ever taking keyboard focus.
-            keyboard = (GtkLayerShell.KeyboardMode.NONE if os.environ.get('WATTIF_PANEL_PASSIVE')
+            # DRAINHOUND_PANEL_PASSIVE=1 shows the panel without ever taking keyboard focus.
+            keyboard = (GtkLayerShell.KeyboardMode.NONE if os.environ.get('DRAINHOUND_PANEL_PASSIVE')
                         else GtkLayerShell.KeyboardMode.ON_DEMAND)
             GtkLayerShell.set_keyboard_mode(self.window, keyboard)
             GtkLayerShell.set_anchor(self.window, GtkLayerShell.Edge.TOP, True)
@@ -620,7 +620,7 @@ class BatteryPanel(Adw.Application):
         # on-demand panel when it opens, so a click on another window dismisses
         # it, like Audio and Wi-Fi. (A freshly mapped surface can report
         # inactive before niri focuses it, hence waiting for the first focus.)
-        # The pointer entering also counts, for WATTIF_PANEL_PASSIVE.
+        # The pointer entering also counts, for DRAINHOUND_PANEL_PASSIVE.
         engaged = Gtk.EventControllerMotion()
         engaged.connect('enter', lambda *_: setattr(self, 'focused_once', True))
         self.window.add_controller(engaged)
@@ -721,7 +721,7 @@ class BatteryPanel(Adw.Application):
         top = Gtk.Box(spacing=10)
         self.auto_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
         self.auto_switch.connect('state-set', self.switch_experiments)
-        self.hint(self.auto_switch, 'Off (wattif experiment disable) puts every setting back to stock, '
+        self.hint(self.auto_switch, 'Off (drainhound experiment disable) puts every setting back to stock, '
                                     'applied ones too')
         top.append(self.auto_switch)
         title = Gtk.Label(label='Automatic experiments', xalign=0)
@@ -732,7 +732,7 @@ class BatteryPanel(Adw.Application):
         top.append(self.banner)
         self.stop_button = Gtk.Button(label='Stop', valign=Gtk.Align.CENTER)
         self.stop_button.add_css_class('destructive-action')
-        self.stop_button.connect('clicked', lambda _b: self.command([*WATTIF, 'experiment', 'stop']))
+        self.stop_button.connect('clicked', lambda _b: self.command([*DRAINHOUND, 'experiment', 'stop']))
         top.append(self.stop_button)
         page.append(top)
         votes = Gtk.Box(spacing=8)
@@ -745,12 +745,12 @@ class BatteryPanel(Adw.Application):
             content.append(Gtk.Label(label=label))
             button = Gtk.Button(child=content)
             button.add_css_class(f'vote-{choice}')
-            button.connect('clicked', lambda _b, c=choice: self.command([*WATTIF, 'vote', c], done=None))
+            button.connect('clicked', lambda _b, c=choice: self.command([*DRAINHOUND, 'vote', c], done=None))
             votes.append(button)
         self.vote_note = self.muted(wrapped(hexpand=True))
         votes.append(self.vote_note)
         self.resume_button = Gtk.Button(label='Resume now', valign=Gtk.Align.CENTER)
-        self.resume_button.connect('clicked', lambda _b: self.command([*WATTIF, 'vote', 'resume']))
+        self.resume_button.connect('clicked', lambda _b: self.command([*DRAINHOUND, 'vote', 'resume']))
         votes.append(self.resume_button)
         page.append(votes)
         self.experiments_note = self.muted(wrapped())
@@ -958,7 +958,7 @@ class BatteryPanel(Adw.Application):
             self.requested = now
             self.wake.notify()
         if self.worker is None:
-            self.worker = threading.Thread(target=self.work, name='wattif panel-load', daemon=True)
+            self.worker = threading.Thread(target=self.work, name='drainhound panel-load', daemon=True)
             self.worker.start()
 
     def work(self):
@@ -1047,7 +1047,7 @@ class BatteryPanel(Adw.Application):
         if errors:
             parts = '; '.join(f'{part} ({error})' for part, error in errors.items())
             self.problems.set_text(f"Couldn't compute {parts}. Everything else is shown; details: "
-                                   'journalctl --user -u wattif panel, or wattif check.')
+                                   'journalctl --user -u drainhound panel, or drainhound check.')
         self.problems.set_visible(bool(errors))
 
     def fill_legend(self, points):
@@ -1214,11 +1214,11 @@ class BatteryPanel(Adw.Application):
         self.result['pool'] = [c['name'] for c in self.settings() if c['name'] in pool]  # Catalog order.
         empty = None if self.result['pool'] else ('No settings included: automatic experiments have nothing to '
                                                   'test until you include one (the switch turns them off).')
-        self.command([*WATTIF, 'experiment', 'pool', 'add' if included else 'remove', name], done=empty)
+        self.command([*DRAINHOUND, 'experiment', 'pool', 'add' if included else 'remove', name], done=empty)
 
     def switch_experiments(self, _switch, on):
         if not self.syncing:
-            self.command([*WATTIF, 'experiment', 'enable' if on else 'disable'])
+            self.command([*DRAINHOUND, 'experiment', 'enable' if on else 'disable'])
         return False
 
     def set_goal(self, goal):
@@ -1231,7 +1231,7 @@ class BatteryPanel(Adw.Application):
         state = self.experiment_state()
         owned = state.get('status') in ('running', 'paused')
         assignments = self.goal_assignments(goal)
-        self.command([*WATTIF, 'experiment', 'goal', goal, '--apply'],
+        self.command([*DRAINHOUND, 'experiment', 'goal', goal, '--apply'],
                      done=f'Goal: {goal.capitalize()}. Paused experiments switch to its combination within a minute.'
                      if owned and state.get('settled') else
                      f'Goal: {goal.capitalize()}. Nothing applied: experiments own the settings.' if owned else
@@ -1240,7 +1240,7 @@ class BatteryPanel(Adw.Application):
     def goal_assignments(self, goal):
         """What `goal --apply` sets: recommend.json's combination, the one shown
         while it is fresh; else the CLI computes its own (None: not known here)."""
-        if (self.result or {}).get('recs_source') != 'wattif eta':
+        if (self.result or {}).get('recs_source') != 'drainhound eta':
             return None
         return ((self.result.get('recs') or {}).get(goal) or {}).get('apply') or []
 
@@ -1264,7 +1264,7 @@ class BatteryPanel(Adw.Application):
         order = (goal,) + tuple(g for g in report.GOALS if g != goal)
         lines = [f"{g.capitalize()}: {(recs.get(g) or {}).get('text') or 'nothing measured yet'}" for g in order]
         if result.get('recs_source') == 'panel':
-            lines.append("(Computed here: wattif eta's recommend.json is missing or over an hour old.)")
+            lines.append("(Computed here: drainhound eta's recommend.json is missing or over an hour old.)")
         self.best_label.set_text('\n'.join(lines))
         self.apply_button.set_visible(self.best is not None)
         self.apply_button.set_sensitive(self.experiment_state().get('status') not in ('running', 'paused'))
@@ -1272,7 +1272,7 @@ class BatteryPanel(Adw.Application):
     def apply_best(self):
         if self.best:
             assignments = list(self.best['apply'])
-            self.command([*WATTIF, 'experiment', 'apply', *assignments],
+            self.command([*DRAINHOUND, 'experiment', 'apply', *assignments],
                          done=lambda out, err: apply_note(assignments, out, err))
 
     def freeze_row(self):
@@ -1353,7 +1353,7 @@ class BatteryPanel(Adw.Application):
         self.freeze_test = Gtk.Button(label='Test now (5 s)')
         self.hint(self.freeze_test, 'Freeze the same apps for 5 seconds right now, measure, and thaw')
         self.freeze_test.connect('clicked', lambda _b: self.command(
-            [*WATTIF, 'experiment', 'test-freeze', '--seconds', '5'] + keep(),
+            [*DRAINHOUND, 'experiment', 'test-freeze', '--seconds', '5'] + keep(),
             done=lambda out, _err: (self.freeze_test_result(out), None), running='Freezing apps for 5 seconds…'))
         buttons.append(self.freeze_test)
         row.append(buttons)
@@ -1403,7 +1403,7 @@ class BatteryPanel(Adw.Application):
         for arm, label in (('psr', 'Next boot: PSR on'), ('default', 'Next boot: default')):
             button = Gtk.Button(label=label)
             button.connect('clicked', lambda _b, a=arm: self.command(
-                [*WATTIF, 'experiment', 'next-boot', a],
+                [*DRAINHOUND, 'experiment', 'next-boot', a],
                 done=f"Next boot set to {'PSR on' if a == 'psr' else 'the default entry'} — restart when convenient."))
             buttons.append(button)
             self.psr_buttons[arm] = button
@@ -1438,7 +1438,7 @@ class BatteryPanel(Adw.Application):
     def start(self, names, unit=None, only_locked=False, extra=()):
         minutes = 60 * BATTERY_HOURS[self.minutes.get_selected()]
         names = [names] if isinstance(names, str) else list(names)
-        command = [*WATTIF, 'experiment', 'start', *names, '--minutes', str(minutes)]
+        command = [*DRAINHOUND, 'experiment', 'start', *names, '--minutes', str(minutes)]
         if unit:
             command += ['--unit', unit]
         if only_locked:
@@ -1575,7 +1575,7 @@ def main(argv):
     if argv[:1] == ['serve'] and (argv[1:2] in ([], ['--open']) and len(argv) <= 3):
         # The layer-shell library is preloaded for this process (launch.preload);
         # the commands the panel's buttons run don't need it.
-        os.environ['LD_PRELOAD'] = os.environ.pop('WATTIF_PRELOADED', os.environ.get('LD_PRELOAD', ''))
+        os.environ['LD_PRELOAD'] = os.environ.pop('DRAINHOUND_PRELOADED', os.environ.get('LD_PRELOAD', ''))
         if not os.environ['LD_PRELOAD']:
             del os.environ['LD_PRELOAD']
         # Hidden until toggled (the unit's ExecStart); --open shows it at once, on TAB if given.
@@ -1588,7 +1588,7 @@ def main(argv):
                     app.activate_action('toggle', None)
             app.connect('startup', lambda *_: GLib.idle_add(lambda: opened() and False))
         return app.run([])
-    print('usage: wattif panel serve [--open [TAB]] | render DIR [6 h|Day|Week]', file=sys.stderr)
+    print('usage: drainhound panel serve [--open [TAB]] | render DIR [6 h|Day|Week]', file=sys.stderr)
     return 2
 
 

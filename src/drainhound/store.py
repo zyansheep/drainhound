@@ -1,8 +1,8 @@
-"""The power database: what the battery models, panel and wattif eta use, written
+"""The power database: what the battery models, panel and drainhound eta use, written
 by the collector as it measures. Standard library only (the collector runs on
 plain Python).
 
-~/.local/state/wattif/power.sqlite3:
+~/.local/state/drainhound/power.sqlite3:
 
     records      one row per 10 s record: every scalar the log has — battery and
                  chip power, CPU time and frequency, C-state residency, IPIs,
@@ -23,17 +23,16 @@ The JSONL log (`power/DAY.jsonl[.zst]`) is still written alongside as a raw
 archive: it alone has idle apps' process counts and memory, per-interrupt and
 per-interface detail and display layouts. On startup the collector imports any
 archive day the database has never seen (the first run, or after deleting it)
-or holds fewer records of than the archive (a write failed); `wattif collect
+or holds fewer records of than the archive (a write failed); `drainhound collect
 import` re-reads every day, keeping what is already stored.
 
-    sqlite3 ~/.local/state/wattif/power.sqlite3 "select avg(bat_w) from records where status = 'Discharging'"
-    duckdb -c "select * from sqlite_scan('~/.local/state/wattif/power.sqlite3', 'records')"
+    sqlite3 ~/.local/state/drainhound/power.sqlite3 "select avg(bat_w) from records where status = 'Discharging'"
+    duckdb -c "select * from sqlite_scan('~/.local/state/drainhound/power.sqlite3', 'records')"
 """
 import collections
 import contextlib
 import datetime
 import json
-import os
 import sqlite3
 import sys
 import time
@@ -188,7 +187,7 @@ COLUMNS = (
     ('fan', 'REAL', lambda r: r.get('fan')),
     ('lid', 'TEXT', lambda r: r.get('lid')),
     ('locked', 'INTEGER', lambda r: flag(r.get('locked'))),
-    # wattif experiment arm
+    # drainhound experiment arm
     ('exp_run', 'TEXT', lambda r: part(r, 'exp').get('run')),
     ('exp_name', 'TEXT', lambda r: part(r, 'exp').get('name')),
     ('exp_block', 'INTEGER', lambda r: part(r, 'exp').get('block')),
@@ -442,7 +441,7 @@ MIGRATIONS = {
     3: (votes_only, True),  # Quality of life became 👍/👎 votes; drop the 0–3 levels schema 2 logged.
     4: (None, True),  # Minute settings gained the CPU frequency cap (boost as it really is).
     5: (add_levers, False),  # Records gained the CPU's own maximum (boost under a cap) and the amdgpu DPM level.
-    6: (add_throttle, False),  # Records gained whether wattif throttle ran.
+    6: (add_throttle, False),  # Records gained whether drainhound throttle ran.
     7: (add_clock, True),  # Minutes gained the mean core clock (chip power rises with it even when idle).
     # Records gained the active-CPU clock (mhz_active, active_n) and the idle floor
     # (min_mhz); minutes ghz_active, `purity`, and bat/soc of the majority status
@@ -506,7 +505,7 @@ def transaction(conn):
 # until nothing older is left and the key goes. A live write recomputes its own
 # minute meanwhile. Both read `records` and replace minutes inside one write
 # transaction, so whichever runs last leaves the same, current rows: they cannot
-# undo each other (nor can `wattif collect import` in another process).
+# undo each other (nor can `drainhound collect import` in another process).
 
 def mark_stale(conn):
     conn.execute(META_SQL)
@@ -629,7 +628,7 @@ def minute_from(row):
 
 
 def complain(where, error):
-    print(f'wattif: {where}: {type(error).__name__}: {error}', file=sys.stderr)
+    print(f'drainhound: {where}: {type(error).__name__}: {error}', file=sys.stderr)
 
 
 class Writer:
@@ -771,7 +770,7 @@ def import_logs(log, db=DB, force=False, counts=None):
         conn.close()
 
 
-# --- Readers (the panel, wattif eta, analysis) -------------------------------------------------
+# --- Readers (the panel, drainhound eta, analysis) -------------------------------------------------
 
 def load_range(start, end, db=DB, apps=True):
     """Per-minute dict rows and events with start <= t < end. Read-only: an

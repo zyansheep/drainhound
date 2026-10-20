@@ -11,9 +11,9 @@ from pathlib import Path
 import itertools
 from unittest import mock
 
-from wattif import config
-from wattif import experiment as experiment_module
-from wattif.experiment import Setting, design, experiment, unit_label, automatic, Ledger, Watchdog
+from drainhound import config
+from drainhound import experiment as experiment_module
+from drainhound.experiment import Setting, design, experiment, unit_label, automatic, Ledger, Watchdog
 
 
 def tree(root, files):
@@ -155,11 +155,11 @@ class FakeJournal:
 
 
 class Sandbox:
-    """Every path wattif experiment writes, in a temporary directory; no commands
+    """Every path drainhound experiment writes, in a temporary directory; no commands
     (sudo, journalctl, notify-send, systemctl), an empty /sys and /proc, no
     compositor or login session, and a fake kernel log. `commands` are the
     programs on PATH, `units` the user units installed; `helper` whether the root
-    helper may be run, `followable` whether wattif throttle can follow the windows."""
+    helper may be run, `followable` whether drainhound throttle can follow the windows."""
 
     def __init__(self, test):
         tmp = tempfile.TemporaryDirectory()
@@ -423,7 +423,7 @@ class ExperimentTests(unittest.TestCase):
                 raise RuntimeError('iw: No such device (-19)')
             return present()
         wifi.get = gone
-        failures, works = [RuntimeError('wattif-helper: Input/output error')], cap.set
+        failures, works = [RuntimeError('drainhound-helper: Input/output error')], cap.set
 
         def flaky(value):
             if failures and value == '2000':
@@ -434,7 +434,7 @@ class ExperimentTests(unittest.TestCase):
                                            ['cpu-cap', 'wifi-ps'])
         running = [s for s in states if s['status'] == 'running']
         excluded = [s.get('excluded') for s in running]
-        self.assertIn({'cpu-cap': 'failing: wattif-helper: Input/output error'}, excluded)
+        self.assertIn({'cpu-cap': 'failing: drainhound-helper: Input/output error'}, excluded)
         self.assertIn({'wifi-ps': 'unavailable'}, excluded)
         self.assertEqual(final['status'], 'finished')
         self.assertEqual((cap.value, wifi.value), ('none', 'on'))  # Restored.
@@ -448,7 +448,7 @@ class ExperimentTests(unittest.TestCase):
 
         def broken(value):
             attempts.append(clock.now)
-            raise RuntimeError('wattif-helper: Invalid argument')
+            raise RuntimeError('drainhound-helper: Invalid argument')
         cap.set = broken
         aspm = levered('aspm', 'performance', 'performance', ('powersupersave', 'performance'))
         experiment_module.prefer(risky=['aspm'])
@@ -533,7 +533,7 @@ class ExperimentTests(unittest.TestCase):
 
         def refuses_stock(value):
             if value == 'on' and stuck['on']:
-                raise RuntimeError('wattif-helper: busy')
+                raise RuntimeError('drainhound-helper: busy')
             works(value)
         wifi.set = refuses_stock
         final, _ = self.run_automatic({'cpu-cap': cap, 'wifi-ps': wifi}, clock, 1000 + 6 * 60, ['cpu-cap', 'wifi-ps'])
@@ -541,7 +541,7 @@ class ExperimentTests(unittest.TestCase):
         self.assertEqual(final['pending'], ['wifi-ps'])
         self.assertEqual((cap.value, wifi.value), ('none', 'off'))  # The rest was restored first.
         self.box.specs = {'cpu-cap': cap, 'wifi-ps': wifi}
-        self.assertEqual(experiment_module.command_restore(battery=lambda: True), {'wifi-ps': 'wattif-helper: busy'})
+        self.assertEqual(experiment_module.command_restore(battery=lambda: True), {'wifi-ps': 'drainhound-helper: busy'})
         self.assertEqual(self.box.state()['status'], 'restore-pending')  # Still: ExecStopPost changes nothing.
         later = Ledger(clock=lambda: time.time() + 3600)  # Past the backoff after those failures.
         self.assertEqual(experiment_module.command_reconcile(battery=lambda: True, ledger=Ledger()),
@@ -559,7 +559,7 @@ class ExperimentTests(unittest.TestCase):
 
         def broken(value):
             attempts.append(clock.now)
-            raise RuntimeError('wattif-helper: aspm reads powersupersave after writing performance')
+            raise RuntimeError('drainhound-helper: aspm reads powersupersave after writing performance')
         aspm.set = broken
         final, states = self.run_automatic({'aspm': aspm}, clock, 1000 + 3600, ['aspm'], battery=lambda: False)
         self.assertLessEqual(len(attempts), 8)  # 0, 60, 180, 420, 900, 1860 s, and the final one.
@@ -630,7 +630,7 @@ class ExperimentTests(unittest.TestCase):
     def test_wifi_power_saving_goes_back_to_what_was_found(self):
         stock, live = experiment_module.config.SETTINGS['stock'], {'ps': 'off'}
 
-        def run(command, check=True, **_):  # iw, and wattif-helper wifips.
+        def run(command, check=True, **_):  # iw, and drainhound-helper wifips.
             if command[:2] == ['iw', 'dev']:
                 return f"\tPower save: {live['ps']}"
             live['ps'] = command[-1]
@@ -641,14 +641,14 @@ class ExperimentTests(unittest.TestCase):
             self.assertEqual(spec.stock(), 'off')  # Untouched: as it is (the driver's, NetworkManager's).
             live['ps'] = 'on'
             self.assertEqual(spec.stock(), 'on')  # Changed by you or your system: as it is now.
-            experiment_module.change(spec, 'off', Ledger(), 'manual')  # wattif's first change saves it first,
+            experiment_module.change(spec, 'off', Ledger(), 'manual')  # drainhound's first change saves it first,
             self.assertEqual((spec.stock(), live['ps']), ('on', 'off'))  # and its own value never counts.
             self.assertEqual(spec.stock(False), 'on')  # Not seen on AC: as found on battery.
             with mock.patch.dict(stock, {'wifi_ps': {'battery': 'off', 'ac': 'found'}}):
                 self.assertEqual((spec.stock(), spec.stock(False)), ('off', 'on'))  # Configured wins; "found" is None.
             with mock.patch.dict(stock, {'wifi_ps': 'maybe'}), self.assertRaises(ValueError):
                 spec.stock()
-            self.box.boot = 'b2'  # After a reboot: as it is again, until wattif changes it in that boot.
+            self.box.boot = 'b2'  # After a reboot: as it is again, until drainhound changes it in that boot.
             self.assertEqual(spec.stock(), 'off')
 
     def test_corrected_pcie_errors_count_only_after_a_link_change_on_a_quiet_boot(self):
@@ -755,7 +755,7 @@ class ExperimentTests(unittest.TestCase):
         with mock.patch('sys.stdout'), self.assertRaises(SystemExit):
             experiment_module.main(['pool', 'add', 'wifi-ps'])
         self.assertEqual(experiment_module.command_apply(['wifi-ps=y'], battery=lambda: True),
-                         ['wifi-ps (quarantined: `wattif experiment release wifi-ps`)'])
+                         ['wifi-ps (quarantined: `drainhound experiment release wifi-ps`)'])
         self.assertEqual(specs['wifi-ps'].value, 'x')
         with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
             experiment_module.main(['start', 'wifi-ps'])
@@ -798,12 +798,12 @@ class ExperimentTests(unittest.TestCase):
         self.box.boot = 'b2'  # A reboot ends it.
         self.assertEqual(experiment_module.load_applied(), {})
 
-    def test_disable_puts_back_every_setting_wattif_changed(self):
+    def test_disable_puts_back_every_setting_drainhound_changed(self):
         self.box.specs = specs = self.specs_for_pool()
         experiment_module.command_apply(['cpu-cap=saving', 'gpu-dpm=saving'], risky=True, battery=lambda: True)
         specs['wifi-ps'].value = 'y'  # A crashed run's leftover,
         Ledger().change('wifi-ps', 'y', False, 'auto')
-        specs['boost'].value = 'y'  # and something else's doing: not wattif's to put back.
+        specs['boost'].value = 'y'  # and something else's doing: not drainhound's to put back.
         experiment_module.ENABLED.parent.mkdir(parents=True, exist_ok=True)
         experiment_module.ENABLED.touch()
         with mock.patch.object(experiment_module, 'run', lambda *a, **k: ''):
@@ -858,9 +858,9 @@ class ExperimentTests(unittest.TestCase):
         self.assertEqual((catalog['aspm'].stock(), catalog['apst'].stock()), ('performance', '0'))  # APST: as found.
         (self.box.root / 'cmdline').write_text('quiet\n')
         self.assertEqual(catalog['aspm'].stock(), 'default')  # As found.
-        Ledger().change('apst', '0', False, 'auto')  # A change logged before anything was saved (an older wattif):
+        Ledger().change('apst', '0', False, 'auto')  # A change logged before anything was saved (an older drainhound):
         self.assertEqual(catalog['apst'].stock(), experiment_module.APST_DEFAULT)  # nothing better than the guess.
-        self.assertEqual(experiment_module.HELPER, ['sudo', '-n', 'wattif-helper'])  # config [helper] command's default.
+        self.assertEqual(experiment_module.HELPER, ['sudo', '-n', 'drainhound-helper'])  # config [helper] command's default.
         self.assertEqual(experiment_module.RISKY, ('aspm', 'apst', 'gpu-dpm'))
 
     def real_catalog(self):
@@ -907,7 +907,7 @@ class ExperimentTests(unittest.TestCase):
         no_turbo = self.box.root / 'sys' / CPU / 'intel_pstate/no_turbo'
         calls = []
 
-        def helper(command, check=True, **_):  # wattif-helper boost: intel_pstate's no_turbo, inverted.
+        def helper(command, check=True, **_):  # drainhound-helper boost: intel_pstate's no_turbo, inverted.
             calls.append(command)
             no_turbo.write_text(f'{1 - int(command[-1])}\n')
             return ''
@@ -941,10 +941,10 @@ class ExperimentTests(unittest.TestCase):
     def test_stock_values_come_from_configuration(self):
         catalog = self.real_catalog()
         abm, panel = catalog['abm'], self.box.root / 'sys/class/drm/card1-eDP-1/amdgpu/panel_power_savings'
-        # By default ABM is as found: as it is on battery while wattif hasn't changed it, left to the system on AC.
+        # By default ABM is as found: as it is on battery while drainhound hasn't changed it, left to the system on AC.
         self.assertEqual((abm.stock(True), abm.stock(False), abm.ac_managed, bool(abm.reset)), ('3', None, True, True))
         panel.write_text('1\n')
-        self.assertEqual(abm.stock(True), '1')  # Until wattif first changes it,
+        self.assertEqual(abm.stock(True), '1')  # Until drainhound first changes it,
         with mock.patch.object(experiment_module, 'run', lambda command, check=True, **_: panel.write_text('0\n')):
             experiment_module.change(abm, '0', Ledger(), 'manual')
         self.assertEqual(self.box.prefs()['found'], {'abm': {'battery': '1'}})
@@ -965,7 +965,7 @@ class ExperimentTests(unittest.TestCase):
         with mock.patch.dict(config.SETTINGS['stock'], cpu_cap_mhz=300):  # Below what the CPU runs at.
             with mock.patch.object(experiment_module, 'CPU_CAP', '300'):
                 self.assertNotIn('cpu-cap', CATALOG())
-            from wattif import report
+            from drainhound import report
             self.assertEqual(report.cap_phrase(), 'CPU capped at 0.3 GHz')
 
     def test_abm_goes_back_to_its_configured_value_or_as_found(self):
@@ -1092,7 +1092,7 @@ class ExperimentTests(unittest.TestCase):
         self.assertEqual([(f['quarantine'], 'without a shutdown' in f['what']) for f in found], [(False, True)])
 
     def test_the_reports_tables_name_the_catalogs_settings(self):
-        from wattif import report
+        from drainhound import report
         catalog = self.real_catalog()
         names = set(catalog) | {'refresh'}  # And the refresh rate, with a compositor.
         self.assertEqual(set(report.SETTING), names)
@@ -1126,7 +1126,7 @@ class ExperimentTests(unittest.TestCase):
 
         def broken(value):
             attempts.append(clock.now)
-            raise RuntimeError('wattif-helper: Invalid argument')
+            raise RuntimeError('drainhound-helper: Invalid argument')
         cap.set = broken
         with mock.patch.object(experiment_module, 'GIVE_UP', 3600):
             state, _ = self.run_experiment(cap, 60, battery=lambda: False, clock=clock)
@@ -1161,7 +1161,7 @@ class ExperimentTests(unittest.TestCase):
                 (command, timeout)) or ''):
             experiment_module.lab('cpucap', 'none')
         self.assertEqual(calls, [(experiment_module.HELPER + ['cpucap', 'none'], experiment_module.LAB_TIMEOUT)])
-        # wattif-helper waits 10 s for another change's lock, then exits 75 (Busy): well inside the timeout.
+        # drainhound-helper waits 10 s for another change's lock, then exits 75 (Busy): well inside the timeout.
         self.assertGreaterEqual(experiment_module.LAB_TIMEOUT, 2 * 10 + 5)
 
     def test_how_the_last_boot_ended(self):
@@ -1286,14 +1286,14 @@ class ExperimentTests(unittest.TestCase):
         self.assertEqual(len(self.box.notes), 1)
 
     def test_the_not_applied_line_keeps_its_form(self):
-        # The battery panel parses it (panel_data.refused): 'wattif experiment: not applied: name (why); …'.
+        # The battery panel parses it (panel_data.refused): 'drainhound experiment: not applied: name (why); …'.
         self.box.specs = self.specs_for_pool()
         experiment_module.prefer(quarantine={'wifi-ps': {'reason': 'HC died'}})
         with mock.patch('sys.stderr') as err:
             experiment_module.command_apply(['aspm=y', 'wifi-ps=y', 'cpu-cap=y'], battery=lambda: True)
         written = ''.join(call.args[0] for call in err.write.call_args_list)
-        self.assertIn('wattif experiment: not applied: aspm (risky: add --risky); '
-                      'wifi-ps (quarantined: `wattif experiment release wifi-ps`)\n', written)
+        self.assertIn('drainhound experiment: not applied: aspm (risky: add --risky); '
+                      'wifi-ps (quarantined: `drainhound experiment release wifi-ps`)\n', written)
 
     def test_goal_apply_says_at_once_when_a_run_owns_the_settings_and_what_it_computed(self):
         experiment_module.write_state({'mode': 'auto', 'status': 'running'})
@@ -1302,7 +1302,7 @@ class ExperimentTests(unittest.TestCase):
             experiment_module.main(['goal', 'battery', '--apply'])
         self.assertLess(time.monotonic() - started, 2)  # Not 30 s waiting for the lock.
         written = ''.join(call.args[0] for call in err.write.call_args_list)
-        self.assertIn('wattif experiment: not applied: experiments own the settings\n', written)
+        self.assertIn('drainhound experiment: not applied: experiments own the settings\n', written)
         experiment_module.write_state({'mode': 'auto', 'status': 'finished'})
         self.box.specs = specs = self.specs_for_pool()
         battery = self.box.root / 'sys/class/power_supply/BAT1'  # command_apply's own on_battery() reads it.
@@ -1314,13 +1314,13 @@ class ExperimentTests(unittest.TestCase):
             applied = experiment_module.apply_goal('battery', recommend=stale)
         self.assertEqual((applied, specs['cpu-cap'].value, specs['aspm'].value), (['cpu-cap=saving'], 'y', 'x'))
         written = ''.join(call.args[0] for call in err.write.call_args_list)
-        self.assertIn('wattif experiment: recommend.json was stale, so the battery combination was computed now; '
+        self.assertIn('drainhound experiment: recommend.json was stale, so the battery combination was computed now; '
                       'applied: cpu-cap=saving\n', written)
 
-    # --- Review fixes (October 20): settings go back as wattif found them ---------------------------
+    # --- Review fixes (October 20): settings go back as drainhound found them ---------------------------
 
     def commands(self, live, calls):
-        """`run` for the AMD laptop: wattif-helper over the sandbox's /sys (aspm, apst, abm,
+        """`run` for the AMD laptop: drainhound-helper over the sandbox's /sys (aspm, apst, abm,
         cpucap; trigger changes nothing: no udev rule sets anything), powerprofilesctl over
         live['profile'], and systemctl doing nothing."""
         sys_root, helper = self.box.root / 'sys', len(experiment_module.HELPER)
@@ -1363,14 +1363,14 @@ class ExperimentTests(unittest.TestCase):
         calls = []
         with mock.patch.object(experiment_module, 'run', self.commands({}, calls)):
             self.assertEqual((specs['aspm'].stock(), specs['apst'].stock()), ('powersupersave', '0'))
-            experiment_module.main(['disable'])  # wattif never changed them:
+            experiment_module.main(['disable'])  # drainhound never changed them:
             self.assertEqual([c for c in calls if c[0] != 'systemctl'], [])  # nothing is written.
             for name, value in (('aspm', 'performance'), ('apst', experiment_module.APST_DEFAULT)):  # A run's blocks.
                 experiment_module.change(specs[name], value, Ledger(), 'manual')
             self.assertEqual((specs['aspm'].read(), specs['apst'].read()), ('performance', '100000'))
             experiment_module.main(['restore', '--stock'])
             self.assertEqual((specs['aspm'].read(), specs['apst'].read()), ('powersupersave', '0'))  # As found.
-        # Nothing saved (an older wattif's change): the limit the drives started with, not 100000.
+        # Nothing saved (an older drainhound's change): the limit the drives started with, not 100000.
         self.box.boot = 'b2'
         experiment_module.update_preferences(lambda prefs: prefs.pop('found', None))
         Ledger().change('apst', experiment_module.APST_DEFAULT, False, 'auto')
@@ -1430,7 +1430,7 @@ class ExperimentTests(unittest.TestCase):
             self.assertEqual(experiment_module.stock_names({'refresh': spec}, Ledger()), [])  # Put back: not held.
 
     def test_abm_applied_on_ac_then_disabled_goes_back_to_what_it_was(self):
-        # No udev rule sets ABM: before, disable left wattif's 3, logged it as stock and
+        # No udev rule sets ABM: before, disable left drainhound's 3, logged it as stock and
         # saved it as the ABM found on battery for good.
         panel = self.box.root / 'sys/class/drm/card1-eDP-1/amdgpu/panel_power_savings'
         self.enterContext(mock.patch.object(experiment_module, 'run', self.commands({}, [])))
@@ -1444,10 +1444,10 @@ class ExperimentTests(unittest.TestCase):
         experiment_module.command_reconcile(battery=lambda: True)
         self.assertEqual(panel.read_text(), '3\n')  # Unplugged: applied.
         experiment_module.main(['disable'])
-        self.assertEqual(panel.read_text(), '0\n')  # As it was before wattif changed it.
+        self.assertEqual(panel.read_text(), '0\n')  # As it was before drainhound changed it.
         for later in (100, 500):  # The reconciler's captures afterwards (once the power source is steady).
             experiment_module.capture_profile(lambda: True, now=time.time() + later, specs=specs)
-        self.assertEqual(self.box.prefs()['found']['abm'], {'battery': '0'})  # Never wattif's own 3.
+        self.assertEqual(self.box.prefs()['found']['abm'], {'battery': '0'})  # Never drainhound's own 3.
 
     def test_apply_leaves_settings_already_in_the_state_asked_for(self):
         # An "already set" combination moved the profile performance → balanced and ABM 1 → 3.
@@ -1462,7 +1462,7 @@ class ExperimentTests(unittest.TestCase):
             experiment_module.command_apply(combination, battery=lambda: True, left=left)
         written = ''.join(call.args[0] for call in err.write.call_args_list)
         self.assertEqual(left, ['profile', 'abm'])
-        self.assertIn('wattif experiment: already so, left as they are: profile; abm\n', written)
+        self.assertIn('drainhound experiment: already so, left as they are: profile; abm\n', written)
         self.assertEqual((live['profile'], panel.read_text(), specs['cpu-cap'].read()), ('performance', '1\n', '2000'))
         self.assertEqual([c[len(experiment_module.HELPER):] for c in calls], [['cpucap', '2000']])
         self.assertEqual(experiment_module.load_applied()['values'], {'cpu-cap': '2000'})
@@ -1493,9 +1493,9 @@ class ExperimentTests(unittest.TestCase):
         rows = {row['name']: row for row in json.loads(''.join(call.args[0] for call in out.write.call_args_list))}
         self.assertEqual(set(rows), set(specs) | set(specs.missing))
         self.assertEqual((rows['aspm']['error'], rows['profile']['error']), (experiment_module.HELPER_NEEDED, None))
-        self.assertIn("wattif experiment: left out: aspm, apst, boost, abm, gpu-dpm, cpu-cap, wifi-ps (root settings "
-                      "need wattif-helper's sudo rule; see the README)", ''.join(c.args[0] for c in err.write.call_args_list))
-        from wattif import panel_data  # The panel's row for it says why.
+        self.assertIn("drainhound experiment: left out: aspm, apst, boost, abm, gpu-dpm, cpu-cap, wifi-ps (root settings "
+                      "need drainhound-helper's sudo rule; see the README)", ''.join(c.args[0] for c in err.write.call_args_list))
+        from drainhound import panel_data  # The panel's row for it says why.
         row = panel_data.lever_rows([rows['aspm']], {'effects': []}, None, set())[0]
         self.assertEqual((row['detail'].split(' · ')[0], row['sensitive']),
                          (f'Unavailable: {experiment_module.HELPER_NEEDED}', False))
@@ -1525,7 +1525,7 @@ class ExperimentTests(unittest.TestCase):
                 self.assertFalse(HELPER_USABLE())  # No helper configured: never asked.
             self.assertEqual(len(probes), 4)
         # config [helper] command and [experiments] risky as strings: never their characters.
-        with mock.patch.dict(config.SETTINGS['helper'], command='sudo -n wattif-helper'), mock.patch('sys.stderr') as err:
+        with mock.patch.dict(config.SETTINGS['helper'], command='sudo -n drainhound-helper'), mock.patch('sys.stderr') as err:
             command, why = experiment_module.helper_command()
         self.assertEqual(command, [])
         self.assertIn('must be a list of words', why)
@@ -1542,7 +1542,7 @@ class ExperimentTests(unittest.TestCase):
             self.assertFalse(experiment_module.locker_running())  # Not "s", "w", "a" …
 
     def test_throttle_apps_is_offered_only_where_throttle_can_follow_the_windows(self):
-        self.box.followable = False  # Hyprland, GNOME, KDE, X11: wattif throttle caps nothing there.
+        self.box.followable = False  # Hyprland, GNOME, KDE, X11: drainhound throttle caps nothing there.
         self.assertNotIn('throttle-apps', self.real_catalog())
         self.assertFalse(THROTTLE_FOLLOWABLE())
         path = self.box.root / 'niri.sock'
@@ -1595,8 +1595,8 @@ class ExperimentTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({'updated': 1000}))
         with mock.patch.object(experiment_module, 'RECOMMEND', path), \
-                mock.patch('wattif.eta.write_recommendations', return_value={'fresh': True}), \
-                mock.patch('wattif.report.load_range', return_value=([], [])):
+                mock.patch('drainhound.eta.write_recommendations', return_value={'fresh': True}), \
+                mock.patch('drainhound.report.load_range', return_value=([], [])):
             self.assertEqual(experiment_module.recommendation(now=1100), {'updated': 1000})
             self.assertEqual(experiment_module.recommendation(now=1000 + 3601), {'fresh': True, 'computed': True})
 
@@ -1629,7 +1629,7 @@ class ExperimentTests(unittest.TestCase):
                         raise RuntimeError('Failed to activate CPU driver: Invalid argument')
                     for i in range(2):
                         write(f'policy{i}/boost', 0 if command[2] == 'power-saver' else 1)
-                elif command[-2] == 'boost':  # wattif-helper: global on, per CPU as asked.
+                elif command[-2] == 'boost':  # drainhound-helper: global on, per CPU as asked.
                     write('boost', 1)
                     for i in range(2):
                         write(f'policy{i}/boost', command[-1])
@@ -1642,7 +1642,7 @@ class ExperimentTests(unittest.TestCase):
                 self.assertEqual(calls[-1], lab + ['boost', '1'])
                 write('policy1/boost', 0)
                 self.assertEqual(experiment_module.boost_get(), '0')
-                write('boost', 0)  # Off globally (the old wattif-helper): the daemon refuses to switch.
+                write('boost', 0)  # Off globally (the old drainhound-helper): the daemon refuses to switch.
                 experiment_module.profile_set('balanced')
                 self.assertEqual(calls[-3:], [lab + ['boost', '0'], ['powerprofilesctl', 'set', 'balanced'],
                                               lab + ['boost', '0']])

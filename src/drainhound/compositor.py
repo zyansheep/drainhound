@@ -1,5 +1,5 @@
-"""The desktop's windows, from the compositor's IPC, for wattif throttle and
-wattif freeze: each window's pid and app id, its workspace and when it last had
+"""The desktop's windows, from the compositor's IPC, for drainhound throttle and
+drainhound freeze: each window's pid and app id, its workspace and when it last had
 focus (CLOCK_MONOTONIC s), which window has focus, and which workspaces are
 shown on their outputs. An X11 window's pid is the client's where the
 compositor knows it (sway: _NET_WM_PID); niri gives xwayland-satellite's, so
@@ -9,7 +9,7 @@ A backend follows its compositor's event stream (a child process whose stdout
 throttle.run reads). `known` says whether its state is live: false until the
 first full snapshot, and false again once the stream ends, when everything is
 forgotten (clear()). Before, a dead niri stream left its last windows behind,
-and wattif freeze went on freezing apps you were using.
+and drainhound freeze went on freezing apps you were using.
 
     niri    `niri msg -j event-stream`: it begins with every window and workspace
     sway    `swaymsg -t subscribe -m '["window","workspace"]'`; get_tree and
@@ -17,8 +17,8 @@ and wattif freeze went on freezing apps you were using.
             (its events don't), and focus times are kept here (sway has none)
 
 detect() picks one from the environment (NIRI_SOCKET, SWAYSOCK) whose socket
-is there. Elsewhere (Hyprland, GNOME, KDE, X11) nothing is known: wattif
-throttle caps nothing and wattif freeze freezes nothing.
+is there. Elsewhere (Hyprland, GNOME, KDE, X11) nothing is known: drainhound
+throttle caps nothing and drainhound freeze freezes nothing.
 """
 import json
 import os
@@ -214,7 +214,7 @@ def detect(environ=None, clock=time.monotonic, socket=is_socket):
     """The backend for the compositor this session runs (a Desktop that knows
     nothing if it is none of them). A NIRI_SOCKET or SWAYSOCK whose socket
     isn't there is a compositor that has exited (a user service can keep an
-    old session's environment), as wattif experiment reads it too."""
+    old session's environment), as drainhound experiment reads it too."""
     environ = os.environ if environ is None else environ
     for variable, backend in BACKENDS:
         if environ.get(variable) and socket(environ[variable]):

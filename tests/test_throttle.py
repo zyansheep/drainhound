@@ -9,8 +9,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from wattif import compositor, config, throttle
-from wattif.throttle import UNLIMITED, Throttle
+from drainhound import compositor, config, throttle
+from drainhound.throttle import UNLIMITED, Throttle
 
 
 class ThrottleTests(unittest.TestCase):
@@ -403,7 +403,7 @@ class RunTests(unittest.TestCase):
             program = f"""
 import sys
 from pathlib import Path
-from wattif import compositor, throttle
+from drainhound import compositor, throttle
 class Niri(compositor.Niri):
     command = (sys.executable, '-c', {niri!r})
 agent = throttle.Throttle(Path({str(apps)!r}), quota=5, battery=lambda: True, proc=Path({str(proc)!r}), desktop=Niri())

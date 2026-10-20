@@ -3,7 +3,7 @@ requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "wattif"
+name = "drainhound"
 dynamic = ["version"]
 description = "Where a Linux laptop's battery goes, how long it will last, and what would make it last longer, measured on your machine by experiment"
 readme = "README.md"
@@ -31,16 +31,16 @@ dependencies = ["numpy>=1.26", "scipy>=1.11"]
 panel = ["PyGObject>=3.48", "pycairo>=1.25"]
 
 [project.scripts]
-wattif = "wattif.cli:main"
+drainhound = "drainhound.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/zyansheep/wattif"
+Homepage = "https://github.com/zyansheep/drainhound"
 
 [tool.setuptools.dynamic]
-version = { attr = "wattif.__version__" }
+version = { attr = "drainhound.__version__" }
 
 [tool.setuptools.package-data]
-wattif = ["menu-theme.css"]
+drainhound = ["menu-theme.css"]
 
 [tool.ruff]
 line-length = 120

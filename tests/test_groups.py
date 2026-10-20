@@ -5,7 +5,7 @@ from unittest import mock
 
 import numpy as np
 
-from wattif import collector, config, panel_data, report
+from drainhound import collector, config, panel_data, report
 
 
 def rows(apps, n=240, seed=3):

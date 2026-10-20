@@ -1,8 +1,8 @@
 """A synthetic month of data in a fresh state directory, to try the panel or
 take screenshots without a month of your own:
 
-    python tools/demo.py /tmp/wattif-demo
-    WATTIF_STATE_DIR=/tmp/wattif-demo/state wattif panel serve --open
+    python tools/demo.py /tmp/drainhound-demo
+    DRAINHOUND_STATE_DIR=/tmp/drainhound-demo/state drainhound panel serve --open
 
 The month is the tests' (tests/test_panel_data.month: battery and AC time,
 manual and automatic experiments, votes, suspends) with everyday app names.
@@ -15,7 +15,7 @@ from pathlib import Path
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parents[1] / 'src')]
 
 from tests.test_panel_data import month  # noqa: E402
-from wattif import store  # noqa: E402
+from drainhound import store  # noqa: E402
 
 NAMES = {'Floorp': 'Firefox', 'yosys': 'cargo'}
 EXTRA = {'Code': 0.12, 'Slack': 0.06, 'Spotify': 0.04, 'Niri': 0.03, 'PipeWire': 0.01}
@@ -39,7 +39,7 @@ def main(directory):
         conn.executemany(store.INSERT_EVENT, [(e.get('event'), e.get('t1', 0), e.get('t0'), e.get('boot'),
                                                e.get('gap_s'), store.compact(e)) for e in events])
     print(f'{len(minutes)} minutes, {len(events)} events in {db}')
-    print(f'WATTIF_STATE_DIR={state} WATTIF_RUNTIME_DIR={Path(directory) / "runtime"} wattif panel serve --open')
+    print(f'DRAINHOUND_STATE_DIR={state} DRAINHOUND_RUNTIME_DIR={Path(directory) / "runtime"} drainhound panel serve --open')
 
 
 if __name__ == '__main__':

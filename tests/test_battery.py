@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from wattif import battery as batteries
+from drainhound import battery as batteries
 
 
 def supply(root, name, **values):

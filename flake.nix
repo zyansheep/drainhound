@@ -1,5 +1,5 @@
 {
-  description = "wattif: where a Linux laptop's battery goes, how long it will last, and what would make it last longer";
+  description = "drainhound: where a Linux laptop's battery goes, how long it will last, and what would make it last longer";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -16,27 +16,27 @@
       else pkgs.python314Packages;
   in {
     packages = forAll (pkgs: rec {
-      wattif = pkgs.callPackage ./nix/package.nix {python3Packages = python3PackagesOf pkgs;};
-      default = wattif;
+      drainhound = pkgs.callPackage ./nix/package.nix {python3Packages = python3PackagesOf pkgs;};
+      default = drainhound;
     });
 
     nixosModules.default = import ./nix/module.nix self;
-    nixosModules.wattif = self.nixosModules.default;
+    nixosModules.drainhound = self.nixosModules.default;
 
     overlays.default = final: _prev: {
-      wattif = final.callPackage ./nix/package.nix {python3Packages = python3PackagesOf final;};
+      drainhound = final.callPackage ./nix/package.nix {python3Packages = python3PackagesOf final;};
     };
 
     checks = forAll (pkgs: let
-      wattif = self.packages.${pkgs.stdenv.hostPlatform.system}.wattif;
+      drainhound = self.packages.${pkgs.stdenv.hostPlatform.system}.drainhound;
     in {
       # The Python tests run in the package's checkPhase.
-      package = wattif;
+      package = drainhound;
       # The root helper against a fake /sys, /run and /proc/cmdline, and shellcheck.
-      helper = pkgs.runCommand "wattif-helper-check" {nativeBuildInputs = [pkgs.shellcheck];} ''
-        shellcheck --severity=style ${./helper/wattif-helper}
+      helper = pkgs.runCommand "drainhound-helper-check" {nativeBuildInputs = [pkgs.shellcheck];} ''
+        shellcheck --severity=style ${./helper/drainhound-helper}
         shellcheck --shell=bash ${./helper/test-helper.sh}
-        ${pkgs.bash}/bin/bash ${./helper/test-helper.sh} ${wattif}/bin/wattif-helper
+        ${pkgs.bash}/bin/bash ${./helper/test-helper.sh} ${drainhound}/bin/drainhound-helper
         touch $out
       '';
       # The NixOS module evaluates, with the helper's sudo rule and suspend hooks.
@@ -46,7 +46,7 @@
           modules = [
             self.nixosModules.default
             {
-              services.wattif = {
+              services.drainhound = {
                 enable = true;
                 helper.users = ["alice"];
                 settings.freeze.apps = ["obsidian"];
@@ -63,19 +63,19 @@
         };
         c = system.config;
       in
-        pkgs.writeText "wattif-module-check" (builtins.toJSON {
-          config = c.environment.etc."wattif/config.toml".source;
+        pkgs.writeText "drainhound-module-check" (builtins.toJSON {
+          config = c.environment.etc."drainhound/config.toml".source;
           sudo = c.security.sudo.extraRules;
           sleep = c.powerManagement.powerDownCommands;
-          wanted = c.systemd.user.services.wattif-collector.wantedBy;
-          panel = c.systemd.user.services.wattif-panel.wantedBy;
-          timer = c.systemd.user.timers.wattif-reconcile.wantedBy;
+          wanted = c.systemd.user.services.drainhound-collector.wantedBy;
+          panel = c.systemd.user.services.drainhound-panel.wantedBy;
+          timer = c.systemd.user.timers.drainhound-reconcile.wantedBy;
         });
     });
 
     devShells = forAll (pkgs: {
       default = pkgs.mkShell {
-        inputsFrom = [self.packages.${pkgs.stdenv.hostPlatform.system}.wattif];
+        inputsFrom = [self.packages.${pkgs.stdenv.hostPlatform.system}.drainhound];
         packages = [pkgs.ruff pkgs.shellcheck];
         shellHook = ''export PYTHONPATH=$PWD/src''${PYTHONPATH:+:$PYTHONPATH}'';
       };

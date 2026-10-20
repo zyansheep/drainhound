@@ -1,4 +1,4 @@
-// wattif's Firefox process bridge: which site each content process shows (the first line of an AutoConfig file is skipped).
+// drainhound's Firefox process bridge: which site each content process shows (the first line of an AutoConfig file is skipped).
 //
 // The battery menu lists a Firefox-family browser's content processes as
 // "Firefox web · PID 1234". With this script the browser writes, every 5 s,
@@ -12,11 +12,11 @@
 // process. To install it, in the browser's installation directory (the one with
 // the `firefox` binary: /usr/lib/firefox, /usr/lib/librewolf, /opt/zen, ...):
 //
-//   1. defaults/pref/wattif-bridge.js, containing:
-//        pref("general.config.filename", "wattif-bridge.cfg");
+//   1. defaults/pref/drainhound-bridge.js, containing:
+//        pref("general.config.filename", "drainhound-bridge.cfg");
 //        pref("general.config.obscure_value", 0);
 //        pref("general.config.sandbox_enabled", false);
-//   2. wattif-bridge.cfg: a copy of this file.
+//   2. drainhound-bridge.cfg: a copy of this file.
 //   3. Restart the browser. about:support's "Important Modified Preferences"
 //      lists general.config.filename once it is loaded; errors go to the
 //      Browser Console (Ctrl+Shift+J).
@@ -64,7 +64,7 @@
       await IOUtils.move(temporary, path);
     } catch (error) {
       // Failure leaves a stale snapshot, which the collector ignores automatically.
-      Cu.reportError(`wattif process bridge: ${error}`);
+      Cu.reportError(`drainhound process bridge: ${error}`);
     } finally { busy = false; }
   }
   const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);

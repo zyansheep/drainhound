@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from wattif import config, launch
+from drainhound import config, launch
 
 NOW = 1.8e9
 DISCHARGING = {'status': 'Discharging', 'pct': 62.4, 'watts': 7.84, 'updated': NOW - 1, 'energy_pct': 60,
@@ -64,7 +64,7 @@ class TooltipTests(unittest.TestCase):
             self.assertNotIn('tooltip', self.label(DISCHARGING))
             self.assertEqual(self.label(dict(DISCHARGING, updated=NOW - 60)), {'text': '--', 'class': ['unknown']})
         stale = self.label(dict(DISCHARGING, updated=NOW - 60))
-        self.assertEqual((stale['text'], stale['tooltip']), ('--', "No estimate: wattif eta isn't running"))
+        self.assertEqual((stale['text'], stale['tooltip']), ('--', "No estimate: drainhound eta isn't running"))
 
     def test_hours(self):
         self.assertEqual([launch.hours_text(h) for h in (0.75, 1.9925, 9.6, 10.4, float('nan'), None)],

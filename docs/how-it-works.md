@@ -1,14 +1,14 @@
-# How wattif works
+# How drainhound works
 
 Linux has no per-process power meter. What a laptop does measure is the
 battery's draw, and on many machines the chip's (amdgpu's package power, or
-RAPL's package energy where it's readable). wattif records those totals with
+RAPL's package energy where it's readable). drainhound records those totals with
 everything that could explain them, fits models to them, and runs
 experiments where a model alone can't tell cause from coincidence.
 
 ## Measuring
 
-`wattif collect` (the `wattif-collector` user service) samples the battery
+`drainhound collect` (the `drainhound-collector` user service) samples the battery
 and the chip's power several times a second. Every 2 s it scans the processes'
 CPU time. Every 10 s it writes one **record** of raw inputs, never its own
 conclusions, so better models can be fitted to old data later:
@@ -75,7 +75,7 @@ that file, so the whole program agrees on one fit.
 
 ## Time left
 
-`wattif eta` forecasts the draw, not the percentage:
+`drainhound eta` forecasts the draw, not the percentage:
 
 - **Remaining energy** comes from the battery's energy counter, or for
   charge-counting batteries from the charge times the learned loaded-voltage
@@ -94,7 +94,7 @@ that file, so the whole program agrees on one fit.
 
 **Empty is where the battery cuts out, which is often not 0%.** Many embedded
 controllers cut the power with charge still on the gauge; the laptop this grew
-on cut at ~1.8%, every time, with the loaded voltage still normal. wattif
+on cut at ~1.8%, every time, with the loaded voltage still normal. drainhound
 learns that cutoff from boots that ended on battery at a low level with no
 shutdown. How each boot ended comes from the journal, so a crash or a reboot
 can't teach it. Below 5%:
@@ -116,11 +116,11 @@ over a log-normal fit of past suspends' drain (longer ones weigh more), with an
 ## Experiments
 
 Observational data can't tell what a setting does: you turn on power saving
-when the battery is low, and you run builds on AC. So wattif randomizes.
+when the battery is low, and you run builds on AC. So drainhound randomizes.
 
 **Blocks.** While enabled and on battery, every 4-minute block sets each
 setting in the pool to one state, with the first minute ignored (washout:
-the battery reading lags, links retrain). A manual run (`wattif experiment
+the battery reading lags, links retrain). A manual run (`drainhound experiment
 start a b c --minutes N`) cycles a shuffled full factorial of up to four
 settings. The automatic runner picks each block's combination with the plan
 below.
@@ -163,7 +163,7 @@ anything goes.
 **When to stop** (`report.testing_value`). More testing improves the
 recommendation, which only changes a setting where the change saves with 90%
 certainty (Benjamini–Hochberg across settings). For 10, 30 and 100 more
-hours, wattif simulates the posterior after that much testing. Testing h
+hours, drainhound simulates the posterior after that much testing. Testing h
 hours *saves* the expected loss reduction times your battery hours over the
 next 30 days. It *costs* h × the watts blocks draw above the recommendation.
 When no amount pays, the runner pauses with the recommended combination set,
@@ -173,7 +173,7 @@ tests 10 hours first.
 
 **Goals.** *Battery* recommends the measured combination with the lowest
 draw. *Comfort* recommends the one most likely to earn a 👍, then the lowest
-draw. Both only consider allowed combinations. `wattif experiment goal
+draw. Both only consider allowed combinations. `drainhound experiment goal
 comfort|battery --apply` switches.
 
 **Safety.**
@@ -185,7 +185,7 @@ comfort|battery --apply` switches.
 - A watchdog reads the kernel log every 30 s while experiments run, and the
   previous boot's at start. On a dead USB controller, a Bluetooth timeout, a
   PCIe, GPU or NVMe error, or a crash reset while awake, it puts back what
-  wattif changed, quarantines what changed in the 15 minutes before, and turns
+  drainhound changed, quarantines what changed in the 15 minutes before, and turns
   experiments off until you turn them on again. A boot that died asleep only
   pauses the run.
 - Applied settings (`apply`, `goal --apply`) last until reboot, on battery
@@ -193,7 +193,7 @@ comfort|battery --apply` switches.
   battery.
 
 **Boot-level settings** can't change at runtime. Panel self-refresh on amdgpu
-is the one wattif compares: with a `psr` arm in `experiments.boot_arms` (a boot
+is the one drainhound compares: with a `psr` arm in `experiments.boot_arms` (a boot
 entry that sets `amdgpu.dcdebugmask` without its 0x10 bit), the panel picks the
 entry for the next restart only, the arm with less battery time first. Boots are compared on their baselines, with a
 Welch t interval over boots once each arm has 5.
@@ -209,7 +209,7 @@ effect only ~48% of the time.
 
 ## Background apps
 
-**Throttle** (`wattif throttle`, started by the `throttle-apps` setting). On
+**Throttle** (`drainhound throttle`, started by the `throttle-apps` setting). On
 battery, every app with a window except the focused one gets a CPU quota
 (cgroup `cpu.max`, 10% of a core per app by default). The quota lifts the
 moment the app is focused and stays off for 2 minutes after it loses focus.
@@ -219,7 +219,7 @@ two. Scopes in nested slices (uwsm, app2unit and Flatpak use
 app, and so is a launcher's randomly named scope with the app of its name. A
 window belongs to the app its pid's scope says, or, when the pid says nothing
 (niri gives every X11 window xwayland-satellite's), to the app its app id
-names. While the focused window belongs to no app wattif can tell, nothing is
+names. While the focused window belongs to no app drainhound can tell, nothing is
 capped. Never throttled:
 
 - apps playing or recording audio or video (a *running* PipeWire stream);
@@ -228,12 +228,12 @@ capped. Never throttled:
 - input methods;
 - anything while on AC.
 
-**Freeze** (`wattif freeze`, Android's cached-app freezer for apps you list).
+**Freeze** (`drainhound freeze`, Android's cached-app freezer for apps you list).
 On battery, a listed app that hasn't had focus for 30 minutes and has no
 window on a workspace in view gets `cgroup.freeze`, so it uses no CPU at all.
 It thaws at once when you focus it, switch to its workspace, start it again or
 plug in, and every 10 minutes it thaws for 10 s so timers and sync catch up.
 An app that is busy (over a quarter of a core) or playing media keeps running.
 Without live compositor state, nothing is frozen; nor while a focused or
-visible window belongs to no app wattif can tell (under niri, a game Steam
+visible window belongs to no app drainhound can tell (under niri, a game Steam
 started), since it might be one of yours.

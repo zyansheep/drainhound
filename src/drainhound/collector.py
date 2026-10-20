@@ -47,7 +47,7 @@ BUILTIN_NAMES = {
     # The desktop itself.
     'niri': 'Niri', 'sway': 'Sway', 'hyprland': 'Hyprland', 'gnome-shell': 'GNOME Shell',
     'kwin_wayland': 'KWin', 'kwin_x11': 'KWin', 'plasmashell': 'Plasma', 'waybar': 'Waybar',
-    'swaync': 'Notifications', 'mako': 'Notifications', 'dunst': 'Notifications', 'wattif': 'wattif',
+    'swaync': 'Notifications', 'mako': 'Notifications', 'dunst': 'Notifications', 'drainhound': 'drainhound',
 }
 
 
@@ -295,7 +295,7 @@ def single_instance(state):
         handle.seek(0)
         holder = handle.read().strip() or '?'
         handle.close()
-        sys.exit(f'wattif: another collector (PID {holder}) is already running; it holds {path}')
+        sys.exit(f'drainhound: another collector (PID {holder}) is already running; it holds {path}')
     handle.truncate(0)
     handle.write(f'{os.getpid()}\n')
     handle.flush()
@@ -330,7 +330,7 @@ def main(argv=()):
             print(day)
         return 0
     if argv:
-        sys.exit('usage: wattif collect [import]')
+        sys.exit('usage: drainhound collect [import]')
     lock = single_instance(log.parent)  # noqa: F841 (held until exit)
     directory = config.RUNTIME
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)

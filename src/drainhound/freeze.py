@@ -23,15 +23,15 @@ desktop apps aren't. So only the apps you list are frozen: not chat apps (their
 connection drops while frozen), and nothing that serves other programs (a dev
 server stops answering).
 
-    wattif freeze [PATTERN ...] [--after MIN] [--every MIN] [--thaw SEC]
-    wattif freeze --release      (thaw what it froze; the unit's ExecStopPost)
+    drainhound freeze [PATTERN ...] [--after MIN] [--every MIN] [--thaw SEC]
+    drainhound freeze --release      (thaw what it froze; the unit's ExecStopPost)
 
 PATTERN is matched (case-insensitively) anywhere in the app's scope names in
-app.slice (and the slices there), systemd's escapes undone, as wattif
+app.slice (and the slices there), systemd's escapes undone, as drainhound
 throttle's --keep is. Without one it freezes the configuration's [freeze]
 apps, and with none of those it idles; AFTER, EVERY and THAW are [freeze]
 after, every and thaw, and the flags override them all. It follows focus and media from the same event streams as
-wattif throttle (throttle.Session). RUNTIME/freeze.json says what it watches
+drainhound throttle (throttle.Session). RUNTIME/freeze.json says what it watches
 and what it has frozen.
 """
 import argparse
@@ -65,7 +65,7 @@ class Freezer(Session):
         # By app: last in use; when frozen (this time); when a periodic thaw began; (time, CPU µs) samples.
         self.used, self.frozen, self.thawed, self.usage, self.was_busy = {}, {}, {}, {}, {}
         self.scopes = None  # The scopes seen last time (None before the first look).
-        self.mine = set()  # Scopes this froze (a wattif experiment freeze is left alone).
+        self.mine = set()  # Scopes this froze (a drainhound experiment freeze is left alone).
 
     def chosen(self, scope):
         name = unescape(unit(scope)).lower()
@@ -205,7 +205,7 @@ def release_left(state=STATE, apps=APPS):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog='wattif freeze', description=__doc__.split('\n\n')[0])
+    parser = argparse.ArgumentParser(prog='drainhound freeze', description=__doc__.split('\n\n')[0])
     parser.add_argument('patterns', nargs='*', metavar='PATTERN',
                         help='apps to freeze, matched in scope names (default: [freeze] apps)')
     parser.add_argument('--after', type=float, default=AFTER / 60, help='minutes without focus before freezing')
@@ -221,13 +221,13 @@ def main(argv=None):
     patterns = string_list(args.patterns, 'PATTERN') or string_list(config.get('freeze', 'apps'), '[freeze] apps')
     if not patterns:
         # A unit that runs it unconfigured stays up, doing nothing, instead of failing and restarting.
-        print('wattif freeze: no apps to freeze (name them, or set [freeze] apps in the configuration); idling',
+        print('drainhound freeze: no apps to freeze (name them, or set [freeze] apps in the configuration); idling',
               file=sys.stderr)
         while True:
             signal.pause()
     desktop = compositor.detect()
     if desktop.command is None:
-        print(f"wattif freeze: {compositor.unsupported()} isn't supported (niri and sway are): nothing says which "
+        print(f"drainhound freeze: {compositor.unsupported()} isn't supported (niri and sway are): nothing says which "
               'apps are in use, so nothing is frozen', file=sys.stderr)
     throttle.run(Freezer(patterns, after=args.after * 60, every=args.every * 60, thaw=args.thaw, desktop=desktop))
 

@@ -10,9 +10,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from wattif import power
-from wattif import store
-from wattif.power import (PRIOR, Deltas, FastSampler, GpuClients, IdleStates, Monitor, PowerLog, attribute, battery_watts,
+from drainhound import power
+from drainhound import store
+from drainhound.power import (PRIOR, Deltas, FastSampler, GpuClients, IdleStates, Monitor, PowerLog, attribute, battery_watts,
                    chip_rails, clock_means, clock_split, clocks, cpu_frequency, device_deltas, experiment_assignment,
                    idle_deltas, idle_parts, interrupts, load_attribution, log_footer, network, own_cpu, parse_fdinfo,
                    percentages, settings, subtract, summarize, TICKS)
@@ -110,7 +110,7 @@ class PowerTests(unittest.TestCase):
 
     def test_throttle_is_on_only_while_its_process_lives(self):
         import json, os
-        from wattif.power import throttle_state
+        from drainhound.power import throttle_state
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'throttle.json'
             self.assertEqual(throttle_state(path), 'off')
@@ -532,7 +532,7 @@ class PowerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
             put(directory / '2000-01-01.jsonl.zst', 'not zstd at all')
-            with mock.patch('wattif.power.stderr', new_callable=io.StringIO) as err:
+            with mock.patch('drainhound.power.stderr', new_callable=io.StringIO) as err:
                 log = PowerLog(directory)
             self.assertIn('ZstdError', err.getvalue())
             self.assertIn('2000-01-01.jsonl.zst', err.getvalue())
@@ -722,8 +722,8 @@ class MonitorTests(unittest.TestCase):
         self.sys, self.proc = fake_machine(root)
         self.log, self.db = root / 'state/power', root / 'state/power.sqlite3'
         self.uptime, self.asleep = [1000.0], [0.0]  # Boot clock; the part of it spent suspended.
-        self.patches = [mock.patch('wattif.power.qol.votes', return_value=[]),
-                        mock.patch('wattif.power.Commands.read', return_value={}),
+        self.patches = [mock.patch('drainhound.power.qol.votes', return_value=[]),
+                        mock.patch('drainhound.power.Commands.read', return_value={}),
                         mock.patch.dict(os.environ, {'XDG_STATE_HOME': str(root / 'xdg')})]
         for patch in self.patches:
             patch.start()
@@ -765,7 +765,7 @@ class MonitorTests(unittest.TestCase):
         with contextlib.ExitStack() as stack, mock.patch('shutil.which', lambda name: f'/usr/bin/{name}'):
             sway = unix_socket(stack, Path(self.tmp.name) / 'sway.sock')
             outputs = power.compositor_outputs(lambda command: json.dumps(SWAY_OUTPUTS), {'SWAYSOCK': sway})
-        with mock.patch('wattif.power.Commands.read', return_value={'compositor': outputs}):
+        with mock.patch('drainhound.power.Commands.read', return_value={'compositor': outputs}):
             monitor = self.monitor()
             for _ in range(6):
                 self.tick(monitor)
@@ -850,7 +850,7 @@ class MonitorTests(unittest.TestCase):
         gaps = [json.loads(d) for (d,) in self.rows("SELECT data FROM events WHERE event = 'gap' ORDER BY t1")]
         self.assertEqual([(g['gap_s'], g['suspended_s']) for g in gaps],
                          [(1800.0, 1800.0), (1800.0, 0.0), (1800.0, 1000.0)])
-        from wattif import report
+        from drainhound import report
         (kept,) = report.sleep_drain(gaps)
         self.assertEqual(kept['end'], gaps[0]['t1'])
         self.assertAlmostEqual(kept['watts'], 0.05 * 15.5 / 0.5, places=3)
@@ -891,7 +891,7 @@ class MonitorTests(unittest.TestCase):
         with contextlib.closing(sqlite3.connect(self.db)) as conn:
             conn.execute(f'PRAGMA user_version = {store.VERSION + 1}')  # A newer build's layout.
         with contextlib.redirect_stderr(io.StringIO()) as err, \
-                mock.patch('wattif.power.stderr', new_callable=io.StringIO) as log_err:
+                mock.patch('drainhound.power.stderr', new_callable=io.StringIO) as log_err:
             monitor = self.monitor()
             for _ in range(6):
                 self.tick(monitor)
@@ -903,7 +903,7 @@ class MonitorTests(unittest.TestCase):
     def test_maintain_reads_back_what_a_failed_write_missed(self):
         monitor = self.monitor()
         real = store.insert
-        with mock.patch('wattif.store.insert', side_effect=sqlite3.OperationalError('disk I/O error')), \
+        with mock.patch('drainhound.store.insert', side_effect=sqlite3.OperationalError('disk I/O error')), \
                 contextlib.redirect_stderr(io.StringIO()):
             for _ in range(6):
                 self.tick(monitor)

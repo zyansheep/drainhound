@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# wattif-helper: the fixed-menu root helper behind wattif's power experiments.
+# drainhound-helper: the fixed-menu root helper behind drainhound's power experiments.
 #
-# wattif runs it as `sudo -n wattif-helper <command>` (a NOPASSWD rule for this
+# drainhound runs it as `sudo -n drainhound-helper <command>` (a NOPASSWD rule for this
 # one file; see the README), or from the suspend hooks as root. Every command
 # writes only the files it is about, with validated values: there is no generic
 # sysfs writer, and nothing reads a file it is given.
 #
-# Changes take $RUN/wattif-helper.lock, so experiments, the panel and the
+# Changes take $RUN/drainhound-helper.lock, so experiments, the panel and the
 # suspend hooks never interleave (aspm wakes every PCI function, then puts each
-# back). The lock and $RUN/wattif-helper are root's alone (umask 077): anyone
+# back). The lock and $RUN/drainhound-helper are root's alone (umask 077): anyone
 # who can open a file can hold a flock on it. Between sleep-safe (before
 # suspend) and sleep-restore (after resume) the `sleeping` flag makes changes
 # refuse (exit 75), so nothing undoes what sleep-safe restored on the way into
@@ -24,17 +24,17 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH
 SYS=/sys
 RUN=/run
 CMDLINE=/proc/cmdline
-LOCK=$RUN/wattif-helper.lock
-SLEEPING=$RUN/wattif-helper/sleeping
+LOCK=$RUN/drainhound-helper.lock
+SLEEPING=$RUN/drainhound-helper/sleeping
 ASPM=$SYS/module/pcie_aspm/parameters/policy
-BUSY=75 # EX_TEMPFAIL: suspending, or another change holds the lock; wattif waits and retries.
-CHANGE_WAIT=10 # s a change waits for another's lock (wattif gives a call 30 s)
+BUSY=75 # EX_TEMPFAIL: suspending, or another change holds the lock; drainhound waits and retries.
+CHANGE_WAIT=10 # s a change waits for another's lock (drainhound gives a call 30 s)
 # Units that are up from before suspend until after resume: systemd's own, and
 # NixOS's sleep-actions.service (powerManagement.powerDownCommands/resumeCommands).
 SLEEP_UNITS="sleep.target systemd-suspend.service systemd-hibernate.service systemd-hybrid-sleep.service systemd-suspend-then-hibernate.service sleep-actions.service"
 usage() {
   cat >&2 <<'USAGE'
-usage: wattif-helper <command> [args]
+usage: drainhound-helper <command> [args]
   status                 battery draw, chip power and the settings below
   abm <0-4>              amdgpu panel power savings (ABM) on the internal panel
   aspm <policy>          PCIe ASPM policy: default|performance|powersave|powersupersave
@@ -53,8 +53,8 @@ USAGE
   exit 2
 }
 log() { # message [priority]: the journal (logger) and stderr
-  logger -t wattif-helper -p "user.${2:-notice}" -- "$1" 2>/dev/null || true
-  echo "wattif-helper: $1" >&2
+  logger -t drainhound-helper -p "user.${2:-notice}" -- "$1" 2>/dev/null || true
+  echo "drainhound-helper: $1" >&2
 }
 # aspm's saved power/control values: put back on any exit, so a failure
 # half-way never leaves every PCI function pinned awake until reboot.
@@ -101,20 +101,20 @@ begin_change() {
   lock "$CHANGE_WAIT" || { log "busy: another change holds $LOCK" warning; exit "$BUSY"; }
   [ -e "$SLEEPING" ] || return 0
   if suspending; then
-    echo "wattif-helper: suspending (sleep-safe ran, sleep-restore not yet); try again after resume" >&2
+    echo "drainhound-helper: suspending (sleep-safe ran, sleep-restore not yet); try again after resume" >&2
     exit "$BUSY"
   fi
   log "clearing a stale sleeping flag (no suspend under way: sleep-restore did not run)" warning
   rm -f "$SLEEPING"
 }
 hooks_only() { # sleep-safe/-restore belong to the suspend hooks, not to sudo
-  [ -z "${SUDO_UID:-}" ] || { echo "wattif-helper: $cmd runs from the suspend hooks only" >&2; exit 2; }
+  [ -z "${SUDO_UID:-}" ] || { echo "drainhound-helper: $cmd runs from the suspend hooks only" >&2; exit 2; }
 }
 aspm_now() { grep -o '\[[a-z]*\]' "$ASPM" | tr -d '[]' || true; }
 # What this helper changed since boot ($RUN is a tmpfs): sleep-safe puts back
 # only those, never what you, TLP or a udev rule set.
-mark() { mkdir -p "$RUN/wattif-helper"; : > "$RUN/wattif-helper/changed-$1"; }
-changed() { [ -e "$RUN/wattif-helper/changed-$1" ]; }
+mark() { mkdir -p "$RUN/drainhound-helper"; : > "$RUN/drainhound-helper/changed-$1"; }
+changed() { [ -e "$RUN/drainhound-helper/changed-$1" ]; }
 cmdline_value() { grep -o "$1=[^ ]*" "$CMDLINE" | tail -n 1 | cut -d= -f2 || true; }
 # Set the ASPM policy with every PCI function awake. A runtime-suspended
 # function puts back the link control it saved before the change when it
@@ -141,7 +141,7 @@ set_aspm() {
   [ "$now" = "$1" ] || { log "aspm reads $now after writing $1" err; return 1; }
 }
 some() { # glob results exist, or say what is missing
-  [ "$#" -gt 1 ] || { echo "wattif-helper: $cmd: no ${1#"$SYS"/} here" >&2; exit 1; }
+  [ "$#" -gt 1 ] || { echo "drainhound-helper: $cmd: no ${1#"$SYS"/} here" >&2; exit 1; }
 }
 shift || true
 case "$cmd" in
@@ -205,7 +205,7 @@ case "$cmd" in
     elif [ -e "$SYS/devices/system/cpu/intel_pstate/no_turbo" ]; then
       echo $((1 - $1)) > "$SYS/devices/system/cpu/intel_pstate/no_turbo"
     else
-      echo "wattif-helper: boost: no cpufreq/boost or intel_pstate/no_turbo here" >&2; exit 1
+      echo "drainhound-helper: boost: no cpufreq/boost or intel_pstate/no_turbo here" >&2; exit 1
     fi
     echo "boost=$1 max_mhz=$(( $(cat "$SYS"/devices/system/cpu/cpu0/cpufreq/scaling_max_freq) / 1000 ))"
     ;;
@@ -251,12 +251,12 @@ case "$cmd" in
     [[ "$bdf" =~ ^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$ ]] || usage
     dev=$SYS/bus/pci/devices/$bdf
     driver=$SYS/bus/pci/drivers/xhci_hcd
-    [ -e "$dev" ] || { echo "wattif-helper: no PCI device $bdf" >&2; exit 1; }
+    [ -e "$dev" ] || { echo "drainhound-helper: no PCI device $bdf" >&2; exit 1; }
     bound=""
     [ -L "$dev/driver" ] && bound=$(basename "$(readlink "$dev/driver")")
     # Bound to xhci_hcd, or unbound (a reset that stopped half-way) and an xHCI controller by class.
     if [ "$bound" != xhci_hcd ] && { [ -n "$bound" ] || [ "$(cat "$dev/class")" != 0x0c0330 ]; }; then
-      echo "wattif-helper: $bdf is not an xHCI controller (driver: ${bound:-none})" >&2; exit 1
+      echo "drainhound-helper: $bdf is not an xHCI controller (driver: ${bound:-none})" >&2; exit 1
     fi
     begin_change
     log "xhci-reset $bdf (driver: ${bound:-none})"
@@ -275,10 +275,10 @@ case "$cmd" in
     # the log.
     # The flag first: from now on changes refuse, then wait for one under way.
     hooks_only
-    mkdir -p "$RUN/wattif-helper"
+    mkdir -p "$RUN/drainhound-helper"
     date +%s > "$SLEEPING"
     lock 30 || log "sleep-safe: proceeding without the lock" warning
-    saved=$RUN/wattif-helper/pre-sleep; : > "$saved"
+    saved=$RUN/drainhound-helper/pre-sleep; : > "$saved"
     failed=0
     policy=$(cmdline_value pcie_aspm.policy)
     current=$(aspm_now)
@@ -307,12 +307,12 @@ case "$cmd" in
     [ "$failed" -eq 0 ] || { log "sleep-safe: a setting could not be put back before suspend" err; exit 1; }
     ;;
   sleep-restore)
-    # After resume: end the lock-out. What sleep-safe put back stays: wattif
+    # After resume: end the lock-out. What sleep-safe put back stays: drainhound
     # sets those settings again itself, after its post-resume wait and within
     # its hold and daily limit.
     hooks_only
     lock 30 || log "sleep-restore: proceeding without the lock" warning
-    saved=$RUN/wattif-helper/pre-sleep
+    saved=$RUN/drainhound-helper/pre-sleep
     if [ -s "$saved" ]; then
       log "after resume, left at the boot-time values: $(tr '\n' ';' < "$saved")"
     fi

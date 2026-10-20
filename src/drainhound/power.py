@@ -170,15 +170,15 @@ class Rapl:
     The counters are root-only since Linux 5.10 (and the stable kernels it went
     back to): PLATYPUS (CVE-2020-8694) showed that unprivileged energy readings
     leak secrets through power side channels (which instructions and data run,
-    keys, KASLR). wattif reads them only where an administrator has opted in,
+    keys, KASLR). drainhound reads them only where an administrator has opted in,
     for instance with a group the user is in:
-        /etc/tmpfiles.d/wattif-rapl.conf:
+        /etc/tmpfiles.d/drainhound-rapl.conf:
             z /sys/class/powercap/intel-rapl:*/energy_uj 0440 root wheel -
     or a udev rule, which also covers the driver loading later:
         ACTION=="add", SUBSYSTEM=="powercap", KERNEL=="intel-rapl:*", \\
             RUN+="/bin/chgrp wheel /sys%p/energy_uj", RUN+="/bin/chmod g+r /sys%p/energy_uj"
     That gives every process of that group the side channel back; mode 0444 gives
-    it to every local user. On an AMD APU wattif uses amdgpu's PPT instead."""
+    it to every local user. On an AMD APU drainhound uses amdgpu's PPT instead."""
     source, counter = 'rapl', True
 
     def __init__(self, zones, clock=None):
@@ -572,7 +572,7 @@ def display(sys=Path('/sys')):
 
 
 def throttle_state(path):
-    """'on' while wattif throttle runs (its state file names a live process), else 'off'."""
+    """'on' while drainhound throttle runs (its state file names a live process), else 'off'."""
     try:
         os.kill(int(json.loads(Path(path).read_text())['pid']), 0)
         return 'on'
@@ -590,7 +590,7 @@ def settings(sys=Path('/sys')):
         'amd_pstate': read(cpu / 'amd_pstate/status'),
         'aspm': next((w[1:-1] for w in (read(sys / 'module/pcie_aspm/parameters/policy') or '').split()
                       if w.startswith('[')), None),
-        # The drive's runtime APST limit (what wattif-helper changes), not nvme_core's boot default.
+        # The drive's runtime APST limit (what drainhound-helper changes), not nvme_core's boot default.
         'nvme_apst_us': next((read(path) for path in sorted(sys.glob('class/nvme/nvme*/power/pm_qos_latency_tolerance_us'))),
                              read(sys / 'module/nvme_core/parameters/default_ps_max_latency_us')),
         # Boot-level: bit 0x10 disables panel self-refresh (see the psr specialisation).
@@ -856,7 +856,7 @@ def process_io(proc, keys):
 
 # --- Online models and attribution ---------------------------------------------
 
-# Model terms and the priors they start from. wattif eta trains the real
+# Model terms and the priors they start from. drainhound eta trains the real
 # values (report.fit) into models.json every 15 minutes; the collector only
 # reads them. report.py shares this dict.
 # Chip W = floor + clock·GHz + load·busy·GHz² + gpu + video: the mean core clock
@@ -896,7 +896,7 @@ def idle_parts(params, chip, scale):
 
 
 def load_attribution(path):
-    """Trained attribution parameters from wattif eta's models.json, or None:
+    """Trained attribution parameters from drainhound eta's models.json, or None:
     PRIOR's keys, the idle clocks report.fit_rows learned (each profile's
     'idle_ghz:<profile>[:ac]', and 'idle_ghz_active'), the idle chip's
     rail shares ('rail:<rail>') and 'stages' (1: the one-stage model of a
@@ -953,7 +953,7 @@ def attribute(record, params):
 
     On battery each chip watt is scaled by the model's per-chip-watt cost (k),
     so apps carry their share of conversion losses; on AC only chip power is
-    known. `params` are wattif eta's trained values (see PRIOR). The clock
+    known. `params` are drainhound eta's trained values (see PRIOR). The clock
     term up to the profile's idle clock (clock_split) is the idle chip's (IDLE,
     as idle_parts once its rails are learned: 'Idle chip/<part>' rows); above
     it, apps share it by CPU time (theirs is what raised the clock).
@@ -1110,7 +1110,7 @@ class PowerLog:
                 try:
                     self.compress(path)
                 except Exception as error:  # A full disk, say: the plain file stays, compressed next start.
-                    print(f'wattif: compressing {path}: {type(error).__name__}: {error}', file=stderr)
+                    print(f'drainhound: compressing {path}: {type(error).__name__}: {error}', file=stderr)
         for path in sorted(directory.glob('*.jsonl*')):
             if path.suffix not in ('.jsonl', '.zst'):
                 continue  # An interrupted compression's .part file.
@@ -1136,7 +1136,7 @@ class PowerLog:
         except (EOFError, ValueError):
             pass  # Includes torn compressed files; the counts so far still stand.
         except Exception as error:  # Unreadable or corrupt (ZstdError is a plain Exception): so do they.
-            print(f'wattif: {path}: {type(error).__name__}: {error}', file=stderr)
+            print(f'drainhound: {path}: {type(error).__name__}: {error}', file=stderr)
         return stats
 
     @staticmethod
@@ -1168,7 +1168,7 @@ class PowerLog:
                 try:
                     self.compress(self.directory / f'{self.day}.jsonl')
                 except Exception as error:  # Left plain; the next start compresses it.
-                    print(f'wattif: compressing {self.day}: {type(error).__name__}: {error}', file=stderr)
+                    print(f'drainhound: compressing {self.day}: {type(error).__name__}: {error}', file=stderr)
             self.handle, self.day = open(self.directory / f'{day}.jsonl', 'a'), day
         self.handle.write(json.dumps(record, separators=(',', ':'), ensure_ascii=False) + '\n')
         self.count(self.index['days'].setdefault(
@@ -1221,7 +1221,7 @@ class PowerLog:
 # --- Orchestration ---------------------------------------------------------------
 
 def experiment_assignment(path, t0, t1):
-    """The running experiment arm for a record, from wattif experiment's state file.
+    """The running experiment arm for a record, from drainhound experiment's state file.
 
     `washout` marks records that began before the arm settled (battery lag,
     governor and link retraining) or that straddle a block change.
@@ -1297,9 +1297,9 @@ class Monitor:
         try:
             counts = {day: stats['records'] for day, stats in self.log.index['days'].items()}
             if days := store.import_logs(directory, self.db.db, counts=counts):
-                print(f'wattif: imported {", ".join(days)} into {self.db.db}', file=stderr)
+                print(f'drainhound: imported {", ".join(days)} into {self.db.db}', file=stderr)
         except Exception as error:  # Never a reason not to sample: the archive is still written.
-            print(f'wattif: {self.db.db}: {type(error).__name__}: {error}', file=stderr)
+            print(f'drainhound: {self.db.db}: {type(error).__name__}: {error}', file=stderr)
         self.models_path, self.models_stamp, self.params = directory / 'models.json', None, dict(PRIOR)
         self.refresh_models()
         self.fast, self.idle_states, self.commands = FastSampler(sys), IdleStates(sys), Commands()
@@ -1477,7 +1477,7 @@ class Monitor:
         return record
 
     def refresh_models(self):
-        """Pick up wattif eta's newly trained parameters when models.json changes."""
+        """Pick up drainhound eta's newly trained parameters when models.json changes."""
         try:
             stamp = self.models_path.stat().st_mtime
         except OSError:

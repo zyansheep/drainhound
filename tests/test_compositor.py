@@ -4,8 +4,8 @@ import socket
 import tempfile
 import unittest
 
-from wattif import compositor
-from wattif.compositor import Desktop, Niri, Sway
+from drainhound import compositor
+from drainhound.compositor import Desktop, Niri, Sway
 
 # As `niri msg -j event-stream` prints them (the start recorded from niri 26.04,
 # titles and layouts cut, a second output's workspace added): the burst it

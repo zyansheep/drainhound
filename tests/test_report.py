@@ -9,11 +9,11 @@ from unittest import mock
 import numpy as np
 import scipy.stats
 
-from wattif import config
-from wattif import experiment
-from wattif import power
-from wattif import report
-from wattif import store
+from drainhound import config
+from drainhound import experiment
+from drainhound import power
+from drainhound import report
+from drainhound import store
 
 
 def record(t1, bat=15.0, soc=8.0, busy=2.0, mhz=2000, apps=None, exp=None, status='Discharging', bl=.5, vdd=None,

@@ -15,10 +15,10 @@ from unittest import mock
 
 import numpy as np
 
-from wattif import battery as batteries
-from wattif import config
-from wattif import eta
-from wattif import store
+from drainhound import battery as batteries
+from drainhound import config
+from drainhound import eta
+from drainhound import store
 
 STATE = tempfile.TemporaryDirectory()
 REAL = (eta.GASP, eta.DEATHS, eta.MODELS, eta.RUNTIME)
@@ -358,7 +358,7 @@ class EtaTests(unittest.TestCase):
             m.update(pct=50, volts=15.5, charge=2e6, unit='uAh')
         path = self.root / 'recommend.json'
         # On battery, settings go back to power-saver, ABM 3 and no boost (the original author's laptop).
-        with mock.patch('wattif.experiment.battery_stock', lambda: {'profile': 'power-saver', 'abm': '3', 'boost': '0'}):
+        with mock.patch('drainhound.experiment.battery_stock', lambda: {'profile': 'power-saver', 'abm': '3', 'boost': '0'}):
             eta.write_recommendations(minutes, [], path, exclude=())
         written = json.loads(path.read_text())
         self.assertEqual(set(written), {'updated', 'battery', 'comfort'})
@@ -392,7 +392,7 @@ class EtaTests(unittest.TestCase):
         self.assertEqual(recommend.call_args.kwargs['exclude'], ('aspm',))
         self.assertTrue(written['battery']['apply'])
         self.assertFalse([a for a in written['battery']['apply'] if a.startswith('aspm=')])
-        # Called without the models (wattif experiment goal --apply): models.json's, if it is this version.
+        # Called without the models (drainhound experiment goal --apply): models.json's, if it is this version.
         eta.save_models(dict(params, fitted=1.0), eta.MODELS)
         with mock.patch.object(eta.report, 'fit_rows', side_effect=AssertionError('fitted again')), \
                 mock.patch.object(eta.report, 'full_energy', return_value=50.0), \
@@ -401,18 +401,18 @@ class EtaTests(unittest.TestCase):
         eta.MODELS.unlink()
 
     def test_recommendations_never_touch_what_experiments_may_not(self):
-        from wattif import experiment
+        from drainhound import experiment
         self.assertEqual(set(eta.RISKY), set(experiment.RISKY))          # The copy for when it won't import.
         fake = types.SimpleNamespace(unrecommended=lambda: ('apst', 'aspm'), RISKY=('aspm', 'apst', 'gpu-dpm'),
                                      quarantined=lambda: {'wifi-ps': 'xHCI died'})
         with contextlib.redirect_stderr(io.StringIO()):
-            with mock.patch.dict(sys.modules, {'wattif.experiment': fake}):
+            with mock.patch.dict(sys.modules, {'drainhound.experiment': fake}):
                 self.assertEqual(eta.unrecommended(), ('apst', 'aspm'))
                 fake.unrecommended = lambda: 1 / 0                        # It fails: the risky and quarantined ones,
                 self.assertEqual(eta.unrecommended(), ('apst', 'aspm', 'gpu-dpm', 'wifi-ps'))
                 fake.quarantined = lambda: 1 / 0                          # the risky ones at least,
                 self.assertEqual(eta.unrecommended(), ('apst', 'aspm', 'gpu-dpm'))
-            with mock.patch.dict(sys.modules, {'wattif.experiment': None}):     # even if experiment.py won't import.
+            with mock.patch.dict(sys.modules, {'drainhound.experiment': None}):     # even if experiment.py won't import.
                 self.assertEqual(eta.unrecommended(), eta.RISKY)
 
     def test_the_reserve_below_the_cutoff(self):
@@ -470,7 +470,7 @@ class EtaTests(unittest.TestCase):
         self.assertEqual(both['deaths'], 2)
         self.assertAlmostEqual(both['cutoff'], np.median([0.056, 0.0550]), places=5)
         self.assertEqual(eta.fit_cutoff([])['cutoff'], 0.0)  # Nothing died yet: empty is zero charge.
-        # wattif eta powered 'died' off itself: it looks like a death in the records, but isn't one.
+        # drainhound eta powered 'died' off itself: it looks like a death in the records, but isn't one.
         self.assertEqual(eta.fit_cutoff(minutes, [timed, {'boot': 'died', 'poweroff': True}])['deaths'], 1)
         self.assertEqual([d['boot'] for d in eta.deaths_in(minutes, running='died')], ['running'])
         path = self.root / 'deaths.json'  # Remembered past the window.
@@ -549,7 +549,7 @@ class EtaTests(unittest.TestCase):
         death = eta.harvest_gasp('now', gasp, deaths)
         self.assertAlmostEqual(death['cut'], 0.0558)                # Cut within the 2 s after it.
         self.assertEqual([g['boot'] for g in eta.load_gasps(deaths)], ['old'])
-        write(boot='older', poweroff=True)                          # wattif eta powered it off.
+        write(boot='older', poweroff=True)                          # drainhound eta powered it off.
         self.assertTrue(eta.harvest_gasp('now', gasp, deaths)['poweroff'])
         self.assertEqual(eta.fit_cutoff([], eta.load_gasps(deaths))['deaths'], 1)
         gasp.write_text('{"boot": "half')                            # Torn: ignored, not a crash.
@@ -1058,7 +1058,7 @@ class EtaTests(unittest.TestCase):
         self.assertTrue(live.absent)
         live.maybe_refit()
         self.assertEqual(started, [])                                        # Nothing to train for.
-        live.publish(out.pop('detail'), out)                                 # `wattif waybar battery` says it too.
+        live.publish(out.pop('detail'), out)                                 # `drainhound waybar battery` says it too.
         self.assertEqual(json.loads((self.root / 'run/eta.json').read_text())['waybar']['text'], 'no battery')
         battery(self.root, **dict(LOW, charge_now=1000000))                  # Hot-plugged.
         self.assertIn('discharging', live.estimate()['class'])

@@ -1,10 +1,10 @@
-"""Where wattif keeps its files, and the user's configuration.
+"""Where drainhound keeps its files, and the user's configuration.
 
 Paths follow the XDG base directories; each can be moved with an environment
-variable (WATTIF_STATE_DIR, WATTIF_RUNTIME_DIR, WATTIF_CONFIG). Settings come
-from DEFAULTS, then /etc/wattif/config.toml, then
-$XDG_CONFIG_HOME/wattif/config.toml (tables merge key by key; a later file
-wins). WATTIF_CONFIG names the one file to read instead (empty: none).
+variable (DRAINHOUND_STATE_DIR, DRAINHOUND_RUNTIME_DIR, DRAINHOUND_CONFIG). Settings come
+from DEFAULTS, then /etc/drainhound/config.toml, then
+$XDG_CONFIG_HOME/drainhound/config.toml (tables merge key by key; a later file
+wins). DRAINHOUND_CONFIG names the one file to read instead (empty: none).
 """
 import copy
 import os
@@ -14,8 +14,8 @@ import sys
 import tomllib
 from pathlib import Path
 
-NAME = 'wattif'
-APP_ID = 'io.github.zyansheep.Wattif'  # The panel's application id and D-Bus name.
+NAME = 'drainhound'
+APP_ID = 'io.github.zyansheep.Drainhound'  # The panel's application id and D-Bus name.
 APP_PATH = '/' + APP_ID.replace('.', '/')
 
 
@@ -25,8 +25,8 @@ def _base(variable, fallback):
 
 
 HOME = Path(os.environ.get('HOME') or '/nonexistent')
-STATE = _base('WATTIF_STATE_DIR', _base('XDG_STATE_HOME', HOME / '.local/state') / NAME)
-RUNTIME = _base('WATTIF_RUNTIME_DIR', _base('XDG_RUNTIME_DIR', Path(f'/tmp/{NAME}-{os.getuid()}')) / NAME)
+STATE = _base('DRAINHOUND_STATE_DIR', _base('XDG_STATE_HOME', HOME / '.local/state') / NAME)
+RUNTIME = _base('DRAINHOUND_RUNTIME_DIR', _base('XDG_RUNTIME_DIR', Path(f'/tmp/{NAME}-{os.getuid()}')) / NAME)
 LOG = STATE / 'power'  # The raw JSONL archive, models.json and index.json.
 DB = STATE / 'power.sqlite3'
 SYSTEM_CONFIG = Path('/etc') / NAME / 'config.toml'
@@ -45,10 +45,10 @@ UNITS = {
 }
 
 DEFAULTS = {
-    # How power experiments run the root helper (see helper/wattif-helper), as a
+    # How power experiments run the root helper (see helper/drainhound-helper), as a
     # list of words. Its sudo rule must allow exactly this command without a
     # password; without one, the root-only settings are left out.
-    'helper': {'command': ['sudo', '-n', 'wattif-helper']},
+    'helper': {'command': ['sudo', '-n', 'drainhound-helper']},
     'apps': {
         # Executable (or Electron app directory) → the name logged and shown;
         # added to the built-in table (collector.APP_NAMES).
@@ -92,10 +92,10 @@ DEFAULTS = {
         'sensor': 'auto',
     },
     # What a setting goes back to when experiments end, on each power source.
-    # None, or the string "found" (TOML has no null): as wattif found it in this
+    # None, or the string "found" (TOML has no null): as drainhound found it in this
     # boot before it first changed it, on that power source; the profile and ABM,
     # which udev rules often switch when you plug in, are left on AC to whatever
-    # your system sets then (wattif only takes back a value of its own still
+    # your system sets then (drainhound only takes back a value of its own still
     # there). A value is put back whatever was found: the original author's
     # udev rules, say, as profile = {battery = "power-saver", ac = "balanced"}
     # and abm = {battery = 3, ac = 0}.
@@ -131,7 +131,7 @@ DEFAULTS = {
         # 'fontawesome' (Font Awesome's icons, in the bar and the panel) or 'text'
         # (plain Unicode: ⚡ 🔌 ⏳ 👍 👎, for bars without Font Awesome).
         'glyphs': 'fontawesome',
-        # `wattif waybar battery`: a tooltip with the time left, sleep and battery
+        # `drainhound waybar battery`: a tooltip with the time left, sleep and battery
         # use (turn it off if your bar shows its own panel on hover).
         'tooltip': True,
     },
@@ -155,7 +155,7 @@ def _merge(base, extra):
 
 def files():
     """The configuration files read, in order."""
-    override = os.environ.get('WATTIF_CONFIG')
+    override = os.environ.get('DRAINHOUND_CONFIG')
     if override is not None:
         return [Path(override)] if override else []
     return [SYSTEM_CONFIG, USER_CONFIG]
@@ -183,9 +183,9 @@ def get(section, key=None):
 
 
 def self_command():
-    """The command that runs this wattif: its entry point, or `python -m wattif`
-    when run that way (children inherit it through WATTIF_SELF)."""
-    if found := os.environ.get('WATTIF_SELF'):
+    """The command that runs this drainhound: its entry point, or `python -m drainhound`
+    when run that way (children inherit it through DRAINHOUND_SELF)."""
+    if found := os.environ.get('DRAINHOUND_SELF'):
         return shlex.split(found)
     if found := shutil.which(NAME):
         return [found]

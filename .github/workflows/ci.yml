@@ -15,7 +15,7 @@ jobs:
       - run: python -m unittest discover -s tests -t .
         env:
           PYTHONPATH: src
-      - run: shellcheck --severity=style helper/wattif-helper && bash helper/test-helper.sh helper/wattif-helper
+      - run: shellcheck --severity=style helper/drainhound-helper && bash helper/test-helper.sh helper/drainhound-helper
 
   nix:
     runs-on: ubuntu-latest

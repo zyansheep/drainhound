@@ -11,8 +11,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from wattif import compositor, config, freeze, throttle
-from wattif.freeze import AFTER, EVERY, THAW, Freezer
+from drainhound import compositor, config, freeze, throttle
+from drainhound.freeze import AFTER, EVERY, THAW, Freezer
 
 
 class FreezeTests(unittest.TestCase):
@@ -138,7 +138,7 @@ class FreezeTests(unittest.TestCase):
         self.assertEqual(self.freezer.app['app-graphical.slice/app-niri-obsidian-1a2b3c4d.scope'], '2243')
 
     def test_only_its_own_freezes_are_undone(self):
-        (self.apps / 'app-niri-floorp-2240.scope' / 'cgroup.freeze').write_text('1\n')  # A wattif experiment block
+        (self.apps / 'app-niri-floorp-2240.scope' / 'cgroup.freeze').write_text('1\n')  # A drainhound experiment block
         self.wait(AFTER)
         self.freezer.release()
         self.assertEqual(self.frozen(), {'app-niri-floorp-2240.scope'})
@@ -396,7 +396,7 @@ class RunTests(unittest.TestCase):
             program = f"""
 import sys
 from pathlib import Path
-from wattif import compositor, freeze, throttle
+from drainhound import compositor, freeze, throttle
 class Niri(compositor.Niri):
     command = (sys.executable, '-c', {niri!r})
 agent = freeze.Freezer(['steam'], Path({str(apps)!r}), battery=lambda: True, proc=Path({str(proc)!r}), after=0,

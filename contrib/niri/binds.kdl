@@ -1,5 +1,5 @@
-// wattif in niri: add inside your `binds { }` block.
-Mod+Shift+B { spawn "wattif" "panel"; }
+// drainhound in niri: add inside your `binds { }` block.
+Mod+Shift+B { spawn "drainhound" "panel"; }
 // Votes from the keyboard, if you like them there too.
-// Mod+Shift+Equal { spawn "wattif" "vote" "up"; }
-// Mod+Shift+Minus { spawn "wattif" "vote" "down"; }
+// Mod+Shift+Equal { spawn "drainhound" "vote" "up"; }
+// Mod+Shift+Minus { spawn "drainhound" "vote" "down"; }

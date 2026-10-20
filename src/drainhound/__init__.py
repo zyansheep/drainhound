@@ -1,4 +1,4 @@
-"""wattif: where a Linux laptop's battery goes, how long it will last, and what
+"""drainhound: where a Linux laptop's battery goes, how long it will last, and what
 would make it last longer (measured on your machine by experiment)."""
 import os
 

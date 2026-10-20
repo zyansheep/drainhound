@@ -10,29 +10,29 @@ skip the battery reading's lag and the system settling. The collector tags
 every record with the running arms (from the state file below); the battery
 panel's Experiments tab fits all settings' effects together (report.lever_effects).
 
-    wattif experiment list | units | status
-    wattif experiment enable | disable          (automatic experiments, see `automatic`; disable puts back what they changed)
-    wattif experiment pool [<name> ...] [--risky]        (the settings they may vary)
-    wattif experiment pool add|remove <name> ... [--risky]
-    wattif experiment quarantine | release <name> ... | release all   (settings the watchdog took out)
-    wattif experiment goal [battery|comfort] [--apply [--risky]]   (what the best combination optimizes)
-    wattif experiment start <name> [<name> ...] [--minutes N] [--unit SCOPE] [--only-locked] [--risky]
-    wattif experiment apply <name>=<value> ... [--risky]   (on battery, e.g. the panel's best combination)
-    wattif experiment start freeze-apps [--keep PATTERN ...]   (always only while locked)
-    wattif experiment stop | restore [--stock]
-    wattif experiment reconcile   (wattif-reconcile.timer: leftovers, applied settings, AC changes)
-    wattif experiment next-boot default|<arm> | boot-status   (boot-level experiments: config [experiments] boot_arms)
-    wattif experiment test-freeze [--seconds 5] [--keep PATTERN]  (freeze now, measure, thaw)
-    wattif experiment run | auto   (the wattif experiment / wattif experiments service bodies)
+    drainhound experiment list | units | status
+    drainhound experiment enable | disable          (automatic experiments, see `automatic`; disable puts back what they changed)
+    drainhound experiment pool [<name> ...] [--risky]        (the settings they may vary)
+    drainhound experiment pool add|remove <name> ... [--risky]
+    drainhound experiment quarantine | release <name> ... | release all   (settings the watchdog took out)
+    drainhound experiment goal [battery|comfort] [--apply [--risky]]   (what the best combination optimizes)
+    drainhound experiment start <name> [<name> ...] [--minutes N] [--unit SCOPE] [--only-locked] [--risky]
+    drainhound experiment apply <name>=<value> ... [--risky]   (on battery, e.g. the panel's best combination)
+    drainhound experiment start freeze-apps [--keep PATTERN ...]   (always only while locked)
+    drainhound experiment stop | restore [--stock]
+    drainhound experiment reconcile   (drainhound-reconcile.timer: leftovers, applied settings, AC changes)
+    drainhound experiment next-boot default|<arm> | boot-status   (boot-level experiments: config [experiments] boot_arms)
+    drainhound experiment test-freeze [--seconds 5] [--keep PATTERN]  (freeze now, measure, thaw)
+    drainhound experiment run | auto   (the drainhound experiment / drainhound experiments service bodies)
 
 catalog() offers only the settings this machine has (PROBES: the kernel's
 files, power-profiles-daemon, the compositor, the throttle unit) and can change
-(root ones only while the root helper can be used: helper_usable). wattif never
+(root ones only while the root helper can be used: helper_usable). drainhound never
 leaves a setting other than it found it. A setting's stock value
 (`Setting.baseline`, per power source) is config [stock]'s where you set one, the
 kernel command line's where it says (ASPM's policy, the APST limit), boost as
 the profile leaves it where power-profiles-daemon sets it with the profile, and
-otherwise what the setting was found at in this boot before wattif experiment
+otherwise what the setting was found at in this boot before drainhound experiment
 first changed it: read and saved then (note_found), and never taken from a
 value of its own (found). Only where none of those exists is it a guess (each
 says so). Restores of everything (`disable`, `restore --stock`, the watchdog)
@@ -64,7 +64,7 @@ Settings that cannot change at runtime are boot-level experiments: config
 self-refresh through amdgpu.dcdebugmask) gets the panel's comparison of boots.
 
 Root settings go through the root helper (config [helper] command: `sudo -n
-wattif-helper`); its pre-sleep hook puts the kernel command line's ASPM and
+drainhound-helper`); its pre-sleep hook puts the kernel command line's ASPM and
 NVMe APST and GPU DPM auto back before every suspend (on some machines those
 are workarounds for crashes in s2idle) and refuses changes until its
 post-resume hook has run. After resume they stay at stock: the runner and the
@@ -95,11 +95,11 @@ from . import throttle
 BLOCK = 240
 WASHOUT = 60
 GIVE_UP = 7 * 86400  # A run that cannot collect its battery time in a week ends.
-# Automatic experiments: on while ENABLED exists (wattif-experiments.service's
+# Automatic experiments: on while ENABLED exists (drainhound-experiments.service's
 # condition), varying the settings listed in POOL.
 SAVED = config.STATE
 ENABLED, POOL = SAVED / 'experiments-enabled', SAVED / 'experiments.json'
-# Every run and every change wattif experiment made (Ledger): the watchdog's and
+# Every run and every change drainhound experiment made (Ledger): the watchdog's and
 # the risky settings' memory, across restarts and reboots.
 LOG = SAVED / 'experiment-log.json'
 # Settings `apply` set, for this boot: reconcile keeps them on battery only.
@@ -132,12 +132,12 @@ def helper_command():
     value = config.get('helper', 'command')
     if isinstance(value, (list, tuple)) and value and all(isinstance(word, str) and word for word in value):
         return list(value), None
-    why = f'config [helper] command must be a list of words, like ["sudo", "-n", "wattif-helper"], not {value!r}'
-    print(f'wattif experiment: {why}; the root settings are left out', file=sys.stderr)
+    why = f'config [helper] command must be a list of words, like ["sudo", "-n", "drainhound-helper"], not {value!r}'
+    print(f'drainhound experiment: {why}; the root settings are left out', file=sys.stderr)
     return [], why
 
 
-# The root helper (helper/wattif-helper), as its sudo rule allows it: config [helper] command.
+# The root helper (helper/drainhound-helper), as its sudo rule allows it: config [helper] command.
 HELPER, HELPER_PROBLEM = helper_command()
 BUSY_EXIT = 75  # The helper: suspending (its sleep-safe holds), or another change holds its lock.
 SYS = Path('/sys')
@@ -156,16 +156,16 @@ BACKOFF, BACKOFF_MAX, FAILURES_MAX = 60, 3600, 4  # A failing setting: 60 s, 120
 RECHECK = 6 * 3600  # s between looks at whether testing is worth it again, while it isn't.
 RETEST = 10 * 3600  # s of blocks after a kernel (major.minor) or BIOS change before testing may stop.
 SETTLED = 'more testing would cost more than it saves'  # The runner's pause while testing isn't worth it.
-# s for a wattif-helper call: past its 10 s wait for another change's lock (it then
+# s for a drainhound-helper call: past its 10 s wait for another change's lock (it then
 # exits BUSY_EXIT) plus the change itself, so a busy lock reads as Busy, not as
-# a timeout that leaves wattif-helper applying the change after we gave up.
+# a timeout that leaves drainhound-helper applying the change after we gave up.
 LAB_TIMEOUT = 30
 # s for `systemctl stop` of a run: its stop restores everything (its unit's TimeoutStopSec, 180 s).
 STOP_TIMEOUT = 240
 
 
 class Busy(RuntimeError):
-    """wattif-helper refused for now (suspending, or its lock is held): wait, don't count it as a failure."""
+    """drainhound-helper refused for now (suspending, or its lock is held): wait, don't count it as a failure."""
 
 
 def run(command, check=True, timeout=15):
@@ -177,7 +177,7 @@ def run(command, check=True, timeout=15):
 
 
 def lab(*args):
-    """`sudo -n wattif-helper <args>`."""
+    """`sudo -n drainhound-helper <args>`."""
     if not HELPER:
         raise RuntimeError(HELPER_PROBLEM)
     try:
@@ -189,7 +189,7 @@ def lab(*args):
         raise
 
 
-HELPER_NEEDED = "root settings need wattif-helper's sudo rule; see the README"
+HELPER_NEEDED = "root settings need drainhound-helper's sudo rule; see the README"
 PROBE_AGAIN = 600  # s before a helper that couldn't be used is asked again (a new sudo rule is noticed).
 
 
@@ -223,7 +223,7 @@ def systemctl_wait(*args, check=False):
     try:
         return run(['systemctl', '--user', *args], check=check, timeout=STOP_TIMEOUT)
     except subprocess.TimeoutExpired:
-        print(f"wattif experiment: systemctl {' '.join(args)} is still running after {STOP_TIMEOUT} s", file=sys.stderr)
+        print(f"drainhound experiment: systemctl {' '.join(args)} is still running after {STOP_TIMEOUT} s", file=sys.stderr)
         return ''
 
 
@@ -246,7 +246,7 @@ def cmdline_param(name):
 
 def notify(summary, body):
     try:
-        subprocess.run(['notify-send', '-u', 'critical', '-a', 'wattif', summary, body],
+        subprocess.run(['notify-send', '-u', 'critical', '-a', 'drainhound', summary, body],
                        capture_output=True, timeout=5, check=False)
     except (OSError, subprocess.TimeoutExpired):
         pass
@@ -470,11 +470,11 @@ def freeze_all_set(units, value):
         run(['systemctl', '--user', 'freeze' if value == 'frozen' else 'thaw', throttle.unit(unit)], check=False)
 
 
-BOOT_ENTRY = re.compile(r'[a-z0-9][a-z0-9_-]{0,31}')  # The entry patterns `wattif-helper next-boot` takes.
+BOOT_ENTRY = re.compile(r'[a-z0-9][a-z0-9_-]{0,31}')  # The entry patterns `drainhound-helper next-boot` takes.
 
 
 def boot_arms():
-    """config [experiments] boot_arms: {arm: the boot entry pattern for `wattif-helper
+    """config [experiments] boot_arms: {arm: the boot entry pattern for `drainhound-helper
     next-boot`}, leaving out the helper's own words and patterns it would refuse."""
     arms = config.get('experiments', 'boot_arms')
     return {str(arm): str(entry) for arm, entry in arms.items()
@@ -506,13 +506,13 @@ class Setting:
         # never fight it while plugged in.
         self.ac_managed = ac_managed
         self.units = units
-        # (on_battery) → the stock value restores go back to (never a value of wattif's own).
+        # (on_battery) → the stock value restores go back to (never a value of drainhound's own).
         self.baseline = baseline
         # (stock value, None while unknown) → None: puts the stock value back another
         # way than set() (ABM as found: the system's power_supply udev rules).
         self.reset = reset
         # Whether the baseline is (partly) as found: change() saves the value before
-        # wattif experiment's first change in a boot (note_found).
+        # drainhound experiment's first change in a boot (note_found).
         self.as_found = as_found
 
     def read(self):
@@ -548,8 +548,8 @@ def stock_value(key, on_battery):
 
 
 def touched(name):
-    """Whether wattif experiment changed `name` in this boot (the ledger's): from
-    then on its value may be wattif's own, never to be taken as found."""
+    """Whether drainhound experiment changed `name` in this boot (the ledger's): from
+    then on its value may be drainhound's own, never to be taken as found."""
     return name in Ledger().last_values(boot_id())
 
 
@@ -559,7 +559,7 @@ def source_key(on):
 
 def boot_found(prefs=None):
     """{name: {'battery'|'ac': value}}: what settings were found at in this boot,
-    on each power source, before wattif experiment first changed them."""
+    on each power source, before drainhound experiment first changed them."""
     record = (prefs if prefs is not None else preferences()).get('boot_found')
     if isinstance(record, dict) and record.get('boot') == boot_id() and isinstance(record.get('values'), dict):
         return record['values']
@@ -567,7 +567,7 @@ def boot_found(prefs=None):
 
 
 def found(name, on, read_now, across=True, live=True):
-    """`name`'s value on power source `on` (battery or not) as wattif experiment
+    """`name`'s value on power source `on` (battery or not) as drainhound experiment
     found it: (`live`) read now while it has changed nothing of it in this boot and
     the machine is on that source; else as saved in this boot before its first
     change (note_found) or while it hadn't changed it (capture_profile); else what
@@ -613,9 +613,9 @@ def remember_found(name, on, value):
 
 
 def note_found(spec):
-    """Before wattif experiment's first change of `spec` in this boot (Setting.as_found
+    """Before drainhound experiment's first change of `spec` in this boot (Setting.as_found
     ones): its value now, saved as found on this power source. Later changes, and
-    every value of wattif's own, never are."""
+    every value of drainhound's own, never are."""
     if spec.as_found and not touched(spec.name):
         remember_found(spec.name, on_battery(), spec.read())
 
@@ -671,9 +671,9 @@ PROFILES = ('power-saver', 'balanced', 'performance')
 
 def own_profile(on_battery, live=True):
     """Your profile for this power source: config [stock] profile's where you set
-    one; else as found (`found`, read now only if `live`: never one of wattif's
+    one; else as found (`found`, read now only if `live`: never one of drainhound's
     own; capture_profile and note_found save it), or as captured by an older
-    wattif ('own_profile'); else, a guess, power-saver on battery (what common
+    drainhound ('own_profile'); else, a guess, power-saver on battery (what common
     udev rules set) and balanced on AC (power-profiles-daemon's own default)."""
     configured = stock_value('profile', on_battery)
     if configured in PROFILES:
@@ -713,7 +713,7 @@ def boost_stock(on=True):
 def battery_stock():
     """The profile, ABM and boost as they go back to on battery, from configuration
     and what was found and saved there (never a live read, never a value of
-    wattif's own): report.own_settings' answer while no battery minute outside
+    drainhound's own): report.own_settings' answer while no battery minute outside
     experiments says. ABM and boost are left out until seen."""
     prefs, values = preferences(), {'profile': own_profile(True, live=False)}
     abm, boost = stock_value('abm', True), stock_value('boost', True)
@@ -740,7 +740,7 @@ def abm_get():
 
 def wifi_stock(on_battery, interface):
     """config [stock] wifi_ps for this power source; where that is None, the value
-    found before wattif experiment changed it, else 'on' (most drivers' default)."""
+    found before drainhound experiment changed it, else 'on' (most drivers' default)."""
     configured = stock_value('wifi_ps', on_battery)
     if configured is not None:
         if configured not in ('on', 'off'):
@@ -757,7 +757,7 @@ def wifi_stock(on_battery, interface):
 
 def abm_stock(on_battery):
     """config [stock] abm for this power source; where that is None, the value found
-    there before wattif experiment changed it (None until seen)."""
+    there before drainhound experiment changed it (None until seen)."""
     configured = stock_value('abm', on_battery)
     if configured is not None:
         if not 0 <= int(configured) <= 4:
@@ -814,7 +814,7 @@ def throttle_get():
 
 
 def throttle_followable():
-    """Whether wattif throttle can follow this session's windows: compositor.detect()
+    """Whether drainhound throttle can follow this session's windows: compositor.detect()
     finds a backend (niri, sway). Elsewhere it caps nothing, so there is nothing to test."""
     return desktops.detect().command is not None
 
@@ -920,7 +920,7 @@ class Catalog(dict):
 def catalog(unit=None, units=None):
     """Experiment specs of the settings this machine has (available) and can change:
     root ones only while the root helper can be used (helper_usable; the others
-    are in the result's `missing`). `unit` / `units` parameterize the wattif
+    are in the result's `missing`). `unit` / `units` parameterize the drainhound
     freeze experiments."""
     wifi = wifi_interface()
     abm_found = stock_value('abm', True) is None or stock_value('abm', False) is None
@@ -931,7 +931,7 @@ def catalog(unit=None, units=None):
                 aspm_get, lambda v: lab('aspm', v),
                 lambda cur: 'powersupersave' if cur != 'powersupersave' else 'performance',
                 root=True, sleep_restored=True, levels=lambda: ('powersupersave', 'performance'), as_found=True,
-                # Never seen (changed by an older wattif, which saved nothing): a guess, the
+                # Never seen (changed by an older drainhound, which saved nothing): a guess, the
                 # kernel's usual build default.
                 baseline=lambda on: cmdline_param('pcie_aspm.policy') or found('aspm', on, aspm_get) or 'default'),
         Setting('apst', 'NVMe autonomous power states (APST)',
@@ -973,7 +973,7 @@ def catalog(unit=None, units=None):
                 visible='Bursty work gets slower.', levels=lambda: (CPU_CAP, 'none'), as_found=True,
                 baseline=lambda on: found('cpu-cap', on, cpu_cap_get) or 'none'),  # Unseen: a guess, no cap.
         Setting('throttle-apps', 'Throttle background apps',
-                f'Caps every app but the focused one at {throttle.QUOTA}% of a core while on battery (wattif throttle); '
+                f'Caps every app but the focused one at {throttle.QUOTA}% of a core while on battery (drainhound throttle); '
                 'apps playing or recording audio or video, terminals, editors, the input method and those in '
                 'config [throttle] keep are left alone.' + risky_note('throttle-apps'),
                 throttle_get, lambda v: run(['systemctl', '--user', 'start' if v == 'on' else 'stop', THROTTLE_UNIT]),
@@ -1021,7 +1021,7 @@ def catalog(unit=None, units=None):
 
 
 def listing(specs):
-    """`wattif experiment list`'s and the panel's rows: describe() of every setting in
+    """`drainhound experiment list`'s and the panel's rows: describe() of every setting in
     `specs` (a catalog()), then those it left out (its `missing`), with why as their error."""
     rows = [describe(spec) for spec in specs.values()]
     for spec, why in getattr(specs, 'missing', {}).values():
@@ -1033,7 +1033,7 @@ def listing(specs):
 
 
 def unit_label(unit):
-    """An app scope's name as wattif throttle and freeze show it (throttle.label);
+    """An app scope's name as drainhound throttle and freeze show it (throttle.label);
     another scope's (systemd-run's run-*.scope), its first process's."""
     if throttle.unit(unit).startswith('app-'):
         return throttle.label(unit)
@@ -1074,7 +1074,7 @@ def freezable_units():
 
 
 def on_battery():
-    """No charger online, as wattif throttle, the estimator and the collector read
+    """No charger online, as drainhound throttle, the estimator and the collector read
     it (battery.mains_online: a Mains supply, or with none, laptops that charge
     only over USB-C, the system's USB supplies); with no charger to read, on
     battery if the system has a battery (not a mouse's or a headset's: scope Device)."""
@@ -1188,10 +1188,10 @@ class Clock:
         return mark is not None and (now[0] - mark[0]) - (now[1] - mark[1]) > 2, now
 
 
-# --- What wattif experiment did: the ledger -----------------------------------------------
+# --- What drainhound experiment did: the ledger -----------------------------------------------
 
 class Ledger:
-    """LOG: the runs (sessions, with a heartbeat) and every change wattif experiment
+    """LOG: the runs (sessions, with a heartbeat) and every change drainhound experiment
     made, for KEEP seconds. The watchdog asks it whether a run was active when
     something broke and what had changed; the risky settings' hold and daily
     limit count its changes; reconcile finds what a crashed run left behind."""
@@ -1297,7 +1297,7 @@ class Ledger:
 
 
 def leftovers(ledger, exclude=()):
-    """Settings wattif experiment last left off stock in this boot (a crashed run's)."""
+    """Settings drainhound experiment last left off stock in this boot (a crashed run's)."""
     return [name for name, c in ledger.last_values(boot_id()).items()
             if c.get('stock') is not True and name not in exclude]
 
@@ -1438,7 +1438,7 @@ def ending(current, previous, shutdown_logged):
 
 
 class Watchdog:
-    """Incidents (INCIDENTS, or a boot that ended badly) that wattif experiment may
+    """Incidents (INCIDENTS, or a boot that ended badly) that drainhound experiment may
     have caused: while one of its runs was active, after `seen` (the last
     incident handled, or the last explicit `enable`). An incident whose
     'quarantine' is False stops experiments but quarantines nothing."""
@@ -1489,7 +1489,7 @@ def seen():
 
 def stock_names(specs, ledger):
     """What `disable`, `restore --stock` and the watchdog put back: only settings
-    wattif experiment changed in this boot or still holds (its applied values, the
+    drainhound experiment changed in this boot or still holds (its applied values, the
     ledger's leftovers), never one it didn't touch (TLP's ASPM, a modprobe.d APST
     limit, your profile), and the refresh rate (a display preference) only while
     held."""
@@ -1500,14 +1500,14 @@ def stock_names(specs, ledger):
 
 
 def trip(found, specs, battery, ledger, restore=True):
-    """The incident brake: what wattif experiment changed back to stock
+    """The incident brake: what drainhound experiment changed back to stock
     (stock_names) and a notification; the run that trips it stops. For an
     incident that may be a setting's doing (the kernel's, or a crash reset while
     awake) also: the suspects (changed in the QUARANTINE_WINDOW before it, or off
     stock at it) quarantined until `release`,
     applied settings dropped and automatic experiments off. One that isn't (a
     boot that died asleep or without a shutdown: 'quarantine' False) leaves them
-    on: they start again at the next login (or `wattif experiment resume`)."""
+    on: they start again at the next login (or `drainhound experiment resume`)."""
     now = time.time()
     reason = '; '.join(dict.fromkeys(incident['what'] for incident in found))
     attributable = any(incident.get('quarantine', True) for incident in found)
@@ -1537,7 +1537,7 @@ def trip(found, specs, battery, ledger, restore=True):
            f'Settings are back to stock; quarantined: {names}. '
            + ('Automatic experiments are off.' if attributable else
               'Automatic experiments start again at your next login.'))
-    print(f'wattif experiment: watchdog: {reason} ({first["message"][:200]}); quarantined {names}'
+    print(f'drainhound experiment: watchdog: {reason} ({first["message"][:200]}); quarantined {names}'
           + (f'; could not restore {", ".join(pending)}' if pending else ''), file=sys.stderr)
     return record
 
@@ -1584,7 +1584,7 @@ def change(spec, value, ledger, by):
 
 
 def still_ours(spec, ledger):
-    """Whether `spec` still reads what wattif experiment last set it to in this boot,
+    """Whether `spec` still reads what drainhound experiment last set it to in this boot,
     off stock: nothing (a udev rule on plugging in, you) has set it since."""
     last = ledger.last_values(boot_id()).get(spec.name) if ledger else None
     return bool(last) and last.get('stock') is not True and last.get('value') == spec.read()
@@ -1596,7 +1596,7 @@ def restore_settings(specs, names, battery, ledger=None, by='restore', captured=
     `patient` (retries: the runner's pauses, the reconciler) skips a setting whose
     last restores failed until its backoff has passed, so a broken one is not
     written every few seconds. On AC, settings the system sets when plugged in
-    (ac_managed) are left to it, unless a value of wattif's is still there."""
+    (ac_managed) are left to it, unless a value of drainhound's is still there."""
     pending, on = {}, battery()
     for name in sorted(dict.fromkeys(names), key=restore_rank):
         spec = specs.get(name)
@@ -1640,7 +1640,7 @@ def restore_settings(specs, names, battery, ledger=None, by='restore', captured=
                 ledger.change(name, target, True, by)
         except Exception as error:  # noqa: BLE001 - restore the rest; the reconciler retries
             pending[name] = str(error) or type(error).__name__
-            print(f'wattif experiment: could not restore {name}: {pending[name]}', file=sys.stderr)
+            print(f'drainhound experiment: could not restore {name}: {pending[name]}', file=sys.stderr)
             if attempted and ledger:  # Not stock: a leftover until a restore succeeds.
                 ledger.change(name, target, None, by + ' (failed)')
     return pending
@@ -1746,7 +1746,7 @@ def experiment(specs, minutes, only_locked=False, block=BLOCK, washout=WASHOUT, 
                     elif present != values[spec.name]:
                         change(spec, values[spec.name], ledger, 'manual')
             except Busy as error:
-                write_state(dict(base, status='paused', reason=f'wattif-helper busy ({error})', blocks=number,
+                write_state(dict(base, status='paused', reason=f'drainhound-helper busy ({error})', blocks=number,
                                  collected=collected), state_path)
                 clock.sleep(15)
                 continue
@@ -1788,7 +1788,7 @@ def experiment(specs, minutes, only_locked=False, block=BLOCK, washout=WASHOUT, 
 
 
 GOALS = ('battery', 'comfort')  # What the panel's best combination optimizes.
-RECOMMEND = RUNTIME / 'recommend.json'  # Each goal's best combination, from wattif eta's latest fit.
+RECOMMEND = RUNTIME / 'recommend.json'  # Each goal's best combination, from drainhound eta's latest fit.
 
 
 def preferences():
@@ -1860,12 +1860,12 @@ def set_pool(names, risky=(), eligible=()):
     for name in dict.fromkeys(names):
         if name in RISKY and name not in risky and name not in already:
             refused.append((name, f'{name} is risky (it can upset some hardware; config [experiments] risky): '
-                                  f'`wattif experiment pool add {name} --risky` to include it'))
+                                  f'`drainhound experiment pool add {name} --risky` to include it'))
             continue
         kept.append(name)  # A quarantined one stays chosen: `release` brings it back.
         if name in blocked:
             refused.append((name, f"{name} is quarantined ({blocked[name].get('reason', 'watchdog')}): "
-                                  f'out until `wattif experiment release {name}`'))
+                                  f'out until `drainhound experiment release {name}`'))
     risky_now = [name for name in kept if name in RISKY]
     prefer(settings=kept, risky=risky_now)
     return refused
@@ -1951,7 +1951,7 @@ def automatic(specs=None, clock=Clock, battery=on_battery, locked=screen_locked,
     battery model most, among those unlikely to earn a 👎 while you are there.
 
     Pauses with the settings at stock on AC and for qol.COOLDOWN after a 👎
-    (`wattif vote resume` ends that early); a 👎 ends the block at once. Nothing
+    (`drainhound vote resume` ends that early); a 👎 ends the block at once. Nothing
     changes for RESUME_SETTLE after a resume. A setting that can't be read
     (no Wi-Fi interface, power-profiles-daemon restarting) sits a block out; one
     that fails to set sits out BACKOFF, doubling, and after FAILURES_MAX failures
@@ -2077,7 +2077,7 @@ def automatic(specs=None, clock=Clock, battery=on_battery, locked=screen_locked,
                 try:  # The goal's combination: at once on a goal change, as recommend.json changes.
                     settled.update(target=best(usable), at=now, goal=goal())
                 except Exception as error:  # noqa: BLE001 - stock meanwhile
-                    print(f'wattif experiment: no recommended combination: {error}', file=sys.stderr)
+                    print(f'drainhound experiment: no recommended combination: {error}', file=sys.stderr)
                     settled.update(target={}, at=now, goal=goal())
             values, held = {}, []
             for name in usable:
@@ -2105,12 +2105,12 @@ def automatic(specs=None, clock=Clock, battery=on_battery, locked=screen_locked,
                     failure['error'] = str(error)[:200]
                     failure['until'] = (math.inf if failure['count'] >= FAILURES_MAX else
                                         now + min(BACKOFF_MAX, BACKOFF * 2 ** (failure['count'] - 1)))
-                    print(f'wattif experiment: could not set {name} (failure {failure["count"]}): {error}',
+                    print(f'drainhound experiment: could not set {name} (failure {failure["count"]}): {error}',
                           file=sys.stderr)
                     pending.update(restore([name]))
                     excluded[name] = f'failing: {failure["error"]}'
             if busy:
-                pause(f'wattif-helper busy ({busy})', 15)
+                pause(f'drainhound-helper busy ({busy})', 15)
                 continue
             usable = [name for name in usable if name not in excluded]
             if not usable:
@@ -2177,7 +2177,7 @@ def command_run():
     block = max(BLOCK, RISKY_HOLD) if set(names) & set(RISKY) else BLOCK
     with ownership(wait=120) as mine:
         if not mine:
-            sys.exit('wattif experiment: another run owns the settings')
+            sys.exit('drainhound experiment: another run owns the settings')
         experiment([specs[name] for name in names], request.get('minutes', 60), only_locked, block=block)
 
 
@@ -2187,7 +2187,7 @@ def load_state(path=None):
 
 def command_restore(battery=on_battery, ledger=None, state_path=None, stock=False, patient=False):
     """Put back what a run left: its settings (with `stock` also everything else
-    wattif experiment changed in this boot: stock_names) to stock.
+    drainhound experiment changed in this boot: stock_names) to stock.
     A run that could not restore everything says 'restore-pending'; this retries it
     (ExecStopPost, the next run, the reconciler: `patient`). Pending settings, if any."""
     ledger = ledger or Ledger()
@@ -2214,7 +2214,7 @@ def command_restore(battery=on_battery, ledger=None, state_path=None, stock=Fals
 
 
 def recommendation(now=None):
-    """Each goal's best combination: wattif eta's recommend.json while under an
+    """Each goal's best combination: drainhound eta's recommend.json while under an
     hour old, else computed now (numpy; then marked 'computed')."""
     try:
         recommend = json.loads(RECOMMEND.read_text())
@@ -2232,20 +2232,20 @@ OWNED = 'experiments own the settings'
 
 
 def not_applied(refused):
-    """'wattif experiment: not applied: name (why); name (why)' on stderr: the battery
+    """'drainhound experiment: not applied: name (why); name (why)' on stderr: the battery
     panel parses this line (panel_data.refused), so keep its form."""
     if refused:
-        print('wattif experiment: not applied: ' + '; '.join(refused), file=sys.stderr)
+        print('drainhound experiment: not applied: ' + '; '.join(refused), file=sys.stderr)
 
 
 ALREADY = 'already so, left as they are'
 
 
 def already_so(names):
-    """'wattif experiment: already so, left as they are: name; name' on stderr: the
+    """'drainhound experiment: already so, left as they are: name; name' on stderr: the
     saving|normal settings apply left alone (panel_data.left_alone parses it)."""
     if names:
-        print(f"wattif experiment: {ALREADY}: {'; '.join(names)}", file=sys.stderr)
+        print(f"drainhound experiment: {ALREADY}: {'; '.join(names)}", file=sys.stderr)
 
 
 def running():
@@ -2269,7 +2269,7 @@ def apply_goal(chosen, now=None, recommend=recommendation, risky=False):
     refused = {why.partition(' (')[0] for why in command_apply(assignments, risky=risky, left=left) or ()}
     applied = [a for a in assignments if a.partition('=')[0] not in refused | set(left)]
     if recommend.get('computed'):  # Not what the menu or the panel showed: say what it was.
-        print(f"wattif experiment: recommend.json was stale, so the {chosen} combination was computed now; "
+        print(f"drainhound experiment: recommend.json was stale, so the {chosen} combination was computed now; "
               f"applied: {', '.join(applied) or 'nothing'}", file=sys.stderr)
     return applied
 
@@ -2290,7 +2290,7 @@ def reconcile_applied(specs, battery, ledger, exclude=(), now=None, explicit=Fal
     again on every call (every minute). Quarantined settings are left out. One
     applied on AC as a state (saving|normal: the record's 'states') is decided
     when it first takes effect on battery: already in that state (not by
-    wattif's doing), it is left as it is and leaves the record.
+    drainhound's doing), it is left as it is and leaves the record.
     {name: why} for those that failed (retried next time)."""
     record = load_applied()
     if not record:
@@ -2344,7 +2344,7 @@ def reconcile_applied(specs, battery, ledger, exclude=(), now=None, explicit=Fal
     else:
         failures = restore_settings(specs, names, battery, ledger, by='apply')
     if changed and (skipped or later):
-        print(f"wattif experiment: left at stock for now: {', '.join(skipped + later)}", file=sys.stderr)
+        print(f"drainhound experiment: left at stock for now: {', '.join(skipped + later)}", file=sys.stderr)
     already_so(already)
     for name in names:
         if name not in record['values']:
@@ -2357,7 +2357,7 @@ def reconcile_applied(specs, battery, ledger, exclude=(), now=None, explicit=Fal
         entry['count'] += 1
         entry['until'] = now + min(BACKOFF_MAX, BACKOFF * 2 ** (entry['count'] - 1))
         if entry['count'] >= FAILURES_MAX and on:  # Gives up: back to stock and out of the record.
-            print(f'wattif experiment: giving up applying {name}: {failures[name]}', file=sys.stderr)
+            print(f'drainhound experiment: giving up applying {name}: {failures[name]}', file=sys.stderr)
             record['values'].pop(name, None)
             backoff.pop(name, None)
             restore_settings(specs, [name], battery, ledger, by='apply')
@@ -2372,7 +2372,7 @@ def command_apply(assignments, risky=False, specs=None, battery=on_battery, ledg
     """Set settings (`name=value`, value also saving|normal), e.g. the panel's best
     combination: while on battery, until reboot (reconcile puts them back to stock
     on AC and sets them again on battery). A saving|normal one already in that
-    state, and not by wattif's doing (ABM 1 for saving, the performance profile
+    state, and not by drainhound's doing (ABM 1 for saving, the performance profile
     for normal), is left as it is: decided now on battery, and on AC when it
     first takes effect on battery (reconcile_applied); `left`, a list, gets the
     names left now. Risky settings move off stock only with `risky`, quarantined
@@ -2407,7 +2407,7 @@ def command_apply(assignments, risky=False, specs=None, battery=on_battery, ledg
             allowed.discard(name)
             to_stock.append(name)
         elif name in blocked:
-            refused.append(f'{name} (quarantined: `wattif experiment release {name}`)')
+            refused.append(f'{name} (quarantined: `drainhound experiment release {name}`)')
         elif name in RISKY and not risky:
             refused.append(f'{name} (risky: add --risky)')
         else:
@@ -2437,7 +2437,7 @@ def command_apply(assignments, risky=False, specs=None, battery=on_battery, ledg
 
 def capture_profile(battery, now=None, settle=60, specs=None):
     """Save as found on this power source (remember_found) the profile, ABM and
-    `specs`' (catalog()'s) settings that wattif experiment hasn't changed in this
+    `specs`' (catalog()'s) settings that drainhound experiment hasn't changed in this
     boot (once it has, their value may be its own), every 5 minutes once the
     source has been steady for `settle` seconds (udev may still be switching):
     what they go back to on this source after a change on the other. The
@@ -2470,7 +2470,7 @@ def capture_profile(battery, now=None, settle=60, specs=None):
 
 
 def command_reconcile(battery=on_battery, ledger=None):
-    """wattif-reconcile.timer, while no run owns the settings: what a
+    """drainhound-reconcile.timer, while no run owns the settings: what a
     run left (restore-pending, a crash), applied settings after AC changes and
     after resume, and your own profile. While applied settings exist it is their
     watchdog: an incident since they were applied trips it (`trip`)."""
@@ -2539,7 +2539,7 @@ def command_enable():
         if record['disabled']:  # Not after a boot that died asleep or without a shutdown: noted, and on.
             raise SystemExit(f"watchdog: {record['reason']}; quarantined: "
                              f"{', '.join(record['quarantined']) or 'nothing'}. Automatic experiments stay off; "
-                             '`wattif experiment enable` again to start them anyway.')
+                             '`drainhound experiment enable` again to start them anyway.')
     prefer(watchdog_seen=time.time())
     SAVED.mkdir(parents=True, exist_ok=True)
     ENABLED.touch()
@@ -2548,7 +2548,7 @@ def command_enable():
 
 def command_disable():
     """Automatic experiments off and every setting they or `apply` changed in this
-    boot back to stock (stock_names: what wattif didn't touch is left as it is)."""
+    boot back to stock (stock_names: what drainhound didn't touch is left as it is)."""
     ENABLED.unlink(missing_ok=True)
     # Applied settings end here, whatever happens next: what they changed is in the
     # ledger, so the reconciler puts it back even if the restore below can't run.
@@ -2556,7 +2556,7 @@ def command_disable():
     systemctl_wait('stop', AUTO_UNIT)  # Its own stop restores what it changed (up to TimeoutStopSec).
     with ownership(wait=60) as mine:
         if not mine:
-            raise SystemExit('a manual experiment owns the settings; `wattif experiment stop` restores them')
+            raise SystemExit('a manual experiment owns the settings; `drainhound experiment stop` restores them')
         pending = command_restore(stock=True)
     if pending:
         raise SystemExit('could not restore ' + '; '.join(f'{name}: {why}' for name, why in pending.items())
@@ -2564,13 +2564,13 @@ def command_disable():
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog='wattif experiment', description=__doc__.split('\n\n')[0])
+    parser = argparse.ArgumentParser(prog='drainhound experiment', description=__doc__.split('\n\n')[0])
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('list')
     sub.add_parser('units')
     sub.add_parser('status')
     sub.add_parser('enable', help='start automatic experiments (they persist across logins)')
-    sub.add_parser('disable', help='stop automatic experiments and put back every setting wattif changed')
+    sub.add_parser('disable', help='stop automatic experiments and put back every setting drainhound changed')
     chosen = sub.add_parser('pool', help='settings automatic experiments may vary (pool add|remove NAME ...)')
     chosen.add_argument('names', nargs='*', metavar='name')
     chosen.add_argument('--risky', action='store_true', help=f"allow the risky settings ({', '.join(RISKY)})")
@@ -2582,7 +2582,7 @@ def main(argv=None):
     chosen_goal.add_argument('--apply', action='store_true',
                              help="also set that goal's best measured combination now (not during experiments)")
     chosen_goal.add_argument('--risky', action='store_true', help='with --apply: risky settings too')
-    sub.add_parser('auto', help='the wattif-experiments.service body')
+    sub.add_parser('auto', help='the drainhound-experiments.service body')
     sub.add_parser('resume', help='restart automatic experiments if enabled (after a manual run)')
     start = sub.add_parser('start', help='randomize one setting, or several together')
     start.add_argument('names', nargs='+', metavar='name')
@@ -2604,10 +2604,10 @@ def main(argv=None):
     test = sub.add_parser('test-freeze', help='freeze the freeze-apps targets now for a few seconds, then thaw')
     test.add_argument('--seconds', type=float, default=5)
     test.add_argument('--keep', action='append')
-    restore = sub.add_parser('restore', help="put a run's leftovers back to stock (--stock: everything wattif "
+    restore = sub.add_parser('restore', help="put a run's leftovers back to stock (--stock: everything drainhound "
                                              'changed in this boot)')
     restore.add_argument('--stock', action='store_true')
-    sub.add_parser('reconcile', help='the wattif-reconcile.timer body')
+    sub.add_parser('reconcile', help='the drainhound-reconcile.timer body')
     sub.add_parser('run')
     args = parser.parse_args(argv)
     if args.command == 'list':
@@ -2615,7 +2615,7 @@ def main(argv=None):
         print(json.dumps(listing(specs)))
         for why in dict.fromkeys(why for _, why in getattr(specs, 'missing', {}).values()):
             names = [name for name, (_, reason) in specs.missing.items() if reason == why]
-            print(f"wattif experiment: left out: {', '.join(names)} ({why})", file=sys.stderr)
+            print(f"drainhound experiment: left out: {', '.join(names)} ({why})", file=sys.stderr)
     elif args.command == 'units':
         print(json.dumps(freezable_units()))
     elif args.command == 'status':
@@ -2646,7 +2646,7 @@ def main(argv=None):
             if name not in known:
                 parser.error(f'unknown experiment {name!r}' + (' (needs --unit)' if name == 'freeze' else ''))
             if name in blocked:
-                parser.error(f'{name} is quarantined by the watchdog: `wattif experiment release {name}` first')
+                parser.error(f'{name} is quarantined by the watchdog: `drainhound experiment release {name}` first')
             if name in RISKY and not args.risky:
                 parser.error(f'{name} is risky (it can upset some hardware; config [experiments] risky): add --risky')
         write_state({'names': names, 'minutes': max(8, min(args.minutes, 24 * 60)), 'unit': args.unit,
@@ -2674,7 +2674,7 @@ def main(argv=None):
             refused = [why for name, why in refused if name in asked]  # Not old risky names, silently dropped.
             if refused:
                 print(' '.join(pool()))
-                raise SystemExit('wattif experiment: not in the pool: ' + '; '.join(refused))
+                raise SystemExit('drainhound experiment: not in the pool: ' + '; '.join(refused))
         print(' '.join(pool()))
     elif args.command == 'quarantine':
         print(json.dumps(quarantined(), indent=1))
@@ -2685,7 +2685,7 @@ def main(argv=None):
             prefer(goal=args.goal)
             if args.apply:
                 if running() and load_state().get('settled'):  # The paused runner sets the goal's combination.
-                    print('wattif experiment: paused experiments switch to its combination within a minute',
+                    print('drainhound experiment: paused experiments switch to its combination within a minute',
                           file=sys.stderr)
                 elif running():  # At once, not after waiting for the lock a run holds for as long as it runs.
                     not_applied([OWNED])
@@ -2700,7 +2700,7 @@ def main(argv=None):
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
         with ownership(wait=120) as mine:
             if not mine:
-                sys.exit('wattif experiment: another run owns the settings')
+                sys.exit('drainhound experiment: another run owns the settings')
             automatic()
     elif args.command == 'resume':
         if ENABLED.exists():
@@ -2713,7 +2713,7 @@ def main(argv=None):
                 raise SystemExit('a run owns the settings (it restores them when it stops)')
             pending = command_restore(stock=args.stock)
         if pending:  # Not an error for ExecStopPost: the state says restore-pending and the reconciler retries.
-            print('wattif experiment: restore pending: ' + '; '.join(f'{n}: {w}' for n, w in pending.items()),
+            print('drainhound experiment: restore pending: ' + '; '.join(f'{n}: {w}' for n, w in pending.items()),
                   file=sys.stderr)
     elif args.command == 'reconcile':
         with ownership() as mine:
@@ -2729,5 +2729,5 @@ def main(argv=None):
 
 if __name__ == '__main__':
     if shutil.which('systemctl') is None:
-        sys.exit('wattif experiment needs systemd')
+        sys.exit('drainhound experiment needs systemd')
     main()

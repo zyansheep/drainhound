@@ -1,9 +1,9 @@
-"""wattif's systemd user units, written from one table.
+"""drainhound's systemd user units, written from one table.
 
-    wattif units                    print them
-    wattif units --install          write them to ~/.config/systemd/user, reload,
+    drainhound units                    print them
+    drainhound units --install          write them to ~/.config/systemd/user, reload,
                                     and enable the default set (--no-enable: don't)
-    wattif units --dir DIR [--exec PATH]   write them to DIR only (packaging)
+    drainhound units --dir DIR [--exec PATH]   write them to DIR only (packaging)
 
 Packages install the same files (the Nix package runs `--dir` at build time).
 The collector has no ProtectSystem/ProtectHome/PrivateTmp on purpose: in a user
@@ -24,77 +24,77 @@ DEFAULT_ENABLED = ('collector', 'eta', 'panel', 'experiments', 'reconcile.timer'
 
 
 def state_dir():
-    """config.STATE as the units see it: %S/wattif (the user manager's state
-    directory, XDG_STATE_HOME's) unless WATTIF_STATE_DIR moved it."""
-    return str(config.STATE) if os.environ.get('WATTIF_STATE_DIR') else f'%S/{config.NAME}'
+    """config.STATE as the units see it: %S/drainhound (the user manager's state
+    directory, XDG_STATE_HOME's) unless DRAINHOUND_STATE_DIR moved it."""
+    return str(config.STATE) if os.environ.get('DRAINHOUND_STATE_DIR') else f'%S/{config.NAME}'
 
 
-def units(wattif):
-    """{file name: contents} for the wattif executable `wattif`."""
+def units(drainhound):
+    """{file name: contents} for the drainhound executable `drainhound`."""
     u = config.UNITS
     session = {'PartOf': SESSION, 'After': SESSION}
     table = {
         u['collector']: (
-            {'Description': 'wattif: sample and log power use', **session},
-            {'ExecStart': f'{wattif} collect', 'Restart': 'on-failure',
+            {'Description': 'drainhound: sample and log power use', **session},
+            {'ExecStart': f'{drainhound} collect', 'Restart': 'on-failure',
              # Slow enough that a crash loop never trips the start limit and stops logging.
              'RestartSec': '5', 'NoNewPrivileges': 'true'},
             True),
         u['eta']: (
-            {'Description': 'wattif: time left, model training, low-battery warnings',
+            {'Description': 'drainhound: time left, model training, low-battery warnings',
              **session, 'After': f"{SESSION} {u['collector']}"},
-            {'ExecStart': f'{wattif} eta --quiet', 'Restart': 'on-failure', 'RestartSec': '5'},
+            {'ExecStart': f'{drainhound} eta --quiet', 'Restart': 'on-failure', 'RestartSec': '5'},
             True),
         u['panel']: (
-            {'Description': 'wattif: resident battery panel', **session, 'Requisite': SESSION},
-            {'Type': 'dbus', 'BusName': config.APP_ID, 'ExecStart': f'{wattif} panel serve',
+            {'Description': 'drainhound: resident battery panel', **session, 'Requisite': SESSION},
+            {'Type': 'dbus', 'BusName': config.APP_ID, 'ExecStart': f'{drainhound} panel serve',
              'Restart': 'on-failure'},
             True),
-        # A manual run (`wattif experiment start`). Root settings go through
-        # `sudo -n wattif-helper`, so no NoNewPrivileges. Stopping restores the
+        # A manual run (`drainhound experiment start`). Root settings go through
+        # `sudo -n drainhound-helper`, so no NoNewPrivileges. Stopping restores the
         # stock values; what could not be is retried by ExecStopPost and the
         # reconciler. TimeoutStopSec covers a full restore (~9 helper calls).
         u['experiment']: (
-            {'Description': 'wattif: a power experiment', 'PartOf': SESSION},
-            {'ExecStart': f'{wattif} experiment run',
-             'ExecStopPost': [f'{wattif} experiment restore',
+            {'Description': 'drainhound: a power experiment', 'PartOf': SESSION},
+            {'ExecStart': f'{drainhound} experiment run',
+             'ExecStopPost': [f'{drainhound} experiment restore',
                               # A manual run stops automatic experiments (Conflicts=); bring them back.
-                              f'{wattif} experiment resume'],
+                              f'{drainhound} experiment resume'],
              'Restart': 'no', 'TimeoutStopSec': '180'},
             False),
-        # Automatic experiments while `wattif experiment enable` left its flag
+        # Automatic experiments while `drainhound experiment enable` left its flag
         # (an incident the watchdog sees removes it). Ordered after the manual
         # unit: when one starts and the other stops, the stop's restore finishes first.
         u['experiments']: (
-            {'Description': 'wattif: automatic power experiments', **session,
+            {'Description': 'drainhound: automatic power experiments', **session,
              'After': f"{SESSION} {u['collector']} {u['experiment']}", 'Conflicts': u['experiment'],
              'ConditionPathExists': f'{state_dir()}/experiments-enabled',
              # A runner that keeps crashing stops trying: at most 5 starts an hour.
              'StartLimitIntervalSec': '3600', 'StartLimitBurst': '5'},
-            {'ExecStart': f'{wattif} experiment auto', 'ExecStopPost': f'{wattif} experiment restore',
+            {'ExecStart': f'{drainhound} experiment auto', 'ExecStopPost': f'{drainhound} experiment restore',
              'Restart': 'on-failure', 'RestartSec': '30', 'TimeoutStopSec': '180'},
             True),
         # While no run owns the settings: retries restores a run could not
-        # finish, keeps applied settings (`wattif experiment apply`) to battery
+        # finish, keeps applied settings (`drainhound experiment apply`) to battery
         # power only, and watches the kernel log while any are applied.
         u['reconcile']: (
-            {'Description': 'wattif: keep applied power settings in step with the power source', 'After': SESSION},
-            {'Type': 'oneshot', 'ExecStart': f'{wattif} experiment reconcile', 'TimeoutStartSec': '180'},
+            {'Description': 'drainhound: keep applied power settings in step with the power source', 'After': SESSION},
+            {'Type': 'oneshot', 'ExecStart': f'{drainhound} experiment reconcile', 'TimeoutStartSec': '180'},
             False),
         u['reconcile'].replace('.service', '.timer'): (
-            {'Description': 'wattif: reconcile power settings every minute', 'PartOf': SESSION},
+            {'Description': 'drainhound: reconcile power settings every minute', 'PartOf': SESSION},
             {'OnActiveSec': '1min', 'OnUnitActiveSec': '1min', 'AccuracySec': '10s'},
             True),
         # Started and stopped by the throttle-apps setting (experiments, or `apply`).
         u['throttle']: (
-            {'Description': 'wattif: throttle unfocused apps on battery', **session},
-            {'ExecStart': f'{wattif} throttle', 'ExecStopPost': f'{wattif} throttle --release',
+            {'Description': 'drainhound: throttle unfocused apps on battery', **session},
+            {'ExecStart': f'{drainhound} throttle', 'ExecStopPost': f'{drainhound} throttle --release',
              'Restart': 'on-failure', 'RestartSec': '5'},
             False),
         # The apps come from config [freeze] apps; with none it idles.
         u['freeze']: (
-            {'Description': 'wattif: freeze long-unused apps on battery', **session},
-            {'ExecStart': f'{wattif} freeze', 'ExecStopPost': f'{wattif} freeze --release',
+            {'Description': 'drainhound: freeze long-unused apps on battery', **session},
+            {'ExecStart': f'{drainhound} freeze', 'ExecStopPost': f'{drainhound} freeze --release',
              'Restart': 'on-failure', 'RestartSec': '5'},
             True),
     }
@@ -102,7 +102,7 @@ def units(wattif):
 
 
 def render(name, unit, body, wanted):
-    lines = ['# Written by `wattif units`.', '[Unit]', *entries(unit), '',
+    lines = ['# Written by `drainhound units`.', '[Unit]', *entries(unit), '',
              '[Timer]' if name.endswith('.timer') else '[Service]', *entries(body)]
     if wanted:
         lines += ['', '[Install]', f'WantedBy={SESSION}']
@@ -125,14 +125,14 @@ def enabled_names():
 
 
 def main(argv=()):
-    parser = argparse.ArgumentParser(prog='wattif units', description=__doc__.split('\n\n')[0])
+    parser = argparse.ArgumentParser(prog='drainhound units', description=__doc__.split('\n\n')[0])
     parser.add_argument('--install', action='store_true', help='write to ~/.config/systemd/user and enable')
     parser.add_argument('--no-enable', action='store_true', help='with --install: only write and reload')
     parser.add_argument('--dir', type=Path, help='write the unit files to DIR (nothing else)')
-    parser.add_argument('--exec', dest='wattif', help='the wattif executable the units run')
+    parser.add_argument('--exec', dest='drainhound', help='the drainhound executable the units run')
     args = parser.parse_args(list(argv))
-    wattif = args.wattif or shlex.join(config.self_command())
-    files = units(wattif)
+    drainhound = args.drainhound or shlex.join(config.self_command())
+    files = units(drainhound)
     if args.dir is None and not args.install:
         for name, text in files.items():
             print(f'### {name}\n{text}')

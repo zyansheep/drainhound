@@ -8,9 +8,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from wattif import power
-from wattif import report
-from wattif import store
+from drainhound import power
+from drainhound import report
+from drainhound import store
 from tests.test_report import record
 
 # Columns each old layout's tables didn't have yet (later migrations added them):
@@ -373,7 +373,7 @@ class StoreTests(unittest.TestCase):
             return real(conn, batch, ids)
         records_by_t1 = {r['t1']: r for r in records}
         order = {r['t1']: i for i, r in enumerate(records)}
-        with mock.patch('wattif.store.insert', insert), contextlib.redirect_stderr(io.StringIO()) as err:
+        with mock.patch('drainhound.store.insert', insert), contextlib.redirect_stderr(io.StringIO()) as err:
             results = [writer.write(r) for r in records]
         self.assertEqual(results.count(False), 10)
         self.assertIn('database is locked', err.getvalue())
@@ -417,7 +417,7 @@ class StoreTests(unittest.TestCase):
 
     def test_unexpected_errors_never_escape_the_writer_or_imports(self):
         writer = store.Writer(self.db)
-        with mock.patch('wattif.store.insert', side_effect=ValueError('not sqlite')), \
+        with mock.patch('drainhound.store.insert', side_effect=ValueError('not sqlite')), \
                 contextlib.redirect_stderr(io.StringIO()) as err:
             self.assertFalse(writer.write(self.records[0]))
         self.assertIn('ValueError: not sqlite', err.getvalue())

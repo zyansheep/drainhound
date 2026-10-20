@@ -1,9 +1,9 @@
-# wattif's data and files
+# drainhound's data and files
 
-Everything wattif keeps is local and readable. The paths below are the
-defaults; `WATTIF_STATE_DIR` and `WATTIF_RUNTIME_DIR` move them.
+Everything drainhound keeps is local and readable. The paths below are the
+defaults; `DRAINHOUND_STATE_DIR` and `DRAINHOUND_RUNTIME_DIR` move them.
 
-## `~/.local/state/wattif` (kept)
+## `~/.local/state/drainhound` (kept)
 
 | File | What |
 | --- | --- |
@@ -19,7 +19,7 @@ defaults; `WATTIF_STATE_DIR` and `WATTIF_RUNTIME_DIR` move them.
 | `experiment-log.json` | every run and every setting change experiments made |
 | `applied.json` | settings `apply` set, for this boot |
 
-## `$XDG_RUNTIME_DIR/wattif` (live, gone at logout)
+## `$XDG_RUNTIME_DIR/drainhound` (live, gone at logout)
 
 These are the files a bar, a widget or a script can read. Each is replaced
 atomically.
@@ -42,7 +42,7 @@ thermal zone sensor); `coverage` (seconds of CPU history behind `cpu`).
 `updated`, and per goal (`battery`, `comfort`): `change` (what it would
 change from your settings), `gain` (minutes per full charge) with its 90%
 `interval`, `delight` (👍 chance per block now → then), `apply` (the
-assignments `wattif experiment apply` takes), `text`.
+assignments `drainhound experiment apply` takes), `text`.
 
 **`experiment.json`** (the runner): `mode` (`auto` for automatic runs), `status`
 (running/paused/done), `reason`, `block`, `block_start`/`block_end`,
@@ -83,16 +83,16 @@ layouts are migrated forward, never dropped.
 Query it directly:
 
 ```sh
-sqlite3 ~/.local/state/wattif/power.sqlite3 \
+sqlite3 ~/.local/state/drainhound/power.sqlite3 \
   "select date(t1, 'unixepoch', 'localtime') day, round(avg(bat_w), 1) watts, count(*) / 360.0 hours
    from records where status = 'Discharging' group by day"
-duckdb -c "select * from sqlite_scan('$HOME/.local/state/wattif/power.sqlite3', 'records') limit 5"
+duckdb -c "select * from sqlite_scan('$HOME/.local/state/drainhound/power.sqlite3', 'records') limit 5"
 ```
 
 Size: ~1.4 KB per record, ~12 MB per day awake. The archive is ~2.3 MB per
 day compressed. It alone keeps idle apps' process counts and memory, the
 per-interrupt and per-interface breakdowns and display layouts. On startup
-the collector imports any archive day the database lacks, and `wattif
+the collector imports any archive day the database lacks, and `drainhound
 collect import` re-reads every day, keeping what is stored.
 
 ## Privacy

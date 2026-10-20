@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
 """Quality of life, as thumbs: what stands out about the laptop right now.
 
-👎 (the red thumb next to the battery, or `wattif vote down`) says the laptop is worse
+👎 (the red thumb next to the battery, or `drainhound vote down`) says the laptop is worse
 than it should be: automatic experiments end their block at once, restore your
-settings and rest for COOLDOWN (`wattif vote resume` ends that early), and the vote
-teaches them which settings to avoid while you are there. 👍 (`wattif vote up`) says
+settings and rest for COOLDOWN (`drainhound vote resume` ends that early), and the vote
+teaches them which settings to avoid while you are there. 👍 (`drainhound vote up`) says
 something is especially good — unexpectedly smooth, quiet, snappy or
 long-lasting — which teaches them which settings are worth keeping (the
 panel's Comfort goal). The collector logs every vote, as a `qol` event and in
 the record it falls in.
 
-    wattif vote up | down       vote
-    wattif vote resume          end the rest after a 👎 now
-    wattif vote                 the last vote, and any rest left
-    wattif waybar up|down       JSON for Waybar's custom/vote-up and custom/vote-down
+    drainhound vote up | down       vote
+    drainhound vote resume          end the rest after a 👎 now
+    drainhound vote                 the last vote, and any rest left
+    drainhound waybar up|down       JSON for Waybar's custom/vote-up and custom/vote-down
 """
 import json
-import os
 import subprocess
 import sys
 import time
@@ -25,7 +24,7 @@ from pathlib import Path
 from . import config
 
 VOTES = ('down', 'up')
-COOLDOWN = 10 * 60  # Seconds automatic experiments rest after a 👎 (`wattif vote resume` ends it).
+COOLDOWN = 10 * 60  # Seconds automatic experiments rest after a 👎 (`drainhound vote resume` ends it).
 STATE = config.STATE / 'qol.json'
 KEEP = 100  # Votes kept in the state file; the collector logs each one as it sees it.
 WAYBAR_SIGNAL = int(config.get('waybar', 'signal'))  # The vote modules refresh on SIGRTMIN+signal.

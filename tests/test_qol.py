@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from wattif import qol
+from drainhound import qol
 
 
 class QolTests(unittest.TestCase):

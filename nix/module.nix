@@ -1,7 +1,7 @@
-# NixOS module: wattif's user services, its root helper (sudo rule and suspend
-# hooks) and /etc/wattif/config.toml.
+# NixOS module: drainhound's user services, its root helper (sudo rule and suspend
+# hooks) and /etc/drainhound/config.toml.
 #
-#   services.wattif = {
+#   services.drainhound = {
 #     enable = true;
 #     helper.users = [ "alice" ];      # who may change root settings in experiments
 #     settings.freeze.apps = [ "obsidian" ];
@@ -12,23 +12,23 @@ self: {
   pkgs,
   ...
 }: let
-  cfg = config.services.wattif;
+  cfg = config.services.drainhound;
   toml = pkgs.formats.toml {};
   units = {
-    collector = "wattif-collector";
-    eta = "wattif-eta";
-    panel = "wattif-panel";
-    experiment = "wattif-experiment";
-    experiments = "wattif-experiments";
-    reconcile = "wattif-reconcile";
-    throttle = "wattif-throttle";
-    freeze = "wattif-freeze";
+    collector = "drainhound-collector";
+    eta = "drainhound-eta";
+    panel = "drainhound-panel";
+    experiment = "drainhound-experiment";
+    experiments = "drainhound-experiments";
+    reconcile = "drainhound-reconcile";
+    throttle = "drainhound-throttle";
+    freeze = "drainhound-freeze";
   };
   # The user units find the setuid sudo first (the system profile's is not
   # setuid), then the user's and the system's packages (niri, swaymsg,
   # powerprofilesctl, iw).
   unitPath = "/run/wrappers/bin:/etc/profiles/per-user/%u/bin:/run/current-system/sw/bin";
-  helper = "/run/current-system/sw/bin/wattif-helper";
+  helper = "/run/current-system/sw/bin/drainhound-helper";
   sudo = "/run/wrappers/bin/sudo";
   rule = {
     users = cfg.helper.users;
@@ -51,13 +51,13 @@ self: {
     environment.PATH = lib.mkForce unitPath;
   });
 in {
-  options.services.wattif = {
-    enable = lib.mkEnableOption "wattif, battery use, time left and power experiments for laptops";
+  options.services.drainhound = {
+    enable = lib.mkEnableOption "drainhound, battery use, time left and power experiments for laptops";
     package = lib.mkOption {
       type = lib.types.package;
       default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
-      defaultText = lib.literalExpression "wattif.packages.\${system}.default";
-      description = "The wattif package.";
+      defaultText = lib.literalExpression "drainhound.packages.\${system}.default";
+      description = "The drainhound package.";
     };
     helper = {
       users = lib.mkOption {
@@ -65,7 +65,7 @@ in {
         default = [];
         example = ["alice"];
         description = ''
-          Users who may run wattif-helper as root without a password, which
+          Users who may run drainhound-helper as root without a password, which
           experiments need for root-only settings (ASPM, NVMe APST, CPU boost
           and frequency cap, Wi-Fi power saving, amdgpu panel power savings and
           clocks). Without any, experiments leave those out and vary only what
@@ -76,7 +76,7 @@ in {
         type = lib.types.bool;
         default = true;
         description = ''
-          Run `wattif-helper sleep-safe` before every suspend and
+          Run `drainhound-helper sleep-safe` before every suspend and
           `sleep-restore` after resume: ASPM and NVMe APST go back to what the
           kernel command line sets (where it sets them; on some machines they
           are workarounds for crashes on the way into suspend) and GPU DPM to
@@ -112,15 +112,15 @@ in {
         }
       '';
       description = ''
-        /etc/wattif/config.toml (see `wattif config` for every key and its
-        default). A user's ~/.config/wattif/config.toml overrides it.
+        /etc/drainhound/config.toml (see `drainhound config` for every key and its
+        default). A user's ~/.config/drainhound/config.toml overrides it.
       '';
     };
   };
 
   config = lib.mkIf cfg.enable {
     environment.systemPackages = [cfg.package];
-    environment.etc."wattif/config.toml".source = toml.generate "wattif-config.toml" (lib.recursiveUpdate {
+    environment.etc."drainhound/config.toml".source = toml.generate "drainhound-config.toml" (lib.recursiveUpdate {
         helper.command = [sudo "-n" helper];
       }
       cfg.settings);
@@ -133,8 +133,8 @@ in {
     security.sudo-rs.extraRules = lib.mkIf (cfg.helper.users != [] && config.security.sudo-rs.enable) [rule];
 
     powerManagement = lib.mkIf (cfg.helper.users != [] && cfg.helper.sleepHooks) {
-      powerDownCommands = "${cfg.package}/bin/wattif-helper sleep-safe || true";
-      resumeCommands = "${cfg.package}/bin/wattif-helper sleep-restore || true";
+      powerDownCommands = "${cfg.package}/bin/drainhound-helper sleep-safe || true";
+      resumeCommands = "${cfg.package}/bin/drainhound-helper sleep-restore || true";
     };
 
     services.udev.extraRules = lib.mkIf cfg.readableRapl ''

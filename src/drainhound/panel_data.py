@@ -2,9 +2,9 @@
 """The battery panel's data: everything it shows for one period, computed off
 the UI thread, and the text it puts in its header and rows. GTK-free, so
 test_panel_data.py runs it headless on a synthetic month of every kind of
-data, and `wattif check` runs it on the real power database.
+data, and `drainhound check` runs it on the real power database.
 
-    wattif check     (each period the panel shows: time per part, and errors)
+    drainhound check     (each period the panel shows: time per part, and errors)
 
 Each part is computed on its own: one that fails falls back to an empty value,
 its error goes in `errors` (with the traceback on stderr, so in the journal),
@@ -21,7 +21,6 @@ import traceback
 from pathlib import Path
 
 from . import battery as batteries
-from . import config
 from . import eta  # First: it limits BLAS threads before numpy loads.
 from . import experiment
 from . import report
@@ -30,13 +29,13 @@ from .report import PHRASES, gain_text
 
 FREEZES = ('freeze', 'freeze-apps')  # Paired A/B runs, analysed apart from the setting model.
 HISTORY_DAYS = 30
-BUDGET = 5.0  # s: wattif check fails a period that takes longer to gather.
+BUDGET = 5.0  # s: drainhound check fails a period that takes longer to gather.
 PERIODS = {'6 h': 6 * 3600, 'Day': 86400, 'Week': 7 * 86400}
 MIN_ROWS = 30  # Battery minutes (report.battery_rows) report.what_if needs.
 # A period with fewer borrows the latest FALLBACK_HOURS of them for the what-if.
 FALLBACK_HOURS = 8
 SPANS = 4  # Periods kept with their per-minute apps while the panel is open.
-FRESH = 3600  # s: recommend.json and models.json older than this are stale (as the menu and wattif experiment).
+FRESH = 3600  # s: recommend.json and models.json older than this are stale (as the menu and drainhound experiment).
 PICKER = 12  # Apps the "Close an app" picker lists (most CPU time first), plus the chosen one.
 NOTE_SECONDS = 30  # A command's failure or refusal stays under the banner this long (or until the next command).
 
@@ -50,7 +49,7 @@ def load_minutes(start, end, apps=True):
     """Minutes and events in [start, end) from the power database. The history
     (`apps` false) without each minute's per-app JSON — decoding it for 30 days
     was 85% of opening the panel — and with experiment minutes' clean parts
-    (report.load_range), which the settings models use, as wattif eta's do.
+    (report.load_range), which the settings models use, as drainhound eta's do.
     A span with its apps (the timeline, the what-if) needs no clean parts."""
     if not apps:
         return report.load_range(start, end, store.DB, apps=False)
@@ -176,13 +175,13 @@ def typical_draw(shared, rows_all, model):
     """THE typical battery draw (W) the panel's gains are computed at, and what it
     is: the mean of the last 30 days' battery minutes at your settings
     (report.typical_power: each minute less what an experiment's settings
-    added), wattif eta's (models.json `typical_power`, the draw recommend.json's
+    added), drainhound eta's (models.json `typical_power`, the draw recommend.json's
     gains are at too) while its models are fresh, else figured here. Not the
     ETA's `typical`, its level of the last ~5 h: a gain per full charge is for
     the long run."""
     typical = (shared or {}).get('typical_power')
     if finite(typical) and typical > 0:
-        return float(typical), f"wattif eta's: the mean at your settings of the last {HISTORY_DAYS} days on battery"
+        return float(typical), f"drainhound eta's: the mean at your settings of the last {HISTORY_DAYS} days on battery"
     power = report.typical_power(rows_all, model) if rows_all and model else None
     if finite(power) and power > 0:
         return power, (f"mean at your settings of the last {HISTORY_DAYS} days' {len(rows_all):,} battery minutes, "
@@ -191,7 +190,7 @@ def typical_draw(shared, rows_all, model):
 
 
 def models_age(now=None):
-    """Seconds since wattif eta last wrote models.json, None if it never has."""
+    """Seconds since drainhound eta last wrote models.json, None if it never has."""
     try:
         return (now or time.time()) - eta.MODELS.stat().st_mtime
     except OSError:
@@ -199,8 +198,8 @@ def models_age(now=None):
 
 
 def models_outdated():
-    """Whether models.json is from another wattif eta version (eta.load_models
-    ignores it): just after an update, until the new wattif eta's first refit."""
+    """Whether models.json is from another drainhound eta version (eta.load_models
+    ignores it): just after an update, until the new drainhound eta's first refit."""
     try:
         found = json.loads(eta.MODELS.read_text()).get('version')
     except (OSError, ValueError, AttributeError):
@@ -209,7 +208,7 @@ def models_outdated():
 
 
 def read_recommend(path=None, now=None):
-    """wattif eta's recommend.json while under FRESH seconds old, else None."""
+    """drainhound eta's recommend.json while under FRESH seconds old, else None."""
     try:
         data = json.loads(Path(path or experiment.RECOMMEND).read_text())
     except (OSError, ValueError):
@@ -220,13 +219,13 @@ def read_recommend(path=None, now=None):
 
 
 def recommendations(levers, quality, energy, typical, exclude=(), recommend=None):
-    """Each goal's best combination from ONE source, and which: wattif eta's
+    """Each goal's best combination from ONE source, and which: drainhound eta's
     recommend.json while fresh — what the battery menu shows and the
-    Battery/Comfort switch applies — else ('panel') computed here as wattif eta
+    Battery/Comfort switch applies — else ('panel') computed here as drainhound eta
     does, from every vote in the history, leaving `exclude`
     (experiment.unrecommended: every setting outside the pool) as it is."""
     if recommend:
-        return {goal: recommend[goal] for goal in report.GOALS if isinstance(recommend.get(goal), dict)}, 'wattif eta'
+        return {goal: recommend[goal] for goal in report.GOALS if isinstance(recommend.get(goal), dict)}, 'drainhound eta'
     if quality is None:
         return {}, None
     return report.recommendations(levers, quality, energy, typical, exclude=tuple(exclude)), 'panel'
@@ -260,7 +259,7 @@ def gather(start, end, history=None, on_period=None, cancelled=None):
             return compute()
         except Exception as error:  # noqa: BLE001 - reported, and the rest still shows
             errors[name] = f'{type(error).__name__}: {error}'
-            print(f'wattif panel: {name} failed', file=sys.stderr)
+            print(f'drainhound panel: {name} failed', file=sys.stderr)
             traceback.print_exc()
             return fallback
         finally:
@@ -280,7 +279,7 @@ def collect(start, end, history, on_period, part, errors, timings, began):
     minutes_all, events = loaded
     # Battery minutes, experiments' included (but their washout): the models hold settings at yours.
     rows_all = report.battery_rows(minutes_all)
-    # wattif eta trains every model; fit here only if its models.json is missing or stale.
+    # drainhound eta trains every model; fit here only if its models.json is missing or stale.
     shared = part('models', eta.load_models, None)
     model = part('battery model', lambda: shared['attribution'] if shared else history.memo(
         'battery model', None, lambda: report.fit_rows(rows_all, minutes=minutes_all)), None)
@@ -328,7 +327,7 @@ def collect(start, end, history, on_period, part, errors, timings, began):
         if typical else []), [])
     plan = part('experiment plan', lambda: cached('plan', lambda: report.plan(minutes_all, events, pool)
                                                   if pool else None, tuple(pool)), None)
-    # Every vote counts, with or without a pool: as wattif eta's recommend.json.
+    # Every vote counts, with or without a pool: as drainhound eta's recommend.json.
     quality = part('quality of life', lambda: plan['qol'] if plan else cached(
         'qol', lambda: report.qol_model(minutes_all, events)), None)
     quarantine = part('quarantine', quarantined, {})
@@ -457,14 +456,14 @@ def health_text(health, now=None):
     model = model_text(health.get('model'), (health.get('battery'), health.get('tested') or 0))
     age = health.get('models_age')
     if health.get('trained'):
-        fitted = (f"trained {time.strftime('%H:%M', time.localtime(health['trained']))} by wattif eta "
+        fitted = (f"trained {time.strftime('%H:%M', time.localtime(health['trained']))} by drainhound eta "
                   f"(models.json {ago(max(0.0, now - health['trained']))} old)")
     elif health.get('models_outdated'):
-        fitted = "fitted here: models.json is from before an update (waiting for wattif eta's first refit)"
+        fitted = "fitted here: models.json is from before an update (waiting for drainhound eta's first refit)"
     elif age is not None:
-        fitted = f'fitted here: models.json is {ago(age)} old (wattif eta not training?)'
+        fitted = f'fitted here: models.json is {ago(age)} old (drainhound eta not training?)'
     else:
-        fitted = 'fitted here: no models.json from wattif eta'
+        fitted = 'fitted here: no models.json from drainhound eta'
     parts.append('battery model: ' + ', '.join(filter(None, [model, fitted])))
     if health.get('blocks'):
         span = health.get('levers_span')
@@ -490,8 +489,8 @@ def what_if_note(result):
     return (f"Model estimates over {result.get('scope') or 'this period'}{draw}: the battery model removes an "
             "app's or group's activity, or dims the display, and assumes nothing else changes (outlined bars; "
             "whiskers are 90% intervals)."
-            + (f" Models trained {time.strftime('%H:%M', time.localtime(result['trained']))} by wattif eta."
-               if result.get('trained') else ' Models fitted here (wattif eta has not trained recently).'))
+            + (f" Models trained {time.strftime('%H:%M', time.localtime(result['trained']))} by drainhound eta."
+               if result.get('trained') else ' Models fitted here (drainhound eta has not trained recently).'))
 
 
 def typical_text(result):
@@ -568,14 +567,14 @@ def lever_rows(settings, levers, quality, pool, risky=(), quarantine=None):
             why = quarantine[name]
             detail += f" · quarantined after a hardware incident{f' ({why})' if why else ''}"
             includable, hint = False, 'Quarantined after a hardware incident: automatic experiments leave it alone'
-        elif name in risky and name in pool:  # In the pool only if added with --risky (wattif experiment pool).
+        elif name in risky and name in pool:  # In the pool only if added with --risky (drainhound experiment pool).
             detail += ' · risky: in automatic runs (added with --risky)'
             hint = ('Risky for some hardware (config [experiments] risky); you added it with --risky. Untick to '
-                    f'take it out of automatic runs (back in only with `wattif experiment pool add {name} --risky`)')
+                    f'take it out of automatic runs (back in only with `drainhound experiment pool add {name} --risky`)')
         elif name in risky:
             detail += ' · risky: not in automatic runs'
             includable, hint = False, ('Risky for some hardware (config [experiments] risky): automatic '
-                                       f'experiments vary it only after `wattif experiment pool add {name} --risky`')
+                                       f'experiments vary it only after `drainhound experiment pool add {name} --risky`')
         effect, progress = effects.get(name), (levers.get('progress') or {}).get(name)
         if effect and finite(effect.get('chance')):
             detail += f" · {effect['chance']:.0%} chance it saves"
@@ -616,14 +615,14 @@ def picker(units, shown, chosen):
 
 
 def notices(err):
-    """wattif experiment's own notices on stderr ('wattif experiment: …' lines, prefix
+    """drainhound experiment's own notices on stderr ('drainhound experiment: …' lines, prefix
     dropped): what a command that succeeded left undone."""
     return [line.split(':', 1)[1].strip() for line in (err or '').splitlines()
-            if line.startswith('wattif experiment:')]
+            if line.startswith('drainhound experiment:')]
 
 
 def refused(err):
-    """{name: why} `wattif experiment apply` (or `goal --apply`) refused: risky
+    """{name: why} `drainhound experiment apply` (or `goal --apply`) refused: risky
     without --risky, quarantined (its 'not applied: a (why); b (why)' line)."""
     found = {}
     for notice in notices(err):
@@ -636,7 +635,7 @@ def refused(err):
 
 
 def left_alone(err):
-    """The settings `wattif experiment apply` left as they were, already in the state
+    """The settings `drainhound experiment apply` left as they were, already in the state
     asked for (its 'already so, left as they are: a; b' line)."""
     found = []
     for notice in notices(err):
@@ -646,7 +645,7 @@ def left_alone(err):
 
 
 def apply_note(assignments, out, err):
-    """The note after `wattif experiment apply <assignments>` (or `goal --apply`,
+    """The note after `drainhound experiment apply <assignments>` (or `goal --apply`,
     whose combination may be unknown here: None), and for how long (None: until
     the next command). Settings it refused, or left as they were (already so),
     are never called applied."""
@@ -673,7 +672,7 @@ def apply_note(assignments, out, err):
 
 def command_note(ok, out, err, done=None):
     """What a finished command leaves under the Experiments banner, and for how
-    long (None: until the next command). A failure's error, or wattif experiment's
+    long (None: until the next command). A failure's error, or drainhound experiment's
     notices from a success, stay NOTE_SECONDS: the 2 s refresh must not wipe
     them before they are read. `done` is a note, or a function of (stdout, stderr)
     returning (note, seconds)."""
@@ -695,7 +694,7 @@ def interaction_clear(interaction):
 
 
 def read_estimate(path, now=None):
-    """wattif eta's latest estimate (eta.json) while under 15 s old, else None."""
+    """drainhound eta's latest estimate (eta.json) while under 15 s old, else None."""
     try:
         data = json.loads(Path(path).read_text())
     except (OSError, ValueError):
@@ -722,7 +721,7 @@ def read_battery(root=Path('/sys/class/power_supply')):
 
 
 def status_line(estimate, battery, now=None):
-    """The panel's header: wattif eta's estimate (eta.json, None when stale),
+    """The panel's header: drainhound eta's estimate (eta.json, None when stale),
     else the battery's own readings. The numbers follow the estimate's own
     status: sysfs can say Charging a moment before eta.json does, and mixing
     the two (a charging line from a discharging estimate) once raised a
@@ -731,7 +730,7 @@ def status_line(estimate, battery, now=None):
     now, battery = now or time.time(), battery or {}
     pct, line = battery.get('pct'), ''
     if estimate and finite(estimate.get('hours')):
-        # wattif eta's own kind (its classes): sysfs's Unknown on battery is discharging to it.
+        # drainhound eta's own kind (its classes): sysfs's Unknown on battery is discharging to it.
         classes = estimate.get('classes') if isinstance(estimate.get('classes'), list) else ()
         status = ('Discharging' if 'discharging' in classes else 'Charging' if 'charging' in classes
                   else str(estimate.get('status') or battery.get('status') or 'unknown'))

@@ -11,11 +11,11 @@ from unittest import mock
 
 import numpy as np
 
-from wattif import eta
-from wattif import experiment
-from wattif import panel_data
-from wattif import report
-from wattif import store
+from drainhound import eta
+from drainhound import experiment
+from drainhound import panel_data
+from drainhound import report
+from drainhound import store
 
 LEVERS = ['aspm', 'apst', 'wifi-ps', 'abm', 'refresh', 'boost', 'profile', 'gpu-dpm', 'cpu-cap', 'throttle-apps']
 # Each setting's (saving, normal) value as the runner sets it, and as a minute logs it.
@@ -274,7 +274,7 @@ class ScopeTests(unittest.TestCase):
         text = panel_data.health_text(result['health'])
         self.assertIn(f'{len(rows):,} battery minutes in the last 30 days', text)
         self.assertIn(f'{all_tested:,} of them in experiments; the what-if used {len(latest)}', text)
-        self.assertIn('battery model: on those minutes, fitted here: no models.json from wattif eta', text)
+        self.assertIn('battery model: on those minutes, fitted here: no models.json from drainhound eta', text)
         calls.clear()  # The minute tick: only the newest borrowed minute is fetched again.
         panel_data.gather(now - 6 * 3600 + 60, now + 60, history)
         self.assertEqual([c for c in calls if c[2] and c[0] < now - 6 * 3600], [(rows[-1]['t'], rows[-1]['t'] + 60, True)])
@@ -295,7 +295,7 @@ class ScopeTests(unittest.TestCase):
             result = panel_data.gather(now - 86400, now, history)
         self.assertEqual(result['typical'], 11.0)
         self.assertTrue(panel_data.typical_text(result).startswith(
-            "Typical draw on battery 11.0 W (wattif eta's: the mean at your settings of the last 30 days on battery) → "
+            "Typical draw on battery 11.0 W (drainhound eta's: the mean at your settings of the last 30 days on battery) → "
             '4.5 h per full charge (50 Wh usable)'))
         aspm = next(e for e in result['levers']['effects'] if e['experiment'] == 'aspm')
         self.assertAlmostEqual(aspm['minutes'], report.runtime_gain(50.0, 11.0, aspm['watts']))
@@ -312,12 +312,12 @@ class ScopeTests(unittest.TestCase):
             result = panel_data.gather(now - 86400, now, history)
         self.assertTrue(panel_data.health_text(result['health']).startswith(
             'Data: the store is still recomputing older minutes after an update'))
-        with tempfile.TemporaryDirectory() as directory:  # Just after an update: the old wattif eta's models.json.
+        with tempfile.TemporaryDirectory() as directory:  # Just after an update: the old drainhound eta's models.json.
             path = Path(directory) / 'models.json'
             path.write_text(json.dumps({'version': eta.MODELS_VERSION - 1, 'fitted': now - 60}))
             with mock.patch.object(eta, 'MODELS', path):
                 result = panel_data.gather(now - 86400, now, history)
-        self.assertIn("fitted here: models.json is from before an update (waiting for wattif eta's first refit)",
+        self.assertIn("fitted here: models.json is from before an update (waiting for drainhound eta's first refit)",
                       panel_data.health_text(result['health'], now))
 
     def test_suspends_that_touch_ac_are_left_out(self):
@@ -392,7 +392,7 @@ class ScopeTests(unittest.TestCase):
                 fresh = panel_data.gather(now - 86400, now, history)
                 path.write_text(json.dumps(dict(written, updated=now - 2 * 3600)))
                 stale = panel_data.gather(now - 86400, now, history)
-        self.assertEqual((fresh['recs_source'], fresh['recs']['battery']['apply']), ('wattif eta', ['aspm=saving']))
+        self.assertEqual((fresh['recs_source'], fresh['recs']['battery']['apply']), ('drainhound eta', ['aspm=saving']))
         self.assertEqual(stale['recs_source'], 'panel')
 
     def test_a_newer_reload_cancels_the_rest(self):
@@ -452,7 +452,7 @@ class ExperimentsOnlyTests(unittest.TestCase):
         shared = {'attribution': dict(report.PRIOR), 'fitted': now, 'typical': 9.0, 'typical_power': 12.0}
         with mock.patch.object(eta, 'load_models', lambda: shared):
             result = panel_data.gather(now - 86400, now, history)
-        self.assertEqual(result['typical'], 12.0)  # wattif eta's when its models are fresh; never the ETA's level.
+        self.assertEqual(result['typical'], 12.0)  # drainhound eta's when its models are fresh; never the ETA's level.
         self.assertTrue(all('minutes' in e for e in result['levers']['effects']))
 
 
@@ -664,40 +664,40 @@ class CommandTests(unittest.TestCase):
     """What the Experiments tab says after a command, and the app picker."""
 
     APPLY = ['aspm=saving', 'apst=saving', 'abm=saving', 'refresh=saving']
-    REFUSED = ('wattif experiment: not applied: aspm (risky: add --risky); '
-               'apst (quarantined: `wattif experiment release apst`)\n')
+    REFUSED = ('drainhound experiment: not applied: aspm (risky: add --risky); '
+               'apst (quarantined: `drainhound experiment release apst`)\n')
 
     def test_apply_never_calls_a_refused_setting_applied(self):
         note, seconds = panel_data.apply_note(self.APPLY, '', self.REFUSED)
         self.assertEqual(note, 'Applied until reboot: abm, refresh. Not applied: aspm (risky: add --risky); '
-                               'apst (quarantined: `wattif experiment release apst`).')
+                               'apst (quarantined: `drainhound experiment release apst`).')
         self.assertEqual(seconds, panel_data.NOTE_SECONDS)  # A refusal outlasts the 2 s refresh.
         self.assertEqual(panel_data.apply_note(['abm=saving'], 'On AC: applied settings take effect on battery.\n', ''),
                          ('Applied until reboot (it takes effect on battery): abm.', None))
-        note, _ = panel_data.apply_note(['aspm=saving'], '', 'wattif experiment: not applied: aspm (risky: add --risky)')
+        note, _ = panel_data.apply_note(['aspm=saving'], '', 'drainhound experiment: not applied: aspm (risky: add --risky)')
         self.assertEqual(note, 'Nothing applied: aspm (risky: add --risky).')
         self.assertEqual(panel_data.apply_note([], '', '')[0], 'Nothing measured to apply yet.')
         note, _ = panel_data.apply_note(None, 'comfort\n', self.REFUSED)  # goal --apply, combination computed by the CLI.
         self.assertTrue(note.startswith('Applied until reboot. Not applied: aspm (risky: add --risky); apst'))
 
     def test_apply_never_calls_a_setting_it_left_as_it_was_applied(self):
-        already = 'wattif experiment: already so, left as they are: profile; abm\n'
+        already = 'drainhound experiment: already so, left as they are: profile; abm\n'
         self.assertEqual(panel_data.left_alone(already), ['profile', 'abm'])
         self.assertEqual(panel_data.apply_note(['profile=normal', 'abm=saving', 'cpu-cap=saving'], '', already),
                          ('Applied until reboot: cpu-cap. Already so, left as they are: profile, abm.', None))
         self.assertEqual(panel_data.apply_note(['profile=normal', 'abm=saving'], '', already)[0],
                          'Already so, left as they are: profile, abm.')  # "Already set": nothing changed.
         note, _ = panel_data.apply_note(['aspm=saving', 'abm=saving'], '',
-                                        self.REFUSED + 'wattif experiment: already so, left as they are: abm\n')
+                                        self.REFUSED + 'drainhound experiment: already so, left as they are: abm\n')
         self.assertEqual(note, 'Already so, left as they are: abm. Nothing applied: aspm (risky: add --risky); '
-                               'apst (quarantined: `wattif experiment release apst`).')
+                               'apst (quarantined: `drainhound experiment release apst`).')
 
     def test_failures_and_notices_stay_and_plain_notes_wait_for_the_next_command(self):
         self.assertEqual(panel_data.command_note(False, '', 'watchdog: xHCI controller died; quarantined: aspm.\n'),
                          ('Command failed: watchdog: xHCI controller died; quarantined: aspm.', panel_data.NOTE_SECONDS))
         self.assertEqual(panel_data.command_note(True, '', '', 'Next boot set to PSR on.'), ('Next boot set to PSR on.', None))
         self.assertEqual(panel_data.command_note(True, 'comfort\n', 'Warning: noise\n' + self.REFUSED),
-                         ('not applied: aspm (risky: add --risky); apst (quarantined: `wattif experiment release apst`).',
+                         ('not applied: aspm (risky: add --risky); apst (quarantined: `drainhound experiment release apst`).',
                           panel_data.NOTE_SECONDS))
         self.assertEqual(panel_data.command_note(True, 'x', '', lambda out, err: (out * 2, 5)), ('xx', 5))
 

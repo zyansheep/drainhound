@@ -1,6 +1,6 @@
-# What wattif needs from the hardware
+# What drainhound needs from the hardware
 
-wattif reads what the kernel exposes and uses what it finds: nothing below
+drainhound reads what the kernel exposes and uses what it finds: nothing below
 is required except a battery. Missing pieces mean less detail, not errors.
 
 ## Measurements
@@ -17,8 +17,8 @@ is required except a battery. Missing pieces mean less detail, not errors.
 
 **RAPL** is root-only since Linux 5.10, because fine-grained energy
 readings can leak what the CPU is doing (PLATYPUS, CVE-2020-8694). To let
-wattif read it, make `energy_uj` readable: on NixOS with
-`services.wattif.readableRapl = true`, elsewhere with a udev rule:
+drainhound read it, make `energy_uj` readable: on NixOS with
+`services.drainhound.readableRapl = true`, elsewhere with a udev rule:
 
 ```
 SUBSYSTEM=="powercap", KERNEL=="intel-rapl:*", RUN+="/bin/chmod 0444 /sys%p/energy_uj"
@@ -29,13 +29,13 @@ Only do this on a machine whose users you trust.
 ## Settings experiments can vary
 
 Each is offered only if the machine has it. Root settings go through
-`wattif-helper`, the others run as you; without the helper's sudo rule the
-root ones are left out (the panel and `wattif experiment list` say so).
+`drainhound-helper`, the others run as you; without the helper's sudo rule the
+root ones are left out (the panel and `drainhound experiment list` say so).
 
-wattif never leaves a setting other than it found it. "As found" below is the
-value a setting had in this boot before wattif first changed it, on that power
+drainhound never leaves a setting other than it found it. "As found" below is the
+value a setting had in this boot before drainhound first changed it, on that power
 source (saved then); `disable`, `restore --stock` and the watchdog put back only
-what wattif changed in this boot. In parentheses: the guess used where nothing
+what drainhound changed in this boot. In parentheses: the guess used where nothing
 was ever seen.
 
 | Setting | Needs | Root | Stock (restored after experiments) |
@@ -49,7 +49,7 @@ was ever seen.
 | `gpu-dpm`: GPU and memory clocks | amdgpu | yes | as found (`auto`) |
 | `wifi-ps`: Wi-Fi power saving | a wireless interface and `iw` | yes | `[stock] wifi_ps`, else as found (on) |
 | `refresh`: refresh rate | niri or sway, and an internal panel with more than one rate | no | the mode found (the highest) |
-| `throttle-apps` | the `wattif-throttle` unit, and niri or sway (what it follows) | no | as found (off) |
+| `throttle-apps` | the `drainhound-throttle` unit, and niri or sway (what it follows) | no | as found (off) |
 | `freeze`, `freeze-apps` | systemd app scopes (manual runs only) | no | running |
 
 ASPM, APST and GPU clocks are risky by default (`[experiments] risky`): some
@@ -86,4 +86,4 @@ and shutdown messages.
   systemd scopes (niri does this, and so do launchers like `app2unit` and
   `uwsm app`). With any other compositor they do nothing.
 - **Bars**: anything that runs a command and reads JSON or text, from
-  `wattif waybar` or [data.md](data.md)'s files.
+  `drainhound waybar` or [data.md](data.md)'s files.

@@ -1,6 +1,6 @@
-// wattif's Waybar modules. Add the names to one of your bar's module lists,
-// e.g. "modules-right": [ "custom/wattif", "custom/vote-up", "custom/vote-down", ... ].
-// Run `wattif eta` as a service (`wattif units --install` does) and these
+// drainhound's Waybar modules. Add the names to one of your bar's module lists,
+// e.g. "modules-right": [ "custom/drainhound", "custom/vote-up", "custom/vote-down", ... ].
+// Run `drainhound eta` as a service (`drainhound units --install` does) and these
 // only read what it publishes, so they start instantly and cost nothing.
 {
   // Time left with ± half its 80% interval and the live draw (`1:17 ±0:15 14.2W`);
@@ -9,30 +9,30 @@
   // using the battery. Classes: discharging, charging, plugged, weak-charger
   // (plugged in but still discharging), low, critical, fill0-fill100 (remaining
   // energy), no-battery, unknown.
-  "custom/wattif": {
-    "exec": "wattif waybar battery",
+  "custom/drainhound": {
+    "exec": "drainhound waybar battery",
     "return-type": "json",
     "restart-interval": 10,
-    "on-click": "wattif panel",
-    "on-click-right": "wattif panel experiments"
+    "on-click": "drainhound panel",
+    "on-click-right": "drainhound panel experiments"
   },
   // 👍 something is especially good right now; 👎 worse than it should be
   // (automatic experiments restore your settings at once and rest 10 minutes).
   // Each vote refreshes them on SIGRTMIN+12 (config [waybar] signal).
   "custom/vote-up": {
-    "exec": "wattif waybar up",
+    "exec": "drainhound waybar up",
     "return-type": "json",
     "interval": 15,
     "signal": 12,
-    "on-click": "wattif vote up",
-    "on-click-right": "wattif panel experiments"
+    "on-click": "drainhound vote up",
+    "on-click-right": "drainhound panel experiments"
   },
   "custom/vote-down": {
-    "exec": "wattif waybar down",
+    "exec": "drainhound waybar down",
     "return-type": "json",
     "interval": 15,
     "signal": 12,
-    "on-click": "wattif vote down",
-    "on-click-right": "wattif panel experiments"
+    "on-click": "drainhound vote down",
+    "on-click-right": "drainhound panel experiments"
   }
 }

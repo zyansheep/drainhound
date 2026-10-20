@@ -15,12 +15,12 @@ from pathlib import Path
 from . import config
 
 TABS = ('timeline', 'experiments')
-STALE = 15  # s: eta.json older than this means wattif eta isn't running.
+STALE = 15  # s: eta.json older than this means drainhound eta isn't running.
 SNAPSHOT_STALE = 30  # s: the collector's snapshot.json (written every 2 s) older than this is left out.
 
 
 def panel(argv):
-    """`wattif panel [TAB]` toggles the panel (or shows TAB); `serve` runs it
+    """`drainhound panel [TAB]` toggles the panel (or shows TAB); `serve` runs it
     (the unit's ExecStart); `render DIR [6 h|Day|Week]` draws its charts to PNGs."""
     if argv[:1] in (['serve'], ['render']):
         if argv[:1] == ['serve']:
@@ -28,7 +28,7 @@ def panel(argv):
         from . import panel as resident
         return resident.main(argv)
     if len(argv) > 1 or (argv and argv[0] not in TABS):
-        print(f"usage: wattif panel [{'|'.join(TABS)}] | serve | render DIR [6 h|Day|Week]", file=sys.stderr)
+        print(f"usage: drainhound panel [{'|'.join(TABS)}] | serve | render DIR [6 h|Day|Week]", file=sys.stderr)
         return 2
     action, parameter = ('show', [argv[0]]) if argv else ('toggle', [])
     if not running() and not start():
@@ -38,27 +38,27 @@ def panel(argv):
         if activate(action, parameter):
             return 0
         time.sleep(0.1)
-    print('wattif: the panel did not answer on D-Bus', file=sys.stderr)
+    print('drainhound: the panel did not answer on D-Bus', file=sys.stderr)
     return 1
 
 
 def layer_shell_library():
-    """gtk4-layer-shell's library: WATTIF_LAYER_SHELL_LIB (packages set it), else
+    """gtk4-layer-shell's library: DRAINHOUND_LAYER_SHELL_LIB (packages set it), else
     wherever the system keeps it."""
     import ctypes.util
-    return os.environ.get('WATTIF_LAYER_SHELL_LIB') or ctypes.util.find_library('gtk4-layer-shell')
+    return os.environ.get('DRAINHOUND_LAYER_SHELL_LIB') or ctypes.util.find_library('gtk4-layer-shell')
 
 
 def preload(argv):
     """Run again with gtk4-layer-shell preloaded, unless it is: it must load before
     libwayland-client, so before GTK, which a running Python can't arrange (the
-    library's own documentation says to LD_PRELOAD it). WATTIF_PRELOADED keeps
+    library's own documentation says to LD_PRELOAD it). DRAINHOUND_PRELOADED keeps
     the LD_PRELOAD from before, for the panel to give its children."""
     library = layer_shell_library()
     loaded = os.environ.get('LD_PRELOAD', '')
-    if not library or 'WATTIF_PRELOADED' in os.environ or library in loaded.replace(' ', ':').split(':'):
+    if not library or 'DRAINHOUND_PRELOADED' in os.environ or library in loaded.replace(' ', ':').split(':'):
         return
-    os.environ['WATTIF_PRELOADED'] = loaded
+    os.environ['DRAINHOUND_PRELOADED'] = loaded
     os.environ['LD_PRELOAD'] = ':'.join(filter(None, (library, loaded)))
     command = config.self_command()
     os.execv(command[0], [*command, *argv])
@@ -99,14 +99,14 @@ def activate(action, parameter):
 
 
 def waybar(argv):
-    """Waybar custom modules: `battery` follows wattif eta's label (eta.json;
-    run `wattif eta` as its own service), `up`/`down` are the vote buttons."""
+    """Waybar custom modules: `battery` follows drainhound eta's label (eta.json;
+    run `drainhound eta` as its own service), `up`/`down` are the vote buttons."""
     if argv in (['up'], ['down']):
         from . import qol
         print(json.dumps(qol.waybar(argv[0])), flush=True)
         return 0
     if argv != ['battery']:
-        print('usage: wattif waybar battery|up|down', file=sys.stderr)
+        print('usage: drainhound waybar battery|up|down', file=sys.stderr)
         return 2
     last = None
     while True:
@@ -118,7 +118,7 @@ def waybar(argv):
 
 
 def battery_label(path=None, now=None, snapshot=None):
-    """The label wattif eta last published, or '--' while it is stale. With
+    """The label drainhound eta last published, or '--' while it is stale. With
     [waybar] tooltip, a label without a tooltip of its own gets one (tooltip()),
     for bars that show nothing else on hover."""
     now = time.time() if now is None else now
@@ -133,7 +133,7 @@ def battery_label(path=None, now=None, snapshot=None):
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         pass
     stale = {'text': '--', 'class': ['unknown']}
-    return dict(stale, tooltip="No estimate: wattif eta isn't running") if wanted else stale
+    return dict(stale, tooltip="No estimate: drainhound eta isn't running") if wanted else stale
 
 
 def read_snapshot(path=None, now=None):

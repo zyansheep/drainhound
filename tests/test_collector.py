@@ -8,8 +8,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from wattif import collector, config
-from wattif.collector import History, processes, temperatures, process_label, process_identity, browser_labels, TICKS, PAGE
+from drainhound import collector, config
+from drainhound.collector import History, processes, temperatures, process_label, process_identity, browser_labels, TICKS, PAGE
 from tests import test_power
 
 
@@ -186,18 +186,18 @@ class MonitorTests(unittest.TestCase):
 
     def test_a_suspend_during_the_process_scan_discards_the_sample(self):
         with tempfile.TemporaryDirectory() as tmp:
-            directory = Path(tmp) / 'wattif'  # Browser labels come from its sibling floorp-monitor.
+            directory = Path(tmp) / 'drainhound'  # Browser labels come from its sibling floorp-monitor.
             directory.mkdir()
             power = mock.Mock()
             power.update.return_value = {'rows': []}
             began = time.clock_gettime(time.CLOCK_BOOTTIME)
-            with mock.patch('wattif.collector.clocks', return_value=(began + 3600, time.time())):
+            with mock.patch('drainhound.collector.clocks', return_value=(began + 3600, time.time())):
                 self.assertIsNone(collector.collect(power, History(), directory, began, scan=lambda: {}))
             power.update.assert_not_called()  # The next sample reports the gap instead.
             self.assertFalse((directory / 'snapshot.json').exists())
             boot, wall = began + 0.3, time.time()
             self.addCleanup(os.umask, os.umask(0o022))
-            with mock.patch('wattif.collector.clocks', return_value=(boot, wall)):
+            with mock.patch('drainhound.collector.clocks', return_value=(boot, wall)):
                 state = collector.collect(power, History(), directory, began, scan=lambda: {}, sensors=lambda: [])
             power.update.assert_called_once_with(boot, wall, {})  # Clocks read after the scan, together.
             self.assertEqual(json.loads((directory / 'snapshot.json').read_text())['battery'], state['battery'])
@@ -234,7 +234,7 @@ class PortableNamesTests(unittest.TestCase):
             power = mock.Mock()
             power.update.return_value = {'rows': []}
             began = time.clock_gettime(time.CLOCK_BOOTTIME)
-            with mock.patch('wattif.collector.clocks', return_value=(began + 0.1, time.time())):
+            with mock.patch('drainhound.collector.clocks', return_value=(began + 0.1, time.time())):
                 collector.collect(power, History(), Path(tmp), began, scan=lambda: {}, sensors=lambda: [],
                                   browsers=lambda: asked.append(1))
             self.assertEqual(asked, [1])

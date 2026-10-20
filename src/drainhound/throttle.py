@@ -28,10 +28,10 @@ scope has that name (window_apps). While the focused window is no app's that
 this can tell (a game Steam started, under niri), it could be any app's, so
 none is capped.
 
-    wattif throttle [--quota N] [--keep PATTERN ...]
-    wattif throttle --release      (lift every quota; the unit's ExecStopPost)
+    drainhound throttle [--quota N] [--keep PATTERN ...]
+    drainhound throttle --release      (lift every quota; the unit's ExecStopPost)
 
-wattif-throttle.service runs it; wattif experiment's throttle-apps setting starts
+drainhound-throttle.service runs it; drainhound experiment's throttle-apps setting starts
 and stops that unit. It follows focus from the compositor's event stream
 (compositor.py: niri or sway; elsewhere it knows no windows, so it caps
 nothing) and streams from `pw-dump --monitor`, so between changes it does
@@ -109,14 +109,14 @@ def string_list(value, setting):
     if isinstance(value, str):
         value = [value]
     if not isinstance(value, (list, tuple)):
-        raise SystemExit(f'wattif: {setting} must be a list of names, like ["steam"], not {value!r}')
+        raise SystemExit(f'drainhound: {setting} must be a list of names, like ["steam"], not {value!r}')
     return [str(item) for item in value if str(item).strip()]
 
 
 class Session:
     """What the desktop is doing, from the compositor's and PipeWire's event
     streams: which app has focus, which have windows, which play or record
-    media. wattif throttle and wattif freeze (freeze.py) act on it. `desktop`
+    media. drainhound throttle and drainhound freeze (freeze.py) act on it. `desktop`
     is a compositor backend (main() picks it with compositor.detect(); niri's
     by default)."""
 
@@ -388,7 +388,7 @@ class Stream:
             os.set_blocking(self.process.stdout.fileno(), False)
             self.selector.register(self.process.stdout, selectors.EVENT_READ, self)
         except OSError as error:
-            print(f'wattif throttle: {self.command[0]}: {error}', file=sys.stderr)
+            print(f'drainhound throttle: {self.command[0]}: {error}', file=sys.stderr)
             self.process, self.retry = None, time.monotonic() + RESCAN
 
     def read(self):
@@ -477,7 +477,7 @@ def keep_patterns(extra=None):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog='wattif throttle', description=__doc__.split('\n\n')[0])
+    parser = argparse.ArgumentParser(prog='drainhound throttle', description=__doc__.split('\n\n')[0])
     parser.add_argument('--quota', type=int, default=QUOTA,
                         help=f'%% of one core per background app, all its scopes (default: [throttle] quota, {QUOTA})')
     parser.add_argument('--keep', action='append',
@@ -492,7 +492,7 @@ def main(argv=None):
     exit_on_signals()
     desktop = compositor.detect()
     if desktop.command is None:
-        print(f"wattif throttle: {compositor.unsupported()} isn't supported (niri and sway are): no windows are "
+        print(f"drainhound throttle: {compositor.unsupported()} isn't supported (niri and sway are): no windows are "
               'known, so nothing is capped', file=sys.stderr)
     run(Throttle(quota=max(1, min(int(args.quota), 100)), keep=keep_patterns(args.keep), desktop=desktop))
 

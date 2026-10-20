@@ -1,6 +1,6 @@
-"""wattif's command line: one entry point, one subcommand per part.
+"""drainhound's command line: one entry point, one subcommand per part.
 
-Each part is imported only when its command runs, so `wattif vote up` or the
+Each part is imported only when its command runs, so `drainhound vote up` or the
 Waybar reader start in a few milliseconds without loading numpy or GTK.
 """
 import importlib
@@ -11,9 +11,9 @@ import sys
 
 from . import __version__, config
 
-USAGE = f"""usage: wattif <command> [args]
+USAGE = f"""usage: drainhound <command> [args]
 
-Services (normally started by systemd; see `wattif units`):
+Services (normally started by systemd; see `drainhound units`):
   collect [import]       sample power every 2 s and log a record every 10 s
   eta [--quiet]          time left, model training, low-battery warnings
   throttle               cap unfocused apps' CPU on battery
@@ -31,7 +31,7 @@ Setup and checks:
   config                 the effective configuration
   version
 
-wattif {__version__}. Files: {config.STATE} (data), {config.RUNTIME} (live state),
+drainhound {__version__}. Files: {config.STATE} (data), {config.RUNTIME} (live state),
 {config.USER_CONFIG} (settings)."""
 
 
@@ -41,14 +41,14 @@ def module(name):
 
 def remember_self():
     """Children (the panel's buttons, the experiment runner's units) run this same
-    wattif: the entry point that started it, or `python -m wattif`."""
-    if os.environ.get('WATTIF_SELF'):
+    drainhound: the entry point that started it, or `python -m drainhound`."""
+    if os.environ.get('DRAINHOUND_SELF'):
         return
     first = sys.argv[0]
     if first.endswith('__main__.py'):
-        os.environ['WATTIF_SELF'] = shlex.join([sys.executable, '-m', config.NAME])
+        os.environ['DRAINHOUND_SELF'] = shlex.join([sys.executable, '-m', config.NAME])
     elif os.path.isfile(first) and os.access(first, os.X_OK):
-        os.environ['WATTIF_SELF'] = os.path.abspath(first)
+        os.environ['DRAINHOUND_SELF'] = os.path.abspath(first)
 
 
 def main(argv=None):
@@ -82,7 +82,7 @@ def main(argv=None):
         print(json.dumps({'files': [str(p) for p in config.files()], **config.SETTINGS}, indent=2))
         return 0
     if command in ('version', '--version'):
-        print(f'wattif {__version__}')
+        print(f'drainhound {__version__}')
         return 0
-    print(f'wattif: unknown command {command!r}\n\n{USAGE}', file=sys.stderr)
+    print(f'drainhound: unknown command {command!r}\n\n{USAGE}', file=sys.stderr)
     return 2

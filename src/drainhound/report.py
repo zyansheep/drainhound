@@ -12,7 +12,7 @@ then:
 * per-minute attribution into stable groups for the stacked timeline;
 * what-if runtime gains: model-based (marginal effect of removing an app's
   activity or dimming) with bootstrap intervals over whole days, and
-  experiment-based (paired A/B blocks from wattif experiment; every setting
+  experiment-based (paired A/B blocks from drainhound experiment; every setting
   together in lever_effects, and the best combination, best_config);
 * sleep drain per suspend from the log's gap events.
 """
@@ -63,7 +63,7 @@ DEFAULT_GROUPS = [
                           'xwayland', 'xorg', 'waybar', 'polybar', 'notifications', 'mako', 'dunst', 'swaync',
                           'fcitx', 'ibus', 'swayidle', 'hypridle', 'swaylock', 'hyprlock', 'swaybg', 'swww', 'xdg-',
                           'wl-', 'systemd', 'dbus', 'networkmanager', 'iwd', 'wpa_supplicant', 'bluetoothd',
-                          'upowerd', 'power-profiles', 'polkit', 'gvfs', 'gsd-', 'at-spi', 'wattif')),
+                          'upowerd', 'power-profiles', 'polkit', 'gvfs', 'gsd-', 'at-spi', 'drainhound')),
 ]
 
 
@@ -546,7 +546,7 @@ def full_energy(minutes, sys=Path('/sys'), reserve_wh=0.0):
     """Usable Wh of a full charge: energy_full, or charge_full × mean discharge
     voltage (without one logged, the pack's nominal voltage), of every battery
     (batteries.read), less `reserve_wh`, the energy below the battery's cutoff
-    (wattif eta's eta.reserve_wh(): about 0.8 Wh, under 2% of a charge, on a
+    (drainhound eta's eta.reserve_wh(): about 0.8 Wh, under 2% of a charge, on a
     Framework 13). None without a full charge to go by."""
     reading = batteries.read(sys / 'class/power_supply')
     if reading is None or not reading['full']:
@@ -639,7 +639,7 @@ DAY_GROUPS = 7  # Days of rows before what_if resamples whole days.
 def what_if(rows, energy, replicates=200, block=60, seed=0, model=None, train_rows=None, days=DAY_GROUPS):
     """Point estimate and 90% interval of runtime gain (minutes) per intervention.
 
-    `model` is the shared trained model (wattif eta's models.json), evaluated
+    `model` is the shared trained model (drainhound eta's models.json), evaluated
     on this period's `rows`; without one, the models are fitted on
     `train_rows`. The period's draw is at your settings (typical_power). The
     interval refits both models on bootstrap resamples of the training rows
@@ -860,7 +860,7 @@ SETTING = {'aspm': 'aspm', 'apst': 'apst', 'wifi-ps': 'wifi_ps', 'abm': 'abm', '
 
 
 def saving(name, value, top_hz=None):
-    """Is `value` — as a minute logs it, or as wattif experiment sets it — the
+    """Is `value` — as a minute logs it, or as drainhound experiment sets it — the
     setting's power-saving state?"""
     if value is None:
         return False
@@ -895,7 +895,7 @@ def saving(name, value, top_hz=None):
 CPU_LEVERS = {'boost', 'profile', 'cpu-cap', 'gpu-dpm', 'throttle-apps'}
 COVARIATES = ('load', 'gpu', 'video', 'bl', 'kbd', 'wifi', 'disk', 'usb', 'audio')
 PRIOR_SD = {'main': 5.0, 'pair': 1.0}  # W: interactions are shrunk (mildly) toward zero.
-BLOCK_MINUTES = 4  # wattif experiment's blocks (experiment.BLOCK); the first minute is washout.
+BLOCK_MINUTES = 4  # drainhound experiment's blocks (experiment.BLOCK); the first minute is washout.
 
 
 def lever_states(settings, top, chosen=None):
@@ -964,7 +964,7 @@ OWN_MINUTES = 600
 
 
 def battery_stock():
-    """The AC_MANAGED settings' saving states on battery as wattif experiment puts
+    """The AC_MANAGED settings' saving states on battery as drainhound experiment puts
     them back there (experiment.battery_stock: config [stock], or as found before;
     by default power-saver, as common udev rules set). Those it can't say, the
     minutes do."""
@@ -1670,7 +1670,7 @@ def recommendations(levers, quality, energy=None, power=None, exclude=()):
     leaving `exclude` (e.g. experiment.RISKY, or settings outside the pool) as
     they are: 'battery' the lowest draw, 'comfort' the likeliest 👍 (to a
     percentage point; then Battery's changes; Battery's until a 👍 exists to
-    learn from). Each: the combination, `apply` (wattif experiment apply
+    learn from). Each: the combination, `apply` (drainhound experiment apply
     arguments for all of it, as saving|normal states: apply sets those not in
     their state then and leaves the rest as they are, so an 'already set' one
     changes nothing), what it changes from your settings (`change`,

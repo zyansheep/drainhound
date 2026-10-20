@@ -35,7 +35,7 @@ gives the second it cuts out (backtested on five deaths, leaving each out:
 within ~10 s on average, 35 s at worst, from two minutes before). Below
 LOW_BATTERY a black box fsyncs the last reading every 2 s (lastgasp.json), so
 the next boot learns exactly when it died. With [battery] poweroff = true, once
-a death has taught the cutoff, wattif eta powers the laptop off cleanly once the
+a death has taught the cutoff, drainhound eta powers the laptop off cleanly once the
 early edge of the cutoff is POWEROFF_SECONDS away (and counts down to that),
 recording the power-off so it isn't taken for a death — unless the battery cut
 the shutdown short; without it, it counts down to the cutoff and warns. Its
@@ -50,16 +50,16 @@ battery over the forecast average battery draw. Time to the charge limit (for th
 from past charging (constant current, then taper), scaled by the current rate;
 its interval comes from how far 10-minute rates stray from that curve.
 
-Training. `wattif eta` is the single trainer: at start and every 15 minutes it
+Training. `drainhound eta` is the single trainer: at start and every 15 minutes it
 fits these models and the battery-use attribution models (report.fit) on the
 last 30 days and writes them all to the power log's models.json, which the
 collector's menu breakdown and the battery panel read. It trains in a
 background thread, so the black box, warnings and power-off never wait for it,
 and not at all below LOW_BATTERY.
 
-`wattif eta` prints one Waybar JSON line every 2 s (time, ± half the 80%
+`drainhound eta` prints one Waybar JSON line every 2 s (time, ± half the 80%
 interval, then watts) and mirrors the estimate to
-$XDG_RUNTIME_DIR/wattif/eta.json for the battery panel.
+$XDG_RUNTIME_DIR/drainhound/eta.json for the battery panel.
 """
 import bisect
 import collections
@@ -269,7 +269,7 @@ def fit_scale(rows, params, step=5, shrink=50):
     followed in the window, or None with under 50 outcomes.
 
     From every 5th minute of each run on battery (after its first 10): the forecast
-    wattif eta would have made then (the level from the LEVEL_MINUTES before, the
+    drainhound eta would have made then (the level from the LEVEL_MINUTES before, the
     last 10 minutes as the recent draw) against the mean of the next battery minutes,
     across suspends and charging within a day, as a time to empty spans them. One
     time constant can't fit the two the draw has (ρ = 0.81 a minute on, 0.25 at 30):
@@ -523,7 +523,7 @@ def fit_cutoff(minutes, known=(), running=None, endings=None, unit='Ah', volts=N
     """The charge (Ah, or Wh: `unit`) at which the battery cuts out, its spread, and how many
     deaths say so: `known` deaths (deaths.json: black-box gasps, timed within
     2 s, and the ones remembered from records) and those the minutes show.
-    A boot wattif eta powered off itself (`poweroff`) didn't die, nor did one
+    A boot drainhound eta powered off itself (`poweroff`) didn't die, nor did one
     remembered with another ending (no `cut`). In `unit`: a battery that counts
     energy learns its cutoff in Wh, only from deaths in Wh (another unit's were
     another battery's); `volts` scale the Ah floors (ah_size)."""
@@ -569,7 +569,7 @@ def remember(entries, path=None):
                 pass  # Nothing (good) to keep: the .bak stays as it was.
             write_atomic(path, json.dumps(sorted(known.values(), key=lambda e: number(e.get('t')) or 0.0)[-100:]))
         except OSError as error:
-            print(f'wattif eta: {path}: {error}', file=sys.stderr)
+            print(f'drainhound eta: {path}: {error}', file=sys.stderr)
     return list(known.values())
 
 
@@ -584,7 +584,7 @@ def remember_deaths(minutes, running=None, path=None, endings=None):
 def judge(gasp, how, end):
     """What a last gasp was, given how its boot ended (`how`, None or 'unknown'
     if the journal can't say, and when its journal ends): a death entry,
-    wattif eta's finished power-off, or None (neither). See harvest_gasp."""
+    drainhound eta's finished power-off, or None (neither). See harvest_gasp."""
     charge, full = number(gasp.get('charge')), number(gasp.get('full')) or 0.0
     if charge is None:
         return None
@@ -607,7 +607,7 @@ def judge(gasp, how, end):
 
 def confirm(entries, endings):
     """Entries filed `unconfirmed` (the journal couldn't say then) that it can say
-    about now, settled: a death, wattif eta's power-off, or neither (kept, with
+    about now, settled: a death, drainhound eta's power-off, or neither (kept, with
     its ending, so it isn't asked again). The rest are left for later."""
     settled = []
     for e in entries:
@@ -630,8 +630,8 @@ def harvest_gasp(boot, gasp_path=None, deaths_path=None, endings=None):
 
     With the journal (`endings`): a 'cut' is a death within 2 s of the gasp's
     reading; a shutdown the battery cut short is one by the journal's last
-    entry (the gasp's rate extrapolated), even wattif eta's own power-off. A
-    crash, reboot, finished shutdown or death asleep is no death; wattif eta's
+    entry (the gasp's rate extrapolated), even drainhound eta's own power-off. A
+    crash, reboot, finished shutdown or death asleep is no death; drainhound eta's
     finished power-off is remembered as that. Without the journal, as before:
     a power-off is one, and a gasp within 120 s or 2.5% of empty is a death;
     when the journal is there but can't say yet, that is filed `unconfirmed`
@@ -646,7 +646,7 @@ def harvest_gasp(boot, gasp_path=None, deaths_path=None, endings=None):
     except (OSError, ValueError, TypeError, KeyError):
         return None
     if gasp.get('boot') == boot:
-        return None  # Still this boot's: wattif eta restarted.
+        return None  # Still this boot's: drainhound eta restarted.
     gasp_path.unlink(missing_ok=True)
     if not isinstance(gasp.get('boot'), str) or number(gasp['charge']) is None:
         return None  # Damaged: nothing to learn.
@@ -660,7 +660,7 @@ def harvest_gasp(boot, gasp_path=None, deaths_path=None, endings=None):
 
 
 def fit(minutes, known=None, previous=None, running=None, endings=None, unit=None, nominal=None):
-    """Every wattif eta model from `minutes`; `known` deaths default to deaths.json
+    """Every drainhound eta model from `minutes`; `known` deaths default to deaths.json
     (read only). With under MIN_ROWS battery minutes (a month on AC, a store
     migration underway) the draw models stay as `previous` had them. `unit` is
     the battery's ('Ah' or 'Wh'; by default the latest minutes'), `nominal` its
@@ -984,12 +984,12 @@ def unrecommended():
     try:
         experiment = importlib.import_module(f'{__package__}.experiment')  # Here: it imports eta (lazily) too.
     except Exception as error:  # noqa: BLE001
-        print(f'wattif eta: experiment.py: {error!r}; leaving the risky settings alone', file=sys.stderr)
+        print(f'drainhound eta: experiment.py: {error!r}; leaving the risky settings alone', file=sys.stderr)
         return RISKY
     try:
         return tuple(experiment.unrecommended())
     except Exception as error:  # noqa: BLE001
-        print(f'wattif eta: experiment.unrecommended: {error!r}; leaving the risky and quarantined settings alone',
+        print(f'drainhound eta: experiment.unrecommended: {error!r}; leaving the risky and quarantined settings alone',
               file=sys.stderr)
     exclude = set(getattr(experiment, 'RISKY', RISKY))
     try:
@@ -1028,7 +1028,7 @@ def reserve_wh(params=None, sys_root=Path('/sys')):
 
 def write_recommendations(minutes, events, path=None, params=None, exclude=None):
     """Each goal's best measured combination (report.recommendations) for the
-    battery menu and `wattif experiment goal --apply`: recommend.json. The draw
+    battery menu and `drainhound experiment goal --apply`: recommend.json. The draw
     it is figured at is the typical one at your settings (report.typical_power)
     by `params`' attribution, the models just trained (else models.json's,
     else fitted here); the energy a full charge delivers above the cutoff; and
@@ -1116,7 +1116,7 @@ class Live:
         """stderr once per kind of failure, not every 2 s."""
         if (what, str(error)) not in self.complaints:
             self.complaints.add((what, str(error)))
-            print(f'wattif eta: {what} failed: {error!r}', file=sys.stderr)
+            print(f'drainhound eta: {what} failed: {error!r}', file=sys.stderr)
 
     # Training, in the background.
 
@@ -1134,7 +1134,7 @@ class Live:
         another layout (mid-migration) or a failure tries again in RETRY s."""
         try:
             if not db_ready(self.db):
-                print('wattif eta: the power database is not at this layout yet; refitting in a minute',
+                print('drainhound eta: the power database is not at this layout yet; refitting in a minute',
                       file=sys.stderr)
                 self.next_fit = self.monotonic() + RETRY
                 return False
@@ -1146,14 +1146,14 @@ class Live:
                            endings=self.endings, unit=self.unit, nominal=self.nominal)
             save_models(params, self.models)
         except Exception as error:  # noqa: BLE001 - try again soon; the estimate goes on with the last models
-            print(f'wattif eta: refit failed: {error!r}', file=sys.stderr)
+            print(f'drainhound eta: refit failed: {error!r}', file=sys.stderr)
             self.next_fit = self.monotonic() + RETRY
             return False
         self.params, self.next_fit = params, self.monotonic() + REFIT
         try:
             write_recommendations(minutes, events, self.runtime / 'recommend.json', params=params)
         except Exception as error:  # noqa: BLE001 - the menu's lines must never stop the estimate
-            print(f'wattif eta: recommendations failed: {error}', file=sys.stderr)
+            print(f'drainhound eta: recommendations failed: {error}', file=sys.stderr)
         return True
 
     def seed(self, minutes):
@@ -1271,7 +1271,7 @@ class Live:
 
     def record_gasp(self, state, timing):
         """The black box: below LOW_BATTERY, the last reading on disk every 2 s, atomically
-        (marked once wattif eta has started powering the laptop off: that isn't a death)."""
+        (marked once drainhound eta has started powering the laptop off: that isn't a death)."""
         gasp = {'t': self.clock(), 'boot': self.boot, 'charge': state['charge'], 'full': state['full'],
                 'unit': state.get('unit', 'Ah'), 'volts': state['volts'], 'watts': state['watts'],
                 'rate': timing['rate'] if timing else None, 'seconds': timing['seconds'] if timing else None,
@@ -1288,7 +1288,7 @@ class Live:
         self.gasp.unlink(missing_ok=True)
 
     def warns_off(self):
-        """Whether wattif eta powers off before the cutoff: allowed ([battery]
+        """Whether drainhound eta powers off before the cutoff: allowed ([battery]
         poweroff), and once a death has taught it. Otherwise the countdown, the
         label and the warnings are the cutoff's, and say nothing of a power-off."""
         return self.allow_poweroff and self.params.get('deaths', 0) >= 1
@@ -1406,7 +1406,7 @@ class Live:
         due, self.due = self.due, None
         if state is None:
             self.low = False
-            if self.absent:  # A desktop: said plainly, and published so `wattif waybar battery` says it too.
+            if self.absent:  # A desktop: said plainly, and published so `drainhound waybar battery` says it too.
                 return {'text': 'no battery', 'class': ['no-battery'],
                         'detail': {'status': 'no battery', 'updated': now, 'text': 'no battery',
                                    'classes': ['no-battery']}}
@@ -1499,7 +1499,7 @@ class Live:
         return {'text': text, 'class': classes, 'percentage': fill, 'detail': result}
 
     def publish(self, detail, label=None):
-        """eta.json for the battery panel and `wattif waybar battery` (the label
+        """eta.json for the battery panel and `drainhound waybar battery` (the label
         as `waybar`). A failure (no runtime directory, a full disk) is
         reported, never raised: the label and the power-off go on."""
         try:
@@ -1544,10 +1544,10 @@ def power_off(timeout=10):
         done = subprocess.run(['systemctl', 'poweroff'], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                               text=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError) as error:
-        print(f'wattif eta: systemctl poweroff: {error}', file=sys.stderr)
+        print(f'drainhound eta: systemctl poweroff: {error}', file=sys.stderr)
         return False
     if done.returncode:
-        print(f'wattif eta: systemctl poweroff: {done.stderr.strip() or done.returncode}', file=sys.stderr)
+        print(f'drainhound eta: systemctl poweroff: {done.stderr.strip() or done.returncode}', file=sys.stderr)
     return done.returncode == 0
 
 
@@ -1558,7 +1558,7 @@ def battery_switch(key):
     value, default = config.get('battery', key), config.DEFAULTS['battery'][key]
     if isinstance(value, bool):
         return value
-    print(f'wattif eta: [battery] {key} = {value!r} is not true or false; taking {str(default).lower()}',
+    print(f'drainhound eta: [battery] {key} = {value!r} is not true or false; taking {str(default).lower()}',
           file=sys.stderr)
     return default
 
@@ -1568,12 +1568,12 @@ def send_notification(title, body):
         subprocess.Popen(['notify-send', '-u', 'critical', '-a', 'Battery', '-i', 'battery-empty', title, body],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError as error:
-        print(f'wattif eta: notify-send: {error}', file=sys.stderr)
+        print(f'drainhound eta: notify-send: {error}', file=sys.stderr)
 
 
 def single_instance(path):
     """An exclusive lock held while this process lives, or None if another
-    wattif eta holds it (two would both train and both power off)."""
+    drainhound eta holds it (two would both train and both power off)."""
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     handle = open(path, 'a+')
     try:
@@ -1585,17 +1585,17 @@ def single_instance(path):
 
 
 def main(argv=()):
-    """`wattif eta`: the estimator, printing Waybar's label every 2 s (not with
+    """`drainhound eta`: the estimator, printing Waybar's label every 2 s (not with
     --quiet, as a service). With one already running, it follows that one's
-    label instead (`wattif waybar battery`)."""
+    label instead (`drainhound waybar battery`)."""
     argv = list(argv)
     if argv not in ([], ['--quiet']):
-        sys.exit('usage: wattif eta [--quiet]')
+        sys.exit('usage: drainhound eta [--quiet]')
     quiet = argv == ['--quiet']
     lock = single_instance(RUNTIME / 'eta.lock')  # noqa: F841 (held until exit)
     if lock is None:
         if quiet:
-            sys.exit('wattif eta: another one is already running')
+            sys.exit('drainhound eta: another one is already running')
         from .launch import waybar
         return waybar(['battery'])
     endings = Endings()
@@ -1604,7 +1604,7 @@ def main(argv=()):
         last = harvest_gasp(live.boot, endings=endings)
         if last is not None and (last.get('cut') is not None or last.get('poweroff')):
             left = f"{last['charge']:.2f} Wh" if entry_unit(last) == 'Wh' else f"{last['charge'] * 1000:.0f} mAh"
-            print(f"wattif eta: the last boot {'powered off' if last.get('poweroff') else 'died'} at "
+            print(f"drainhound eta: the last boot {'powered off' if last.get('poweroff') else 'died'} at "
                   f"{left}, {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last['t']))}", file=sys.stderr)
     except Exception as error:  # noqa: BLE001
         live.complain('last gasp', error)
@@ -1616,7 +1616,7 @@ def main(argv=()):
     try:
         live.seed(report.load_range(time.time() - 1200, time.time() + 60, apps=False)[0])
     except Exception as error:  # noqa: BLE001
-        print(f'wattif eta: seeding from the log failed: {error!r}', file=sys.stderr)
+        print(f'drainhound eta: seeding from the log failed: {error!r}', file=sys.stderr)
     while True:
         try:
             output = live.estimate()

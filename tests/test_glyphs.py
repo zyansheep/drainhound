@@ -5,11 +5,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from wattif import config, eta
+from drainhound import config, eta
 from tests import test_eta  # Its helpers (not its tests: importing a TestCase here would run it again).
 
 try:  # The panel needs GTK 4's typelibs (GI_TYPELIB_PATH); the rest of the suite doesn't.
-    from wattif import panel
+    from drainhound import panel
 except (ImportError, ValueError):
     panel = None
 
