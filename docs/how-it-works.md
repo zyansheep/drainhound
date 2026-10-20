@@ -214,7 +214,13 @@ battery, every app with a window except the focused one gets a CPU quota
 (cgroup `cpu.max`, 10% of a core per app by default). The quota lifts the
 moment the app is focused and stays off for 2 minutes after it loses focus.
 An app is every systemd scope with its launch pid: Electron apps split into
-two. Never throttled:
+two. Scopes in nested slices (uwsm, app2unit and Flatpak use
+`app.slice/app-graphical.slice`) count too; a Flatpak app's sandboxes are one
+app, and so is a launcher's randomly named scope with the app of its name. A
+window belongs to the app its pid's scope says, or, when the pid says nothing
+(niri gives every X11 window xwayland-satellite's), to the app its app id
+names. While the focused window belongs to no app wattif can tell, nothing is
+capped. Never throttled:
 
 - apps playing or recording audio or video (a *running* PipeWire stream);
 - apps without a window (helpers, clipboard servers);
@@ -228,4 +234,6 @@ window on a workspace in view gets `cgroup.freeze`, so it uses no CPU at all.
 It thaws at once when you focus it, switch to its workspace, start it again or
 plug in, and every 10 minutes it thaws for 10 s so timers and sync catch up.
 An app that is busy (over a quarter of a core) or playing media keeps running.
-Without live compositor state, nothing is frozen.
+Without live compositor state, nothing is frozen; nor while a focused or
+visible window belongs to no app wattif can tell (under niri, a game Steam
+started), since it might be one of yours.

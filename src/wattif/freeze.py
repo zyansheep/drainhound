@@ -14,6 +14,9 @@ Nothing is frozen, and what was is thawed, unless both event streams are live:
 without PipeWire's nothing says which apps play media, and without the
 compositor's (none supported, or it died: compositor.py) which are in use, so
 every chosen app counts as in use until it is back, and AFTER starts again then.
+So does every chosen app while a window that is focused or in view is no app's
+that throttle.Session.window_apps can tell (a game Steam started, under niri:
+an X11 window whose app id names no app scope): it may be one of theirs.
 
 Android can freeze every cached app because its apps are written to be frozen;
 desktop apps aren't. So only the apps you list are frozen: not chat apps (their
@@ -24,10 +27,10 @@ server stops answering).
     wattif freeze --release      (thaw what it froze; the unit's ExecStopPost)
 
 PATTERN is matched (case-insensitively) anywhere in the app's scope names in
-app.slice, systemd's escapes undone, as wattif throttle's --keep is. Without
-one it freezes the configuration's [freeze] apps, and with none of those it
-idles; AFTER, EVERY and THAW are [freeze] after, every and thaw, and the flags
-override them all. It follows focus and media from the same event streams as
+app.slice (and the slices there), systemd's escapes undone, as wattif
+throttle's --keep is. Without one it freezes the configuration's [freeze]
+apps, and with none of those it idles; AFTER, EVERY and THAW are [freeze]
+after, every and thaw, and the flags override them all. It follows focus and media from the same event streams as
 wattif throttle (throttle.Session). RUNTIME/freeze.json says what it watches
 and what it has frozen.
 """
@@ -42,7 +45,7 @@ from pathlib import Path
 from . import compositor
 from . import config
 from . import throttle
-from .throttle import APPS, RUNTIME, Session, app_of, label, on_battery, read, unescape
+from .throttle import APPS, RUNTIME, Session, app_scopes, label, on_battery, read, string_list, unescape, unit
 
 AFTER = config.get('freeze', 'after') * 60  # s without focus before an app is frozen.
 EVERY = config.get('freeze', 'every') * 60  # s between thaws while frozen.
@@ -57,7 +60,7 @@ class Freezer(Session):
     def __init__(self, patterns, apps=APPS, battery=on_battery, proc=Path('/proc'), clock=time.monotonic,
                  after=AFTER, every=EVERY, thaw=THAW, busy=BUSY, desktop=None):
         super().__init__(apps, battery, proc, clock, desktop)
-        self.patterns = tuple(p.lower() for p in patterns)
+        self.patterns = tuple(p.lower() for p in string_list(patterns, 'patterns'))
         self.after, self.every, self.thaw, self.busy = after, every, thaw, busy
         # By app: last in use; when frozen (this time); when a periodic thaw began; (time, CPU µs) samples.
         self.used, self.frozen, self.thawed, self.usage, self.was_busy = {}, {}, {}, {}, {}
@@ -65,7 +68,7 @@ class Freezer(Session):
         self.mine = set()  # Scopes this froze (a wattif experiment freeze is left alone).
 
     def chosen(self, scope):
-        name = unescape(scope).lower()
+        name = unescape(unit(scope)).lower()
         return any(pattern in name for pattern in self.patterns)
 
     def cpu_seconds(self, scopes):
@@ -92,20 +95,26 @@ class Freezer(Session):
     def wanted(self):
         """{scope: freeze?} for the scopes of the apps chosen."""
         now, battery = self.clock(), self.battery()
-        scopes = sorted(p.name for p in self.apps.glob('app-*.scope'))
+        scopes = self.look()
         new = set(scopes) - self.scopes if self.scopes is not None else set()
         self.scopes = set(scopes)
         apps = collections.defaultdict(list)
         for scope in scopes:
-            apps[app_of(scope)].append(scope)
+            apps[self.app[scope]].append(scope)
         chosen = {app: own for app, own in apps.items() if any(self.chosen(s) for s in own)}
-        # Without the compositor's state nothing says what is in use: all of it might be.
-        in_use = self.playing() | self.shown() | {self.focused_app()} if self.desktop.known else set(chosen)
+        # Without the compositor's state nothing says what is in use: all of it might be. Nor while a window
+        # in view is no app's that can be told: it might be any chosen one's.
+        if self.desktop.known and not self.unknown_in_view():
+            in_use = self.playing() | self.shown() | self.focused_apps()
+        else:
+            in_use = set(chosen)
         focused = self.last_focused()
         values = {}
         for app, own in chosen.items():
             names = {label(s).lower() for s in own}
-            relaunched = any(app_of(s) != app and label(s).lower() in names for s in new)
+            # A new scope of its name and of another launch (its pid or random id) than the app's own.
+            launches = {instance(s) for s in own if s not in new}
+            relaunched = any(label(s).lower() in names and instance(s) not in launches for s in new)
             if app in in_use or relaunched:
                 self.used[app] = now
             elif app not in self.used:  # First seen: when it last had focus, if niri knows.
@@ -134,22 +143,29 @@ class Freezer(Session):
         return values
 
     def apply(self, values=None):
-        """Freeze and thaw what changed; the scopes now frozen by this."""
+        """Freeze and thaw what changed; the scopes now frozen by this. The
+        state file names a scope before it is frozen, and a scope is in
+        self.mine (what release() thaws) before it is, so a run killed or
+        stopped in between leaves nothing frozen that --release doesn't know."""
         values = self.wanted() if values is None else values
+        current = {scope: read(self.apps / scope / 'cgroup.freeze') for scope in values}
+        freezing = {scope for scope, freeze in values.items() if freeze and current[scope] == '0'}
+        if not freezing <= set((self.written or {}).get('scopes') or ()):
+            self.written = {**(self.written or {}), 'scopes': sorted(self.mine | freezing)}
+            throttle.write_state(self.written, self.state_path)
         for scope, freeze in values.items():
             path = self.apps / scope / 'cgroup.freeze'
-            current = read(path)
             try:
-                if freeze and current == '0':
-                    path.write_text('1')
+                if scope in freezing:
                     self.mine.add(scope)
+                    path.write_text('1')
                 elif not freeze and scope in self.mine:
-                    if current == '1':
+                    if current[scope] == '1':
                         path.write_text('0')
                     self.mine.discard(scope)
             except OSError:
                 self.mine.discard(scope)  # The app exited meanwhile.
-        self.mine &= {p.name for p in self.apps.glob('app-*.scope')}
+        self.mine &= set(app_scopes(self.apps))
         return sorted(self.mine)
 
     def release(self):
@@ -166,6 +182,11 @@ class Freezer(Session):
                 'watching': sorted({label(s).lower() for s in self.scopes or () if self.chosen(s)})}
 
 
+def instance(scope):
+    """Which launch a scope is of: its name's trailing pid or random id."""
+    return unit(scope).rpartition('-')[2]
+
+
 def release_left(state=STATE, apps=APPS):
     """Thaw the scopes a previous run's state file says it froze (after a crash)."""
     try:
@@ -173,6 +194,8 @@ def release_left(state=STATE, apps=APPS):
     except (OSError, ValueError, AttributeError):
         scopes = []
     for scope in scopes:
+        if not (isinstance(scope, str) and scope.endswith('.scope') and '..' not in scope.split('/')):
+            continue  # Not one this wrote.
         try:
             if read(apps / scope / 'cgroup.freeze') == '1':
                 (apps / scope / 'cgroup.freeze').write_text('0')
@@ -194,8 +217,8 @@ def main(argv=None):
         release_left()
         return
     release_left()  # A crashed run's freezes: start from thawed.
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    patterns = args.patterns or [str(p) for p in config.get('freeze', 'apps') or () if str(p)]
+    throttle.exit_on_signals()  # Each thaws what it froze on the way out.
+    patterns = string_list(args.patterns, 'PATTERN') or string_list(config.get('freeze', 'apps'), '[freeze] apps')
     if not patterns:
         # A unit that runs it unconfigured stays up, doing nothing, instead of failing and restarting.
         print('wattif freeze: no apps to freeze (name them, or set [freeze] apps in the configuration); idling',

@@ -1,4 +1,7 @@
 import json
+import os
+import socket
+import tempfile
 import unittest
 
 from wattif import compositor
@@ -139,7 +142,8 @@ class NiriTests(unittest.TestCase):
             niri.event(event)
         self.assertTrue(niri.known)
         self.assertEqual(niri.focused, 30)
-        self.assertEqual(niri.windows[30], {'pid': 667715, 'workspace': 4, 'focus': 75707.67139285})
+        self.assertEqual(niri.windows[30], {'pid': 667715, 'app_id': 'vesktop', 'workspace': 4,
+                                            'focus': 75707.67139285})
         self.assertEqual(niri.workspaces[7], {'output': 'HDMI-A-1', 'active': True})
         self.assertEqual([w for w in niri.windows if niri.shown(w)], [30])
         for event in NIRI_LATER[:3]:
@@ -232,6 +236,22 @@ class SwayTests(unittest.TestCase):
         sway.clear()
         self.assertEqual((sway.known, sway.windows, sway.workspaces), (False, {}, {}))
 
+    def test_x11_windows_have_their_class_as_app_id_even_without_a_pid(self):
+        # sway gives an X11 window its client's pid (_NET_WM_PID); one that doesn't say has pid 0, and still is a window.
+        tree = {'id': 1, 'type': 'root', 'nodes': [{'id': 3, 'type': 'output', 'nodes': [
+            {'id': 5, 'type': 'workspace', 'nodes': [
+                {'id': 11, 'type': 'con', 'name': None, 'nodes': [  # A split: no pid.
+                    {'id': 20, 'type': 'con', 'pid': 4100, 'app_id': None, 'shell': 'xwayland', 'focused': True,
+                     'window_properties': {'class': 'steam', 'instance': 'steamwebhelper'}},
+                    {'id': 21, 'type': 'con', 'pid': 0, 'app_id': None, 'shell': 'xwayland',
+                     'window_properties': {'class': 'Xterm'}},
+                    {'id': 22, 'type': 'con', 'pid': 9001, 'app_id': 'foot', 'shell': 'xdg_shell'}]}]}]}]}
+        self.state = (tree, [{'id': 5, 'output': 'eDP-1', 'visible': True}])
+        self.sway.started()
+        self.assertEqual({w: (k['pid'], k['app_id']) for w, k in self.sway.windows.items()},
+                         {20: (4100, 'steam'), 21: (0, 'Xterm'), 22: (9001, 'foot')})
+        self.assertEqual(self.sway.focused, 20)
+
     def test_events_pretty_printed_or_one_per_line(self):
         stream = Buffer(json.dumps(SWAY_EVENTS_1[0], indent=2) + '\n' + json.dumps(SWAY_EVENTS_2[0]) + '\n'
                         + json.dumps(SWAY_EVENTS_2[1], indent=2)[:30])
@@ -241,9 +261,23 @@ class SwayTests(unittest.TestCase):
 
 
 class DetectTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.sockets = []
+        for name in ('niri.sock', 'sway-ipc.sock'):  # Listening, as a compositor's are.
+            listener = socket.socket(socket.AF_UNIX)
+            listener.bind(os.path.join(self.tmp.name, name))
+            self.sockets.append(listener)
+        self.niri, self.sway = (os.path.join(self.tmp.name, name) for name in ('niri.sock', 'sway-ipc.sock'))
+
+    def tearDown(self):
+        for listener in self.sockets:
+            listener.close()
+        self.tmp.cleanup()
+
     def test_the_backend_follows_the_session(self):
-        self.assertIsInstance(compositor.detect({'NIRI_SOCKET': '/run/user/1000/niri.sock'}), Niri)
-        self.assertIsInstance(compositor.detect({'SWAYSOCK': '/run/user/1000/sway-ipc.sock'}), Sway)
+        self.assertIsInstance(compositor.detect({'NIRI_SOCKET': self.niri}), Niri)
+        self.assertIsInstance(compositor.detect({'SWAYSOCK': self.sway}), Sway)
         for environ in ({'HYPRLAND_INSTANCE_SIGNATURE': 'abc'}, {'XDG_CURRENT_DESKTOP': 'GNOME'}, {}):
             desktop = compositor.detect(environ)
             self.assertIs(type(desktop), Desktop)
@@ -253,6 +287,19 @@ class DetectTests(unittest.TestCase):
                                                               {'XDG_CURRENT_DESKTOP': 'GNOME'}, {})],
                          ['Hyprland', 'GNOME', 'this session'])
         self.assertEqual(Sway.command[:3], ('swaymsg', '-t', 'subscribe'))
+
+    def test_a_socket_that_is_gone_is_no_compositor(self):
+        # A user service can keep the environment of a session whose compositor has exited.
+        gone, plain = os.path.join(self.tmp.name, 'niri.old.sock'), os.path.join(self.tmp.name, 'file')
+        open(plain, 'w').close()
+        for stale in (gone, plain):
+            self.assertIs(type(compositor.detect({'NIRI_SOCKET': stale})), Desktop)
+            self.assertIs(type(compositor.detect({'SWAYSOCK': stale})), Desktop)
+        self.assertIsInstance(compositor.detect({'NIRI_SOCKET': gone, 'SWAYSOCK': self.sway}), Sway)  # The one there.
+        self.assertIsInstance(compositor.detect({'NIRI_SOCKET': self.niri, 'SWAYSOCK': self.sway}), Niri)
+        self.assertEqual(compositor.unsupported({'NIRI_SOCKET': gone, 'XDG_CURRENT_DESKTOP': 'niri'}),
+                         f'niri with a stale NIRI_SOCKET (no socket at {gone})')
+        self.assertEqual(compositor.unsupported({'NIRI_SOCKET': self.niri, 'XDG_CURRENT_DESKTOP': 'GNOME'}), 'GNOME')
 
 
 if __name__ == '__main__':

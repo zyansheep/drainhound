@@ -1,8 +1,12 @@
 import contextlib
 import io
 import json
+import os
+import signal
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -33,15 +37,17 @@ class FreezeTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def scope(self, scope, pid):
+    def scope(self, scope, pid, cgroup=None):
         (self.apps / scope).mkdir(parents=True)
         (self.apps / scope / 'cgroup.freeze').write_text('0\n')
         (self.apps / scope / 'cpu.stat').write_text('usage_usec 0\n')
         (self.proc / str(pid)).mkdir(parents=True)
-        (self.proc / str(pid) / 'cgroup').write_text(f'0::/user.slice/user-1000.slice/user@1000.service/app.slice/{scope}\n')
+        (self.proc / str(pid) / 'cgroup').write_text(
+            f'0::{cgroup or "/user.slice/user-1000.slice/user@1000.service/app.slice/" + scope}\n')
 
     def frozen(self):
-        return {p.parent.name for p in self.apps.glob('*/cgroup.freeze') if p.read_text().strip() == '1'}
+        return {p.parent.relative_to(self.apps).as_posix() for p in self.apps.rglob('cgroup.freeze')
+                if p.read_text().strip() == '1'}
 
     def wait(self, seconds, step=5):
         """Advance the clock, stepping the freezer as run() does every RESCAN."""
@@ -116,10 +122,20 @@ class FreezeTests(unittest.TestCase):
         self.assertEqual(self.frozen(), set())
 
     def test_starting_a_frozen_app_again_thaws_it(self):
+        self.freezer.step(True)
         self.wait(AFTER)
+        self.assertTrue(self.OBSIDIAN <= self.frozen())
         self.scope('app-niri-obsidian-4000.scope', 4000)  # `obsidian obsidian://open?…` from another app
         self.freezer.step(True)
         self.assertFalse(self.OBSIDIAN & self.frozen())
+        self.wait(AFTER)
+        self.assertTrue(self.OBSIDIAN <= self.frozen())
+        # Started by `uwsm app` or app2unit: a scope with a random id, which joins Obsidian's by its name, is a
+        # new launch too.
+        self.scope('app-graphical.slice/app-niri-obsidian-1a2b3c4d.scope', 4001)
+        self.freezer.step(True)
+        self.assertFalse(self.OBSIDIAN & self.frozen())
+        self.assertEqual(self.freezer.app['app-graphical.slice/app-niri-obsidian-1a2b3c4d.scope'], '2243')
 
     def test_only_its_own_freezes_are_undone(self):
         (self.apps / 'app-niri-floorp-2240.scope' / 'cgroup.freeze').write_text('1\n')  # A wattif experiment block
@@ -160,6 +176,140 @@ class FreezeTests(unittest.TestCase):
             self.now += AFTER
             self.assertEqual(blind.step(True)['frozen'], [])
         self.assertEqual(self.frozen(), set())
+
+    SATELLITE = '/user.slice/user-1000.slice/user@1000.service/session.slice/wayland-wm@niri.service'
+
+    def x11(self, *windows):
+        """X11 windows under niri: xwayland-satellite's pid (2649, outside every app scope), the X11 class as app id."""
+        if not (self.proc / '2649').exists():
+            (self.proc / '2649').mkdir()
+            (self.proc / '2649' / 'cgroup').write_text(f'0::{self.SATELLITE}\n')
+        for window in windows:
+            self.freezer.window_event({'WindowOpenedOrChanged': {'window': {'pid': 2649, **window}}})
+
+    def test_a_focused_x11_app_under_niri_is_in_use(self):
+        # The review's case: Steam focused and on screen, frozen 30 min on as niri said xwayland-satellite's pid.
+        self.freezer.window_event({'WindowClosed': {'id': 3}})
+        self.x11({'id': 7, 'app_id': 'steam', 'workspace_id': 1, 'is_focused': True,
+                  'focus_timestamp': {'secs': int(self.now - 1), 'nanos': 0}})
+        self.freezer.step(True)
+        self.wait(AFTER + 60)
+        self.assertEqual(self.frozen(), self.OBSIDIAN)
+        self.freezer.window_event({'WindowFocusChanged': {'id': 1}})
+        self.freezer.window_event({'WorkspaceActivated': {'id': 2, 'focused': True}})  # Steam's window out of view.
+        self.wait(AFTER - 10)
+        self.assertNotIn('app-niri-steam-3000.scope', self.frozen())
+        self.wait(20)
+        self.assertIn('app-niri-steam-3000.scope', self.frozen())
+
+    def test_steam_started_by_uwsm_is_seen_and_its_x11_window_is_its(self):
+        # As on a Framework 13 under niri and uwsm: Steam's scope nests, with a random id; its windows are X11.
+        steam = 'app-graphical.slice/app-niri-steam-140a4d35.scope'
+        self.scope(steam, 4100)
+        self.freezer.window_event({'WindowClosed': {'id': 3}})
+        self.x11({'id': 7, 'app_id': 'steam', 'workspace_id': 1, 'is_focused': True})
+        self.freezer.step(True)
+        self.assertIn('steam', self.freezer.step(True)['watching'])
+        self.wait(AFTER + 60)
+        self.assertNotIn(steam, self.frozen())  # Focused.
+        self.freezer.window_event({'WindowFocusChanged': {'id': 1}})
+        self.freezer.window_event({'WorkspaceActivated': {'id': 2, 'focused': True}})
+        self.wait(AFTER + 5)
+        self.assertIn(steam, self.frozen())
+
+    def test_while_a_window_in_view_is_no_known_apps_nothing_is_frozen(self):
+        # A game Steam started (its class names no scope): it may be any chosen app's, so all are in use.
+        self.x11({'id': 8, 'app_id': 'steam_app_1145360', 'workspace_id': 1, 'is_focused': True})
+        self.wait(AFTER + 60)
+        self.assertEqual(self.frozen(), set())
+        self.freezer.window_event({'WindowFocusChanged': {'id': 1}})  # Not focused, still shown: the same.
+        self.wait(60)
+        self.assertEqual(self.frozen(), set())
+        self.freezer.window_event({'WindowClosed': {'id': 8}})  # The game ends: AFTER from then.
+        self.wait(AFTER - 10)
+        self.assertEqual(self.frozen(), set())
+        self.wait(20)
+        self.assertEqual(self.frozen(), self.OBSIDIAN | {'app-niri-steam-3000.scope'})
+        self.x11({'id': 8, 'app_id': 'steam_app_1145360', 'workspace_id': 2, 'is_focused': False})
+        self.freezer.step(True)  # Out of view, it says nothing.
+        self.assertEqual(self.frozen(), self.OBSIDIAN | {'app-niri-steam-3000.scope'})
+
+    def test_apps_in_nested_slices_are_frozen_with_all_their_scopes(self):
+        # A Flatpak Vesktop's two sandboxes (its zygote has one of its own), as uwsm/app2unit/Flatpak nest them.
+        nested = {'app-graphical.slice/app-flatpak-dev.vencord.Vesktop-464058271.scope',
+                  'app-graphical.slice/app-flatpak-dev.vencord.Vesktop-900100968.scope'}
+        for scope, pid in zip(sorted(nested), (667715, 667740)):
+            self.scope(scope, pid)
+        self.freezer.patterns = ('vesktop',)
+        self.freezer.window_event({'WindowOpenedOrChanged': {'window': {
+            'id': 30, 'pid': 667715, 'workspace_id': 1, 'is_focused': True}}})
+        self.wait(AFTER + 60)
+        self.assertEqual(self.frozen(), set())  # Focused: neither sandbox freezes.
+        self.freezer.window_event({'WindowFocusChanged': {'id': 1}})
+        self.freezer.window_event({'WindowOpenedOrChanged': {'window': {
+            'id': 30, 'pid': 667715, 'workspace_id': 2, 'is_focused': False}}})
+        self.wait(AFTER + 5)
+        self.assertEqual(self.frozen(), nested)
+        state = self.freezer.state_path
+        self.assertEqual(json.loads(state.read_text())['scopes'], sorted(nested))
+        freeze.release_left(state, self.apps)  # After a crash.
+        self.assertEqual(self.frozen(), set())
+
+    def test_the_state_file_names_a_scope_before_it_is_frozen(self):
+        self.freezer.state_path = self.apps.parent / 'freeze.json'
+        listed = []
+        write = Path.write_text
+
+        def watched(path, text, *args, **kwargs):
+            if path.name == 'cgroup.freeze' and text == '1':
+                listed.append(path.parent.name in json.loads(self.freezer.state_path.read_text())['scopes'])
+            return write(path, text, *args, **kwargs)
+        with mock.patch.object(Path, 'write_text', watched):
+            self.wait(AFTER + 5)
+        self.assertEqual(listed, [True] * 3)
+        self.assertEqual(self.frozen(), self.OBSIDIAN | {'app-niri-steam-3000.scope'})
+        freeze.release_left(self.freezer.state_path, self.apps)
+        self.assertEqual(self.frozen(), set())
+
+    def test_a_signal_just_after_a_freeze_still_thaws_it(self):
+        # sys.exit from the SIGTERM/SIGHUP handler can come between writing cgroup.freeze and noting it.
+        write = Path.write_text
+
+        def interrupted(path, text, *args, **kwargs):
+            done = write(path, text, *args, **kwargs)
+            if path.name == 'cgroup.freeze' and text == '1':
+                raise SystemExit(0)
+            return done
+        self.freezer.step(True)
+        self.now += AFTER
+        with mock.patch.object(Path, 'write_text', interrupted), self.assertRaises(SystemExit):
+            self.freezer.step(True)
+        self.assertEqual(len(self.frozen()), 1)
+        self.freezer.release()  # What run()'s finally does.
+        self.assertEqual(self.frozen(), set())
+
+    def test_a_lone_string_is_one_app_not_its_letters(self):
+        self.scope('app-niri-fcitx5-2259.scope', 2259)
+        with mock.patch.object(throttle, 'run') as run, mock.patch.object(freeze.signal, 'signal'), \
+                mock.patch.object(freeze, 'release_left'), \
+                mock.patch.object(freeze.compositor, 'detect', return_value=compositor.Niri()), \
+                mock.patch.dict(config.SETTINGS['freeze'], {'apps': 'steam'}):
+            freeze.main([])
+            self.assertEqual(run.call_args.args[0].patterns, ('steam',))  # Not s, t, e, a, m: every scope.
+        self.assertFalse(Freezer('steam', self.apps).chosen('app-niri-fcitx5-2259.scope'))
+        with mock.patch.object(freeze.signal, 'signal'), mock.patch.object(freeze, 'release_left'), \
+                mock.patch.dict(config.SETTINGS['freeze'], {'apps': {'steam': True}}), \
+                self.assertRaises(SystemExit) as refused:
+            freeze.main([])
+        self.assertIn('[freeze] apps must be a list', str(refused.exception))
+
+    def test_sighup_is_handled_as_sigterm_is(self):
+        with mock.patch.object(throttle, 'run'), mock.patch.object(freeze.signal, 'signal') as handle, \
+                mock.patch.object(freeze, 'release_left'), \
+                mock.patch.object(freeze.compositor, 'detect', return_value=compositor.Niri()):
+            freeze.main(['steam'])
+        handled = {call.args[0] for call in handle.call_args_list}
+        self.assertLessEqual({signal.SIGTERM, signal.SIGHUP}, handled)
 
     def test_defaults_come_from_the_configuration_and_flags_override_them(self):
         self.assertEqual((AFTER, EVERY, THAW), (config.DEFAULTS['freeze']['after'] * 60,
@@ -229,6 +379,52 @@ class RunTests(unittest.TestCase):
                 throttle.run(agent, pw_command=pw)
         self.assertIn((True, '1'), seen)  # Frozen while niri was there,
         self.assertEqual(seen[-1], (False, '0'))  # thawed once its stream ended.
+
+    def test_a_signal_thaws_what_it_froze_and_a_kill_leaves_it_to_release(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            apps, proc, state = Path(tmp) / 'app.slice', Path(tmp) / 'proc', Path(tmp) / 'freeze.json'
+            scope = apps / 'app-niri-steam-3000.scope'
+            scope.mkdir(parents=True)
+            (scope / 'cgroup.freeze').write_text('0\n')
+            (proc / '3000').mkdir(parents=True)
+            (proc / '3000' / 'cgroup').write_text(f'0::/user.slice/app.slice/{scope.name}\n')
+            events = [{'WorkspacesChanged': {'workspaces': [{'id': 1, 'output': 'eDP-1', 'is_active': True},
+                                                            {'id': 2, 'output': 'eDP-1', 'is_active': False}]}},
+                      {'WindowsChanged': {'windows': [{'id': 3, 'pid': 3000, 'workspace_id': 2,
+                                                       'is_focused': False}]}}]
+            niri = f'import time; print({chr(10).join(map(json.dumps, events))!r}, flush=True); time.sleep(30)'
+            program = f"""
+import sys
+from pathlib import Path
+from wattif import compositor, freeze, throttle
+class Niri(compositor.Niri):
+    command = (sys.executable, '-c', {niri!r})
+agent = freeze.Freezer(['steam'], Path({str(apps)!r}), battery=lambda: True, proc=Path({str(proc)!r}), after=0,
+                       desktop=Niri())
+agent.state_path = Path({str(state)!r})
+throttle.exit_on_signals()
+throttle.run(agent, pw_command=(sys.executable, '-c', 'import time; print("[]", flush=True); time.sleep(30)'))
+"""
+            flag = scope / 'cgroup.freeze'
+            for number in (signal.SIGHUP, signal.SIGTERM, signal.SIGKILL):
+                child = subprocess.Popen([sys.executable, '-c', program],
+                                         env={**os.environ, 'PYTHONPATH': os.pathsep.join(sys.path)})
+                try:
+                    deadline = time.monotonic() + 20
+                    while flag.read_text().strip() != '1' and time.monotonic() < deadline:
+                        time.sleep(0.05)
+                    self.assertEqual(flag.read_text().strip(), '1')
+                    child.send_signal(number)
+                    code = child.wait(timeout=20)
+                finally:
+                    child.kill()
+                if number == signal.SIGKILL:  # Nothing runs: the state file says what --release thaws.
+                    self.assertEqual(json.loads(state.read_text())['scopes'], [scope.name])
+                    freeze.release_left(state, apps)
+                else:
+                    self.assertEqual(code, 0)
+                self.assertEqual(flag.read_text().strip(), '0', number)
+                self.assertFalse(state.exists())
 
 
 if __name__ == '__main__':
