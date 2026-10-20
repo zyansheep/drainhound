@@ -552,7 +552,8 @@ class TextTests(unittest.TestCase):
             self.assertIsNone(panel_data.read_estimate(root / 'missing.json', self.NOW))
             battery = root / 'BAT1'
             battery.mkdir()
-            for name, value in (('status', 'Discharging\n'), ('capacity', '41\n'), ('current_now', '800000'),
+            for name, value in (('type', 'Battery\n'), ('status', 'Discharging\n'), ('capacity', '41\n'),
+                                ('current_now', '800000'),
                                 ('voltage_now', 'garbage')):
                 (battery / name).write_text(value)
             self.assertEqual(panel_data.read_battery(root), {'status': 'Discharging', 'pct': 41})
@@ -561,6 +562,13 @@ class TextTests(unittest.TestCase):
             self.assertEqual(panel_data.read_battery(root), {'status': 'Discharging', 'pct': 41, 'watts': 12.0,
                                                              'charge_wh': 30.0})
             self.assertEqual(panel_data.read_battery(root / 'none'), {})
+            other = root / 'BAT0'                                         # A second battery, counting energy:
+            other.mkdir()
+            for name, value in (('type', 'Battery'), ('status', 'Unknown'), ('capacity', '80'), ('power_now', '0'),
+                                ('energy_now', '20000000')):
+                (other / name).write_text(value)
+            self.assertEqual(panel_data.read_battery(root), {'status': 'Discharging', 'pct': 60, 'watts': 12.0,
+                                                             'charge_wh': 20.0 + 2.0 * 15.0})   # Its Ah at its volts.
 
     def test_the_banner_survives_a_state_file_missing_keys(self):
         self.assertEqual(panel_data.banner_text({'status': 'running'}, True, self.NOW),

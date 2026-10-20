@@ -900,9 +900,36 @@ class SmallerFixesTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             battery = Path(tmp) / 'class/power_supply/BAT1'
             battery.mkdir(parents=True)
+            (battery / 'type').write_text('Battery\n')
             (battery / 'energy_full').write_text('55000000\n')
             self.assertAlmostEqual(report.full_energy([], Path(tmp)), 55.0)
             self.assertAlmostEqual(report.full_energy([], Path(tmp), reserve_wh=3.3), 51.7)
+
+    def test_a_full_charge_of_every_battery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            supplies = Path(tmp) / 'class/power_supply'
+            self.assertIsNone(report.full_energy([], Path(tmp)))                    # A desktop.
+            for name, full in (('BAT0', '3000000'), ('BAT1', '1000000')):
+                battery = supplies / name
+                battery.mkdir(parents=True)
+                for key, value in (('type', 'Battery'), ('charge_now', '500000'), ('charge_full', full),
+                                   ('voltage_min_design', '11400000')):
+                    (battery / key).write_text(value)
+            discharging = [{'st': 'D', 'volts': 12.0}, {'st': 'D', 'volts': 12.4}, {'st': 'C', 'volts': 13.0}]
+            self.assertAlmostEqual(report.full_energy(discharging, Path(tmp)), 4.0 * 12.2)   # Both, at the log's
+            self.assertAlmostEqual(report.full_energy([], Path(tmp)), 4.0 * 11.4)            # or the nominal volts.
+            (supplies / 'BAT1/charge_full').unlink()
+            self.assertIsNone(report.full_energy([], Path(tmp)))                    # One can't say: no total.
+
+    def test_sleep_drain_of_a_battery_that_counts_energy(self):
+        events = [{'event': 'gap', 't1': 7200, 'gap_s': 3600,
+                   'bat_before': {'pct': 60, 'charge': 30_000_000, 'unit': 'uWh'},
+                   'bat_after': {'pct': 58, 'charge': 29_100_000, 'unit': 'uWh'}},
+                  {'event': 'gap', 't1': 19200, 'gap_s': 3600,                      # A battery swap in between.
+                   'bat_before': {'pct': 60, 'charge': 30_000_000, 'unit': 'uWh'},
+                   'bat_after': {'pct': 58, 'charge': 2_000_000, 'unit': 'uAh', 'volts': 15.0}}]
+        (sleep,) = report.sleep_drain(events)
+        self.assertAlmostEqual(sleep['watts'], 0.9)                                 # No voltage needed.
 
     def test_each_vote_counts_once_in_its_own_window(self):
         # A block in the middle of a 4-minute window, between minutes outside experiments.

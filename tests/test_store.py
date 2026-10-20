@@ -17,13 +17,14 @@ from tests.test_report import record
 # (records, minutes). Layouts 2 and 3 had layout 1's and 4's tables; imports
 # lacked `records` and there was no meta table before 9.
 RAILS = ({'vdd_w', 'fabric_w'}, {'vdd', 'fabric'})  # Added by layout 10.
+CHIP = {'soc_src'}  # Records gained it with layout 11.
 LACKED = {
-    1: ({'qol', 'cpu_max_mhz', 'gpu_dpm', 'throttle', 'mhz_active', 'active_n', 'min_mhz', *RAILS[0]},
+    1: ({'qol', 'cpu_max_mhz', 'gpu_dpm', 'throttle', 'mhz_active', 'active_n', 'min_mhz', *RAILS[0], *CHIP},
         {'qol', 'present', 'ghz', 'ghz_active', 'purity', *RAILS[1]}),
-    4: ({'cpu_max_mhz', 'gpu_dpm', 'throttle', 'mhz_active', 'active_n', 'min_mhz', *RAILS[0]},
+    4: ({'cpu_max_mhz', 'gpu_dpm', 'throttle', 'mhz_active', 'active_n', 'min_mhz', *RAILS[0], *CHIP},
         {'ghz', 'ghz_active', 'purity', *RAILS[1]}),
-    7: ({'mhz_active', 'active_n', 'min_mhz', *RAILS[0]}, {'ghz', 'ghz_active', 'purity', *RAILS[1]}),
-    8: ({'mhz_active', 'active_n', 'min_mhz', *RAILS[0]}, {'ghz_active', 'purity', *RAILS[1]}),
+    7: ({'mhz_active', 'active_n', 'min_mhz', *RAILS[0], *CHIP}, {'ghz', 'ghz_active', 'purity', *RAILS[1]}),
+    8: ({'mhz_active', 'active_n', 'min_mhz', *RAILS[0], *CHIP}, {'ghz_active', 'purity', *RAILS[1]}),
 }
 
 
@@ -194,7 +195,7 @@ class StoreTests(unittest.TestCase):
                 old_layout(db, version, self.records)
                 self.assertNotIn('ghz_active', store.load_range(*self.span, db)[0][0])  # Readable before migrating.
                 store.connect(db).close()  # Schema changes only: quick, no minute is recomputed yet.
-                self.assertTrue({'mhz_active', 'active_n', 'min_mhz', 'qol', 'throttle', *RAILS[0]}
+                self.assertTrue({'mhz_active', 'active_n', 'min_mhz', 'qol', 'throttle', *RAILS[0], *CHIP}
                                 <= columns(db, 'records'))
                 self.assertTrue({'ghz', 'ghz_active', 'purity', 'qol', 'present', *RAILS[1]} <= columns(db, 'minutes'))
                 self.assertIn('records', columns(db, 'imports'))
@@ -232,6 +233,30 @@ class StoreTests(unittest.TestCase):
         writer.close()
         minute = next(m for m in store.load_range(-1e18, 1e18, db)[0] if m['t'] == store.minute_of(later['t1']))
         self.assertEqual((minute['vdd'], minute['fabric']), (2.0, 1.5))
+
+    def test_layout_10_gains_the_chip_source_without_recomputing_minutes(self):
+        db = Path(self.tmp.name) / 'layout10.sqlite3'
+        writer = store.Writer(db)
+        for r in self.records:
+            writer.write(r)
+        writer.close()
+        with contextlib.closing(sqlite3.connect(db)) as conn:
+            conn.execute('ALTER TABLE records DROP COLUMN soc_src')
+            conn.execute('PRAGMA user_version = 10')
+            conn.commit()
+        before = store.load_range(*self.span, db)[0]
+        store.connect(db).close()
+        self.assertTrue(CHIP <= columns(db, 'records'))
+        self.assertTrue(store.minutes_ready(db))
+        self.assertEqual(store.load_range(*self.span, db)[0], before)
+        writer = store.Writer(db)
+        later = record(self.span[1] + 3600, bat=9)
+        later['soc'] = dict(later.get('soc') or {'w': 5.0}, src='rapl')
+        self.assertTrue(writer.write(later))
+        writer.close()
+        with contextlib.closing(sqlite3.connect(db)) as conn:
+            self.assertEqual(conn.execute('SELECT soc_src FROM records ORDER BY t1').fetchall()[-2:],
+                             [(None,), ('rapl',)])
 
     def test_minute_recompute_goes_a_day_at_a_time_newest_first_beside_live_writes(self):
         base = self.span[0] + 3600
