@@ -791,8 +791,8 @@ class BatteryPanel(Adw.Application):
         best.append(self.best_label)
         self.apply_button = Gtk.Button(label='Apply', valign=Gtk.Align.CENTER, visible=False)
         self.hint(self.apply_button, 'Until reboot, on battery: on AC they go back to stock and return on '
-                                     'battery. Risky settings (ASPM, APST, GPU clocks) and quarantined ones are '
-                                     'left out; the note under the banner says which.')
+                                     'battery. Risky settings and quarantined ones are left out; the note under '
+                                     'the banner says which.')
         self.apply_button.connect('clicked', lambda _b: self.apply_best())
         best.append(self.apply_button)
         page.append(best)
@@ -815,8 +815,9 @@ class BatteryPanel(Adw.Application):
         self.experiment_list.add_css_class('boxed-list')
         for row in (self.freeze_row(), self.freeze_all_row(), self.psr_row()):
             self.experiment_list.append(row)
-        # The two freezing rows show only with app scopes to freeze.
+        # The two freezing rows show only with app scopes to freeze, PSR's with a 'psr' boot arm.
         self.freeze_rows = [self.experiment_list.get_row_at_index(i) for i in (0, 1)]
+        self.psr_list_row = self.experiment_list.get_row_at_index(2)
         page.append(self.experiment_list)
         scroller = Gtk.ScrolledWindow(vexpand=True, min_content_height=430, hscrollbar_policy=Gtk.PolicyType.NEVER)
         scroller.set_child(page)
@@ -1095,7 +1096,7 @@ class BatteryPanel(Adw.Application):
             'while the screen is locked — and learns from your 👎 which settings to avoid and from your 👍 which are '
             'worth keeping (the Comfort goal). Gains are minutes per full charge (90% intervals), each for that '
             'setting alone with the others at your settings.'
-            + (f" {', '.join(risky)}: risky for the hardware, never in automatic runs." if risky else ''))
+            + (f" {', '.join(risky)}: risky for some hardware, never in automatic runs." if risky else ''))
         self.health.set_text(health_text(result.get('health')))
         self.fill_levers(lever_rows(self.settings(), levers, result.get('quality'), set(result.get('pool') or []),
                                     result.get('risky') or (), result.get('quarantine') or {}))
@@ -1144,6 +1145,7 @@ class BatteryPanel(Adw.Application):
         self.freeze_sensitivity()
         freezes = {e['experiment']: e for e in self.effects}
         self.fill_freeze_all(freezes.get('freeze-apps'), active)
+        self.psr_list_row.set_visible('psr' in (result.get('boot_arms') or {}))
         self.fill_psr()
 
     def fill_levers(self, rows):
@@ -1335,14 +1337,17 @@ class BatteryPanel(Adw.Application):
         info.append(title)
         info.append(self.muted(wrapped(label='Runs only while the screen is locked. Frozen blocks measure the '
                                        'platform floor; A − B is what the apps cost in the background.')))
-        self.keep_t3 = Gtk.CheckButton(label='Keep T3 Code running (agent sessions would stall)', active=True)
-        info.append(self.keep_t3)
+        keeping = experiment.freeze_keep()  # config [experiments] freeze_keep
+        self.keep_apps = Gtk.CheckButton(label=f"Keep {', '.join(keeping)} running", active=True,
+                                         visible=bool(keeping))
+        info.append(self.keep_apps)
         self.freeze_all_result = Gtk.Label(xalign=0, visible=False)
         self.freeze_all_result.add_css_class('result')
         info.append(self.freeze_all_result)
         row.append(info)
         buttons = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, valign=Gtk.Align.CENTER)
-        keep = lambda: ['--keep', 't3code' if self.keep_t3.get_active() else '//']  # '//' matches nothing.
+        keep = lambda: ([a for k in keeping for a in ('--keep', k)] if self.keep_apps.get_active()
+                        else ['--keep', '//'])  # '//' matches nothing.
         self.freeze_all_start = Gtk.Button(label='Start')
         self.freeze_all_start.connect('clicked', lambda _b: self.start('freeze-apps', extra=keep()))
         buttons.append(self.freeze_all_start)
@@ -1413,8 +1418,8 @@ class BatteryPanel(Adw.Application):
         self.psr_note.set_text(
             f"This boot: PSR {current}. Logged on battery: PSR on {boots['on']} boots / {hours['on']:.1f} h, "
             f"off {boots['off']} boots / {hours['off']:.1f} h. Needs {report.MIN_BOOTS}+ boots each (with "
-            f"{report.BOOT_MINUTES}+ minutes on battery). PSR was disabled by "
-            "nixos-hardware for hangs reported in 2024; if the desktop stalls, reboot to the default entry.")
+            f"{report.BOOT_MINUTES}+ minutes on battery). PSR hangs some panels (which is why it is often "
+            "disabled); if the desktop stalls, reboot to the default entry.")
         result = ''
         if 'watts' in psr:
             result = (f"Result: PSR on saves {psr['watts']:+.2f} W ({psr['watts_low']:+.2f} to {psr['watts_high']:+.2f})"

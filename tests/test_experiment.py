@@ -1,5 +1,6 @@
 import json
 import math
+import os
 import random
 import subprocess
 import tempfile
@@ -9,8 +10,77 @@ from pathlib import Path
 import itertools
 from unittest import mock
 
+from wattif import config
 from wattif import experiment as experiment_module
 from wattif.experiment import Setting, design, experiment, unit_label, automatic, Ledger, Watchdog
+
+
+def tree(root, files):
+    """Files under `root`, {relative path: contents}; a path ending in / is a directory."""
+    for path, text in files.items():
+        target = root / path
+        if path.endswith('/'):
+            target.mkdir(parents=True, exist_ok=True)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(f'{text}\n')
+
+
+CPU = 'devices/system/cpu/'
+
+
+def policies(count, **files):
+    return {f'{CPU}cpufreq/policy{i}/{name}': value for i in range(count) for name, value in files.items()}
+
+
+ASPM_POLICY = {'module/pcie_aspm/parameters/policy': '[default] performance powersave powersupersave'}
+# A Framework 13 (Ryzen 7040) on battery: amd-pstate (EPP) with per-CPU boost,
+# amdgpu with ABM on the panel (3: its udev rule's battery value), NVMe, Wi-Fi.
+AMD_LAPTOP = {
+    'class/power_supply/ACAD/type': 'Mains', 'class/power_supply/ACAD/online': '0',
+    'class/power_supply/BAT1/type': 'Battery', 'class/power_supply/BAT1/status': 'Discharging',
+    f'{CPU}cpufreq/boost': '1', f'{CPU}amd_pstate/status': 'active',
+    **policies(2, boost='1', scaling_max_freq='4972435', cpuinfo_max_freq='4972435', cpuinfo_min_freq='405914',
+               amd_pstate_max_freq='4972435', scaling_driver='amd-pstate-epp'),
+    **ASPM_POLICY, 'class/nvme/nvme0/power/pm_qos_latency_tolerance_us': '0',
+    'class/drm/card1-eDP-1/amdgpu/panel_power_savings': '3',
+    'class/drm/card1/device/power_dpm_force_performance_level': 'auto',
+    'module/amdgpu/parameters/dcdebugmask': '0x10', 'class/net/wlan0/wireless/': '',
+}
+# An Intel laptop on battery: intel_pstate (turbo through no_turbo), i915 (no ABM,
+# no DPM levels), NVMe, Wi-Fi, a battery reporting energy and power, and a mouse's.
+INTEL_LAPTOP = {
+    'class/power_supply/AC/type': 'Mains', 'class/power_supply/AC/online': '0',
+    'class/power_supply/BAT0/type': 'Battery', 'class/power_supply/BAT0/status': 'Discharging',
+    'class/power_supply/BAT0/energy_now': '41000000', 'class/power_supply/BAT0/power_now': '6500000',
+    'class/power_supply/hidpp_battery_0/type': 'Battery', 'class/power_supply/hidpp_battery_0/scope': 'Device',
+    'class/power_supply/hidpp_battery_0/status': 'Discharging',
+    f'{CPU}intel_pstate/status': 'active', f'{CPU}intel_pstate/no_turbo': '0', f'{CPU}intel_pstate/turbo_pct': '33',
+    **policies(4, scaling_max_freq='4700000', cpuinfo_max_freq='4700000', cpuinfo_min_freq='400000',
+               base_frequency='2100000', scaling_driver='intel_pstate'),
+    **ASPM_POLICY, 'class/nvme/nvme0/power/pm_qos_latency_tolerance_us': '100000',
+    'class/drm/card0/device/vendor': '0x8086', 'class/drm/card0-eDP-1/status': 'connected',
+    'class/net/wlp0s20f3/phy80211/': '',
+}
+# Nothing to control: no cpufreq (a virtual machine, say), ASPM policy, NVMe, GPU files or Wi-Fi.
+MINIMAL = {'class/power_supply/BAT0/type': 'Battery', 'class/power_supply/BAT0/status': 'Discharging'}
+EVERYTHING = ('powerprofilesctl', 'iw')  # Commands on PATH.
+# `niri msg -j outputs` and `swaymsg -r -t get_outputs` (trimmed).
+NIRI_OUTPUTS = {
+    'eDP-1': {'name': 'eDP-1', 'make': 'BOE', 'model': '0x0BCA', 'current_mode': 0, 'vrr_supported': False,
+              'modes': [{'width': 2256, 'height': 1504, 'refresh_rate': 59999, 'is_preferred': True},
+                        {'width': 2256, 'height': 1504, 'refresh_rate': 47998, 'is_preferred': False},
+                        {'width': 1920, 'height': 1200, 'refresh_rate': 59999, 'is_preferred': False}]},
+    'DP-3': {'name': 'DP-3', 'current_mode': 1,
+             'modes': [{'width': 2560, 'height': 1440, 'refresh_rate': 59951, 'is_preferred': False},
+                       {'width': 2560, 'height': 1440, 'refresh_rate': 143998, 'is_preferred': True}]}}
+SWAY_OUTPUTS = [
+    {'id': 4, 'type': 'output', 'name': 'eDP-1', 'make': 'Sharp Corporation', 'model': '0x1546', 'active': True,
+     'dpms': True, 'power': True, 'scale': 2.0, 'transform': 'normal',
+     'modes': [{'width': 2560, 'height': 1600, 'refresh': 120000, 'picture_aspect_ratio': 'none'},
+               {'width': 2560, 'height': 1600, 'refresh': 60000, 'picture_aspect_ratio': 'none'}],
+     'current_mode': {'width': 2560, 'height': 1600, 'refresh': 120000, 'picture_aspect_ratio': 'none'}},
+    {'id': 5, 'type': 'output', 'name': 'HDMI-A-1', 'active': False, 'modes': [], 'current_mode': None}]
 
 
 class FakeClock:
@@ -85,7 +155,9 @@ class FakeJournal:
 
 class Sandbox:
     """Every path wattif experiment writes, in a temporary directory; no commands
-    (sudo, journalctl, notify-send, systemctl) and a fake kernel log."""
+    (sudo, journalctl, notify-send, systemctl), an empty /sys and /proc, no
+    compositor or login session, and a fake kernel log. `commands` are the
+    programs on PATH, `units` the user units installed."""
 
     def __init__(self, test):
         tmp = tempfile.TemporaryDirectory()
@@ -96,6 +168,7 @@ class Sandbox:
         (root / 'cmdline').write_text('pcie_aspm.policy=performance nvme_core.default_ps_max_latency_us=0\n')
         self.journal, self.notes, self.specs, self.boot = FakeJournal(), [], {}, 'b0'
         self.battery = True
+        self.commands, self.units = set(), set()
 
         def no_commands(*args, **kwargs):
             raise AssertionError(f'a test ran a command: {args}')
@@ -104,7 +177,9 @@ class Sandbox:
                        STATE=runtime / 'experiment.json', REQUEST=runtime / 'experiment-request.json',
                        LOCK=runtime / 'experiment.lock', SOURCE=runtime / 'power-source.json',
                        RECOMMEND=runtime / 'recommend.json', CMDLINE=root / 'cmdline', SYS=root / 'sys',
-                       CPUFREQ=root / 'sys/cpufreq', READBACK=(1, 0), run=no_commands,
+                       CPUFREQ=root / 'sys/devices/system/cpu/cpufreq', PROC=root / 'proc', READBACK=(1, 0),
+                       run=no_commands, command_exists=lambda name: name in self.commands,
+                       unit_loaded=lambda unit: unit in self.units,
                        Journal=lambda: self.journal, notify=lambda summary, body: self.notes.append((summary, body)),
                        boot_id=lambda: self.boot, profile_get=lambda: 'power-saver',
                        catalog=lambda unit=None, units=None: self.specs, on_battery=lambda: self.battery)
@@ -117,6 +192,11 @@ class Sandbox:
             patcher = mock.patch.object(target, *value)
             patcher.start()
             test.addCleanup(patcher.stop)
+        environment = mock.patch.dict(os.environ)  # The session's compositor and login session are not the test's.
+        environment.start()
+        test.addCleanup(environment.stop)
+        for variable in ('NIRI_SOCKET', 'SWAYSOCK', 'XDG_SESSION_ID'):
+            os.environ.pop(variable, None)
         self.saved, self.runtime = saved, runtime
 
     def state(self):
@@ -420,7 +500,7 @@ class ExperimentTests(unittest.TestCase):
         # Started on AC: udev's AC values are live. Restores on battery go to the battery stock values.
         profile = levered('profile', 'balanced', lambda on: 'power-saver' if on else 'balanced',
                           ('power-saver', 'balanced'), ac_managed=True)
-        abm = levered('abm', '0', lambda on: experiment_module.ABM_POLICY[on], ('3', '0'), ac_managed=True)
+        abm = levered('abm', '0', lambda on: {True: '3', False: '0'}[on], ('3', '0'), ac_managed=True)
         battery = lambda: clock.now >= 1300
         final, states = self.run_automatic({'profile': profile, 'abm': abm}, clock, 1000 + 20 * 60,
                                            ['profile', 'abm'], battery=battery,
@@ -713,6 +793,7 @@ class ExperimentTests(unittest.TestCase):
         self.assertEqual(experiment_module.own_profile(True), 'power-saver')
 
     def test_stock_values_come_from_the_command_line(self):
+        self.enterContext(self.authors_stock())  # Its udev rule: ABM 3 on battery, 0 on AC.
         catalog = self.real_catalog()
         stock = {name: spec.stock_or_none(True) for name, spec in catalog.items() if name != 'refresh'}
         self.assertEqual(stock, {'aspm': 'performance', 'apst': '0', 'boost': '0', 'abm': '3',
@@ -727,9 +808,237 @@ class ExperimentTests(unittest.TestCase):
         self.assertEqual(experiment_module.RISKY, ('aspm', 'apst', 'gpu-dpm'))
 
     def real_catalog(self):
-        """The real catalog over the sandbox's /sys and command line (a Wi-Fi interface in it)."""
-        (self.box.root / 'sys/class/net/wlan0/wireless').mkdir(parents=True, exist_ok=True)
+        """The real catalog over the sandbox's /sys (AMD_LAPTOP) and command line."""
+        return self.machine(AMD_LAPTOP, EVERYTHING, [experiment_module.THROTTLE_UNIT])
+
+    def machine(self, files, commands=(), units=()):
+        """The real catalog on a fake machine: its /sys, the commands on PATH and the user units."""
+        tree(self.box.root / 'sys', files)
+        self.box.commands, self.box.units = set(commands), set(units)
         return CATALOG()
+
+    @staticmethod
+    def authors_stock():
+        """config [stock] as the original author's udev rules set them."""
+        return mock.patch.dict(config.SETTINGS['stock'], abm={'battery': 3, 'ac': 0})
+
+    # --- Settings on other machines ----------------------------------------------------------------
+
+    def test_an_amd_laptop_has_every_setting(self):
+        catalog = self.real_catalog()
+        self.assertEqual(list(catalog), ['aspm', 'apst', 'boost', 'abm', 'profile', 'gpu-dpm', 'cpu-cap',
+                                         'throttle-apps', 'wifi-ps'])  # No compositor: no refresh rate.
+        self.assertEqual((catalog['boost'].read(), catalog['cpu-cap'].read(), catalog['abm'].read()), ('1', 'none', '3'))
+        self.assertIn('2000 MHz (this CPU runs at 405–4972 MHz)', catalog['cpu-cap'].description)
+        self.assertIn('Risky', catalog['aspm'].description)
+        self.assertNotIn('Risky', catalog['boost'].description)
+        # power-profiles-daemon turns boost off with power-saver on amd-pstate: its stock follows the profile.
+        self.assertEqual(experiment_module.battery_stock(), {'profile': 'power-saver'})  # Nothing seen yet.
+        self.assertEqual(catalog['boost'].stock(), '0')
+        with mock.patch.object(experiment_module, 'profile_get', lambda: 'balanced'):
+            self.assertEqual(catalog['boost'].stock(), '1')
+        catalog['abm'].stock()
+        # What report.own_settings takes for battery without a battery minute outside experiments.
+        self.assertEqual(experiment_module.battery_stock(), {'profile': 'power-saver', 'abm': '3', 'boost': '0'})
+        experiment_module.prefer(risky=['aspm'])
+        self.assertEqual(experiment_module.pool(catalog), ['boost', 'abm', 'profile', 'cpu-cap', 'throttle-apps',
+                                                           'wifi-ps'])
+
+    def test_an_intel_laptop_has_what_intel_pstate_and_its_drivers_offer(self):
+        catalog = self.machine(INTEL_LAPTOP, EVERYTHING)
+        self.assertEqual(list(catalog), ['aspm', 'apst', 'boost', 'profile', 'cpu-cap', 'wifi-ps'])
+        self.assertIn('this CPU runs at 400–4700 MHz', catalog['cpu-cap'].description)
+        no_turbo = self.box.root / 'sys' / CPU / 'intel_pstate/no_turbo'
+        calls = []
+
+        def helper(command, check=True, **_):  # wattif-helper boost: intel_pstate's no_turbo, inverted.
+            calls.append(command)
+            no_turbo.write_text(f'{1 - int(command[-1])}\n')
+            return ''
+        boost = catalog['boost']
+        self.assertEqual((boost.read(), boost.stock(), boost.stock(False)), ('1', '1', '1'))  # Power-saver keeps turbo.
+        self.assertEqual(experiment_module.battery_stock(), {'profile': 'power-saver', 'boost': '1'})
+        with mock.patch.object(experiment_module, 'run', helper):
+            experiment_module.change(boost, '0', Ledger(), 'manual')
+        self.assertEqual((no_turbo.read_text(), boost.read(), calls), ('1\n', '0', [experiment_module.HELPER + ['boost', '0']]))
+        self.assertTrue(ON_BATTERY())
+        tree(self.box.root / 'sys', {'class/power_supply/AC/online': '1', 'class/power_supply/BAT0/status': 'Charging'})
+        self.assertFalse(ON_BATTERY())
+        (self.box.root / 'sys/class/power_supply/AC').rename(self.box.root / 'sys/class/power_supply/ucsi-source-psy')
+        self.assertFalse(ON_BATTERY())  # USB-C power only: the mouse's battery discharging is not the laptop's.
+        tree(self.box.root / 'sys', {f'{CPU}intel_pstate/turbo_pct': '0'})  # No turbo frequencies (or none left).
+        self.assertNotIn('boost', CATALOG())
+
+    def test_a_machine_with_nothing_to_set_pauses_instead_of_failing(self):
+        specs = self.machine(MINIMAL)
+        self.assertEqual(specs, {})
+        self.assertEqual(experiment_module.pool(specs), [])
+        clock, path, states = FakeClock(), self.box.runtime / 'experiment.json', []
+        clock.hooks.append(lambda now: states.append(json.loads(path.read_text())))
+        automatic(specs, clock=clock, battery=lambda: True, locked=lambda: True, resting=lambda: 0.0,
+                  enabled=lambda: clock.now < 1000 + 120, state_path=path, version=lambda: 'Linux 6.18, BIOS 1',
+                  choose=lambda *a: self.fail('nothing to plan'))
+        self.assertEqual({(s['status'], s['reason']) for s in states}, {('paused', 'no settings to test')})
+        self.assertEqual((self.box.state()['status'], self.box.state()['pending']), ('finished', []))
+        self.assertEqual(experiment_module.restore_settings(specs, ['boost'], lambda: True), {'boost': 'unavailable'})
+
+    def test_stock_values_come_from_configuration(self):
+        catalog = self.real_catalog()
+        abm, panel = catalog['abm'], self.box.root / 'sys/class/drm/card1-eDP-1/amdgpu/panel_power_savings'
+        # By default ABM is left as found: read on battery while nothing of ours holds it, left to the system on AC.
+        self.assertEqual((abm.stock(True), abm.stock(False), abm.ac_managed, bool(abm.reset)), ('3', None, True, True))
+        self.assertEqual(self.box.prefs()['found'], {'abm': {'battery': '3'}})
+        panel.write_text('0\n')
+        self.assertEqual(abm.stock(True), '3')  # Kept once found.
+        self.assertFalse(catalog['profile'].ac_managed)  # config's AC profile: wattif puts it back on AC.
+        self.assertEqual((catalog['profile'].stock(True), catalog['profile'].stock(False)), ('power-saver', 'balanced'))
+        with mock.patch.dict(config.SETTINGS['stock'], profile={'battery': 'balanced', 'ac': None},
+                             abm={'battery': 2, 'ac': 0}, boost={'battery': 0, 'ac': 1}), \
+                mock.patch.object(experiment_module, 'CPU_CAP', '1600'):
+            catalog = CATALOG()
+            self.assertEqual({n: (catalog[n].stock(True), catalog[n].stock(False)) for n in ('profile', 'abm', 'boost')},
+                             {'profile': ('balanced', 'balanced'), 'abm': ('2', '0'), 'boost': ('0', '1')})
+            self.assertEqual((catalog['abm'].ac_managed, catalog['abm'].reset, catalog['profile'].ac_managed),
+                             (False, None, True))
+            self.assertEqual(catalog['cpu-cap'].levels(), ('1600', 'none'))
+            self.assertIn('1600 MHz', catalog['cpu-cap'].description)
+        with mock.patch.dict(config.SETTINGS['stock'], cpu_cap_mhz=300):  # Below what the CPU runs at.
+            with mock.patch.object(experiment_module, 'CPU_CAP', '300'):
+                self.assertNotIn('cpu-cap', CATALOG())
+            from wattif import report
+            self.assertEqual(report.cap_phrase(), 'CPU capped at 0.3 GHz')
+
+    def test_abm_goes_back_to_its_configured_value_or_as_found(self):
+        catalog, panel, calls = self.real_catalog(), self.box.root / 'sys/class/drm/card1-eDP-1/amdgpu/panel_power_savings', []
+        helper = len(experiment_module.HELPER)
+
+        def run(command, check=True, **_):  # No udev rule sets ABM here: the trigger changes nothing.
+            calls.append(command[helper:])
+            if command[helper] == 'abm':
+                panel.write_text(command[-1] + '\n')
+            return ''
+        restore = lambda specs, on=True: experiment_module.restore_settings(specs, ['abm'], lambda: on, Ledger())
+        with mock.patch.object(experiment_module, 'run', run):
+            Ledger().change('abm', '0', False, 'auto')  # A block set 0 before ABM was ever seen.
+            panel.write_text('0\n')
+            self.assertEqual((restore(catalog), calls), ({}, [['trigger', 'power_supply']]))
+            self.assertEqual(panel.read_text(), '0\n')  # Nothing to go back to but the system's policy.
+            experiment_module.remember_found('abm', True, '3')  # Seen before the next change.
+            calls.clear()
+            self.assertEqual((restore(catalog), calls), ({}, [['trigger', 'power_supply'], ['abm', '3']]))
+            with mock.patch.dict(config.SETTINGS['stock'], abm={'battery': 3, 'ac': None}):  # Configured on battery:
+                catalog = CATALOG()
+                panel.write_text('1\n')
+                calls.clear()
+                self.assertEqual((restore(catalog), calls), ({}, [['abm', '3']]))  # written, no trigger;
+                self.assertEqual((restore(catalog, on=False), calls), ({}, [['abm', '3']]))  # AC: the system's.
+            self.enterContext(self.authors_stock())
+            catalog = CATALOG()
+            panel.write_text('1\n')
+            calls.clear()
+            self.assertEqual((restore(catalog), calls), ({}, [['abm', '3']]))  # Configured: written, no trigger.
+            self.assertEqual((restore(catalog, on=False), panel.read_text()), ({}, '0\n'))
+
+    def test_the_refresh_rate_through_niri_or_sway(self):
+        socket, calls, outputs = self.box.root / 'compositor.sock', [], {'niri': NIRI_OUTPUTS, 'sway': SWAY_OUTPUTS}
+        socket.touch()
+
+        def run(command, check=True, **_):
+            calls.append(command)
+            if command[:3] == ['niri', 'msg', '-j'] or command[:2] == ['swaymsg', '-r']:
+                return json.dumps(outputs[command[0].removesuffix('msg')])
+            return ''
+        with mock.patch.object(experiment_module, 'run', run):
+            self.assertNotIn('refresh', self.real_catalog())  # No compositor that sets modes.
+            os.environ['NIRI_SOCKET'] = str(socket)
+            spec = CATALOG()['refresh']
+            self.assertEqual((spec.read(), spec.levels(), spec.alternative(spec.read()), spec.stock()),
+                             ('2256x1504@59.999', ('2256x1504@47.998', '2256x1504@59.999'), '2256x1504@47.998',
+                              '2256x1504@59.999'))
+            spec.set('2256x1504@47.998')
+            self.assertEqual(calls[-1], ['niri', 'msg', 'output', 'eDP-1', 'mode', '2256x1504@47.998'])
+            del os.environ['NIRI_SOCKET']
+            os.environ['SWAYSOCK'] = str(socket)
+            spec = CATALOG()['refresh']
+            self.assertEqual((spec.read(), spec.levels()), ('2560x1600@120.000', ('2560x1600@60.000', '2560x1600@120.000')))
+            spec.set('2560x1600@60.000')
+            self.assertEqual(calls[-1], ['swaymsg', 'output', 'eDP-1', 'mode', '2560x1600@60.000Hz'])
+            outputs['sway'] = [dict(SWAY_OUTPUTS[0], modes=SWAY_OUTPUTS[0]['modes'][:1])]
+            self.assertNotIn('refresh', CATALOG())  # A panel with one refresh rate.
+            socket.unlink()
+            self.assertIsNone(experiment_module.compositor())  # A stale variable: no compositor.
+
+    def test_the_screen_is_locked_by_a_locker_or_by_logind(self):
+        proc, calls, hint = self.box.root / 'proc', [], ['no']
+        tree(proc, {'412/comm': 'niri', '977/comm': 'gtklock'})
+
+        def run(command, check=True, **_):
+            calls.append(command)
+            return '3 7' if command[1] == 'show-user' else f'LockedHint=no\n\nLockedHint={hint[0]}'
+        with mock.patch.object(experiment_module, 'run', run):
+            self.assertTrue(experiment_module.screen_locked())
+            self.assertEqual(calls, [])  # A locker runs: logind isn't asked.
+            (proc / '977/comm').write_text('foot\n')
+            self.assertFalse(experiment_module.screen_locked())
+            hint[0] = 'yes'  # GNOME or KDE, say: they tell logind.
+            self.assertTrue(experiment_module.screen_locked())
+            self.assertEqual(calls[-2:], [['loginctl', 'show-user', str(os.getuid()), '-p', 'Sessions', '--value'],
+                                          ['loginctl', 'show-session', '3', '7', '-p', 'LockedHint']])
+            os.environ['XDG_SESSION_ID'] = '7'
+            self.assertTrue(experiment_module.screen_locked())
+            self.assertEqual(calls[-1], ['loginctl', 'show-session', '7', '-p', 'LockedHint'])
+            (proc / '977/comm').write_text('gtklock\n')
+            hint[0] = 'no'
+            with mock.patch.dict(config.SETTINGS['session'], lockers=['swaylock']):
+                self.assertFalse(experiment_module.screen_locked())
+
+    def test_boot_arms_come_from_configuration(self):
+        calls = []
+        with mock.patch.object(experiment_module, 'run', lambda command, check=True, **_: calls.append(command) or ''), \
+                mock.patch('sys.stdout'):
+            self.assertIsNone(experiment_module.psr_arm())
+            with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
+                experiment_module.main(['next-boot', 'psr'])  # Not configured: no such arm.
+            experiment_module.main(['next-boot', 'default'])
+            arms = {'psr': 'psr', 'quiet': 'no-splash', 'bad': 'Not an entry!', 'list': 'x'}
+            with mock.patch.dict(config.SETTINGS['experiments'], boot_arms=arms):
+                self.assertEqual(experiment_module.boot_arms(), {'psr': 'psr', 'quiet': 'no-splash'})
+                experiment_module.main(['next-boot', 'quiet'])
+                tree(self.box.root / 'sys', {'module/amdgpu/parameters/dcdebugmask': '0x10'})
+                self.assertEqual(experiment_module.psr_arm(), 'default')
+        self.assertEqual([c[len(experiment_module.HELPER):] for c in calls],
+                         [['next-boot', 'default'], ['next-boot', 'no-splash']])
+
+    def test_close_every_app_keeps_what_configuration_says(self):
+        kept = []
+        with mock.patch.object(experiment_module, 'freeze_targets', lambda keep: kept.append(keep) or []), \
+                mock.patch.object(experiment_module, 'test_freeze', lambda units, seconds: []), \
+                mock.patch.object(experiment_module, 'uncovered', lambda: []), mock.patch('sys.stdout'):
+            experiment_module.main(['test-freeze'])
+            with mock.patch.dict(config.SETTINGS['experiments'], freeze_keep=['t3code']):
+                experiment_module.main(['test-freeze'])
+                experiment_module.main(['test-freeze', '--keep', 'floorp'])
+        self.assertEqual(kept, [[], ['t3code'], ['floorp']])
+
+    def test_a_boot_without_a_reset_reason_is_judged_by_its_shutdown(self):
+        # Intel (and older AMD) kernels print no "Previous system reset reason".
+        self.unended_run(value='none')
+        for message in ('intel_pstate: Intel P-state driver initializing', 'nvme nvme0: 8/0/0 default/read/poll queues',
+                        'i915 0000:00:02.0: [drm] GuC firmware i915/tgl_guc_70.bin version 70.20.0'):
+            self.box.journal.add(9000, message)
+        self.assertEqual(Watchdog(journal=self.box.journal, ledger=Ledger()).preflight(0), [])  # A clean shutdown.
+        self.box.journal.shutdown = False  # None logged: a battery cut or a hard power-off, say.
+        found = Watchdog(journal=self.box.journal, ledger=Ledger()).preflight(0)
+        self.assertEqual([(f['quarantine'], 'without a shutdown' in f['what']) for f in found], [(False, True)])
+
+    def test_the_reports_tables_name_the_catalogs_settings(self):
+        from wattif import report
+        catalog = self.real_catalog()
+        names = set(catalog) | {'refresh'}  # And the refresh rate, with a compositor.
+        self.assertEqual(set(report.SETTING), names)
+        self.assertEqual(set(report.PHRASES), names)
+        self.assertEqual(report.NOTICEABLE, {n for n, spec in catalog.items() if spec.visible} | {'refresh'})
+        self.assertLessEqual(report.CPU_LEVERS | set(report.MEDIATORS) | report.AC_MANAGED, names)
 
     # --- Review fixes (October 16) ---------------------------------------------------------------
 
@@ -1030,7 +1339,8 @@ class ExperimentTests(unittest.TestCase):
         self.assertEqual(unit_label('app-niri-signal\\x2ddesktop-2342.scope'), 'signal-desktop')
 
 
-CATALOG, JOURNAL = experiment_module.catalog, experiment_module.Journal  # The real ones (the sandbox replaces them).
+# The real ones (the sandbox replaces them).
+CATALOG, JOURNAL, ON_BATTERY = experiment_module.catalog, experiment_module.Journal, experiment_module.on_battery
 
 
 if __name__ == '__main__':

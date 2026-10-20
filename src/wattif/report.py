@@ -843,8 +843,8 @@ def saving(name, value, top_hz=None):
             return top_hz is not None and float(str(value).rpartition('@')[2]) < top_hz - 1
         if name == 'boost':
             return str(value) == '0'
-        if name == 'profile':  # platform_profile per minute, power-profiles-daemon's name from the runner
-            return value in ('low-power', 'quiet', 'power-saver')
+        if name == 'profile':  # platform_profile per minute (its power-saver: low-power, cool or quiet), the runner's name
+            return value in ('low-power', 'cool', 'quiet', 'power-saver')
         if name in ('gpu-dpm', 'throttle-apps'):
             return value in ('low', 'on')
         if name == 'cpu-cap':  # The runner's value; minutes compare max_mhz with the CPU's maximum.
@@ -906,8 +906,8 @@ def own_settings(minutes, top=None):
     (the runner puts them back), except AC_MANAGED ones. Those are what most of
     the last OWN_MINUTES battery minutes outside experiments had (a single one
     can be from just before udev switched, or from trying balanced for a while),
-    or udev's battery states (UDEV_BATTERY) when there are none: AC minutes
-    have AC's."""
+    or their stock battery states (battery_stock) when there are none: AC
+    minutes have AC's."""
     top = top or tops(minutes)
     logged = [m for m in minutes if m.get('set')]
     own = [m for m in logged if not m.get('exp')] or logged
@@ -918,15 +918,28 @@ def own_settings(minutes, top=None):
                                     if n in AC_MANAGED)
         states.update({n: votes[n, True] > votes[n, False] for n in AC_MANAGED})
     else:
-        states.update(UDEV_BATTERY)
+        states.update(battery_stock())
     return states
 
 
-# udev switches the profile and ABM on AC/battery changes, and each profile
-# change sets boost (power-profiles-daemon: off for power-saver).
+# Settings the system may switch on AC/battery changes: udev rules and
+# power-profiles-daemon set the profile and ABM, and each profile change can set
+# boost (power-profiles-daemon on amd-pstate: off for power-saver).
 AC_MANAGED = {'profile', 'abm', 'boost'}
-UDEV_BATTERY = {'profile': True, 'abm': True, 'boost': True}  # Their states on battery: power-saver, ABM on, no boost.
 OWN_MINUTES = 600
+
+
+def battery_stock():
+    """The AC_MANAGED settings' saving states on battery as wattif experiment puts
+    them back there (experiment.battery_stock: config [stock], or as found before;
+    by default power-saver, as common udev rules set). Those it can't say, the
+    minutes do."""
+    try:
+        from . import experiment  # Here: the stdlib side, which imports this module lazily too.
+        values = experiment.battery_stock()
+    except Exception:  # noqa: BLE001 - the minutes say instead
+        values = {}
+    return {name: saving(name, value) for name, value in values.items() if name in AC_MANAGED}
 
 
 def experiment_values(exp, levers):
@@ -1580,12 +1593,21 @@ REGRET_DRAWS = 300  # Posterior draws for each candidate's expected cost.
 REGRET_FLOOR = 0.3  # W: keeps a candidate that is surely best from taking every block.
 
 
+def cap_phrase():
+    """The CPU cap's saving state, at config [stock] cpu_cap_mhz."""
+    try:
+        return f"CPU capped at {float(config.get('stock', 'cpu_cap_mhz')) / 1000:g} GHz"
+    except (TypeError, ValueError):
+        return 'CPU capped'
+
+
 # How to say a setting is in its (power-saving, normal) state.
 PHRASES = {'aspm': ('ASPM on', 'ASPM off'), 'apst': ('APST on', 'APST off'),
            'wifi-ps': ('Wi-Fi power saving on', 'Wi-Fi power saving off'), 'abm': ('ABM on', 'ABM off'),
            'refresh': ('lower refresh rate', 'full refresh rate'), 'boost': ('CPU boost off', 'CPU boost on'),
            'profile': ('power-saver profile', 'balanced profile'),
-           'gpu-dpm': ('GPU clocks low', 'GPU clocks automatic'), 'cpu-cap': ('CPU capped at 2 GHz', 'CPU uncapped'),
+           'gpu-dpm': ('GPU clocks low', 'GPU clocks automatic'),
+           'cpu-cap': (cap_phrase(), 'CPU uncapped'),
            'throttle-apps': ('background apps throttled', 'background apps unthrottled')}
 GOALS = ('battery', 'comfort')
 

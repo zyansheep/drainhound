@@ -9,6 +9,8 @@ from unittest import mock
 import numpy as np
 import scipy.stats
 
+from wattif import config
+from wattif import experiment
 from wattif import power
 from wattif import report
 from wattif import store
@@ -545,9 +547,17 @@ class ModelDataTests(unittest.TestCase):
         plugged = [dict(exp[-1], t=exp[-1]['t'] + 60 * (i + 1), st='C', exp=None,
                         set={'aspm': 'performance', 'apst': '0', 'boost': '1', 'profile': 'balanced', 'abm': 0,
                              'hz': 60.0}) for i in range(5)]
-        states = report.own_settings(exp + plugged)
-        # AC has AC's profile, ABM and boost: on battery udev sets power-saver, ABM on, no boost.
+        # AC has AC's profile, ABM and boost: on battery they go back to what experiments restore there,
+        # config [stock]'s (by default power-saver; ABM and boost as found, here never: as the minutes have them).
+        with mock.patch.object(experiment, 'preferences', lambda: {}):
+            states = report.own_settings(exp + plugged)
+        self.assertEqual((states['profile'], states['abm'], states['boost'], states['aspm']), (True, False, False, False))
+        # The original author's udev rule sets ABM 3 on battery; power-saver turns boost off there (amd-pstate).
+        with mock.patch.dict(config.SETTINGS['stock'], abm={'battery': 3, 'ac': 0}), \
+                mock.patch.object(experiment, 'preferences', lambda: {'boost_follows_profile': True}):
+            states = report.own_settings(exp + plugged)
         self.assertEqual((states['profile'], states['abm'], states['boost'], states['aspm']), (True, True, True, False))
+        self.assertTrue(report.saving('profile', 'cool'))  # A platform profile's power-saver, as quiet and low-power.
 
 
 class ClockTests(unittest.TestCase):

@@ -124,6 +124,7 @@ def hermetic():
             mock.patch.object(eta, 'reserve_wh', lambda: 0.0, create=True),
             mock.patch.object(experiment, 'goal', lambda: 'battery'),
             mock.patch.object(experiment, 'psr_arm', lambda: 'default'),
+            mock.patch.object(experiment, 'boot_arms', lambda: {'psr': 'psr'}),  # The PSR comparison is configured.
             mock.patch.object(experiment, 'catalog', lambda: {n: FakeSpec(n) for n in LEVERS}),
             mock.patch.object(experiment, 'describe', lambda spec: next(s for s in SETTINGS if s['name'] == spec.name)),
             mock.patch.object(experiment, 'freezable_units', lambda: []),
