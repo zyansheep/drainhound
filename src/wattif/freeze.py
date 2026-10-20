@@ -2,26 +2,34 @@
 """Cached-app freeze, after Android's: on battery, an app you chose that hasn't
 had focus for AFTER and has no window on a workspace in view is frozen with the
 cgroup freezer, so it uses no CPU at all. It thaws the moment you focus it or
-switch to its workspace (niri's events), when you start it again (a new scope
-with its name: a second instance hands its arguments to the running one and
-would wait for it), and on AC. Every EVERY it thaws for THAW, so timers, sync
-and connections catch up. An app busier than BUSY of a core over the last
-BUSY_WINDOW (a build, an export) is left running, and one playing or recording
-audio or video counts as in use. Its last focus is niri's focus_timestamp, so
-a restart doesn't reset it.
+switch to its workspace (the compositor's events), when you start it again (a
+new scope with its name: a second instance hands its arguments to the running
+one and would wait for it), and on AC. Every EVERY it thaws for THAW, so
+timers, sync and connections catch up. An app busier than BUSY of a core over
+the last BUSY_WINDOW (a build, an export) is left running, and one playing or
+recording audio or video counts as in use. Its last focus is the compositor's
+(niri's focus_timestamp, so a restart doesn't reset it).
+
+Nothing is frozen, and what was is thawed, unless both event streams are live:
+without PipeWire's nothing says which apps play media, and without the
+compositor's (none supported, or it died: compositor.py) which are in use, so
+every chosen app counts as in use until it is back, and AFTER starts again then.
 
 Android can freeze every cached app because its apps are written to be frozen;
 desktop apps aren't. So only the apps you list are frozen: not chat apps (their
 connection drops while frozen), and nothing that serves other programs (a dev
 server stops answering).
 
-    wattif freeze PATTERN ... [--after MIN] [--every MIN] [--thaw SEC]
+    wattif freeze [PATTERN ...] [--after MIN] [--every MIN] [--thaw SEC]
     wattif freeze --release      (thaw what it froze; the unit's ExecStopPost)
 
 PATTERN is matched (case-insensitively) anywhere in the app's scope names in
-app.slice, systemd's escapes undone, as wattif throttle's --keep is. It follows
-focus and media from the same event streams as wattif throttle (throttle.Session).
-RUNTIME/freeze.json says what it watches and what it has frozen.
+app.slice, systemd's escapes undone, as wattif throttle's --keep is. Without
+one it freezes the configuration's [freeze] apps, and with none of those it
+idles; AFTER, EVERY and THAW are [freeze] after, every and thaw, and the flags
+override them all. It follows focus and media from the same event streams as
+wattif throttle (throttle.Session). RUNTIME/freeze.json says what it watches
+and what it has frozen.
 """
 import argparse
 import collections
@@ -31,13 +39,14 @@ import sys
 import time
 from pathlib import Path
 
+from . import compositor
 from . import config
 from . import throttle
 from .throttle import APPS, RUNTIME, Session, app_of, label, on_battery, read, unescape
 
-AFTER = 30 * 60  # s without focus before an app is frozen.
-EVERY = 10 * 60  # s between thaws while frozen.
-THAW = 10  # s each thaw lasts.
+AFTER = config.get('freeze', 'after') * 60  # s without focus before an app is frozen.
+EVERY = config.get('freeze', 'every') * 60  # s between thaws while frozen.
+THAW = config.get('freeze', 'thaw')  # s each thaw lasts.
 BUSY, BUSY_WINDOW = 0.25, 5 * 60  # Cores, over s: busier apps are working, not idling.
 STATE = RUNTIME / 'freeze.json'
 
@@ -46,8 +55,8 @@ class Freezer(Session):
     state_path = STATE
 
     def __init__(self, patterns, apps=APPS, battery=on_battery, proc=Path('/proc'), clock=time.monotonic,
-                 after=AFTER, every=EVERY, thaw=THAW, busy=BUSY):
-        super().__init__(apps, battery, proc, clock)
+                 after=AFTER, every=EVERY, thaw=THAW, busy=BUSY, desktop=None):
+        super().__init__(apps, battery, proc, clock, desktop)
         self.patterns = tuple(p.lower() for p in patterns)
         self.after, self.every, self.thaw, self.busy = after, every, thaw, busy
         # By app: last in use; when frozen (this time); when a periodic thaw began; (time, CPU µs) samples.
@@ -90,7 +99,8 @@ class Freezer(Session):
         for scope in scopes:
             apps[app_of(scope)].append(scope)
         chosen = {app: own for app, own in apps.items() if any(self.chosen(s) for s in own)}
-        in_use = self.playing() | self.shown() | {self.focused_app()}
+        # Without the compositor's state nothing says what is in use: all of it might be.
+        in_use = self.playing() | self.shown() | {self.focused_app()} if self.desktop.known else set(chosen)
         focused = self.last_focused()
         values = {}
         for app, own in chosen.items():
@@ -147,8 +157,10 @@ class Freezer(Session):
 
     def step(self, media_known):
         """Apply what is wanted now; the state file's contents. Without stream
-        data (PipeWire down) nothing stays frozen: an app might be wanted for media."""
-        frozen = self.apply() if media_known else self.apply(dict.fromkeys(self.wanted(), False))
+        data nothing stays frozen: without PipeWire's an app might be wanted for
+        media, without the compositor's it might be the one you are using."""
+        live = media_known and self.desktop.known
+        frozen = self.apply() if live else self.apply(dict.fromkeys(self.wanted(), False))
         return {'on_battery': self.battery(), 'scopes': frozen,  # An app's scopes can differ in case: one name.
                 'frozen': sorted({label(s).lower() for s in frozen}),
                 'watching': sorted({label(s).lower() for s in self.scopes or () if self.chosen(s)})}
@@ -171,7 +183,8 @@ def release_left(state=STATE, apps=APPS):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog='wattif freeze', description=__doc__.split('\n\n')[0])
-    parser.add_argument('patterns', nargs='*', metavar='PATTERN', help='apps to freeze (matched in scope names)')
+    parser.add_argument('patterns', nargs='*', metavar='PATTERN',
+                        help='apps to freeze, matched in scope names (default: [freeze] apps)')
     parser.add_argument('--after', type=float, default=AFTER / 60, help='minutes without focus before freezing')
     parser.add_argument('--every', type=float, default=EVERY / 60, help='minutes between thaws while frozen')
     parser.add_argument('--thaw', type=float, default=THAW, help='seconds each thaw lasts')
@@ -180,11 +193,20 @@ def main(argv=None):
     if args.release:
         release_left()
         return
-    if not args.patterns:
-        parser.error('name at least one app to freeze')
     release_left()  # A crashed run's freezes: start from thawed.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    throttle.run(Freezer(args.patterns, after=args.after * 60, every=args.every * 60, thaw=args.thaw))
+    patterns = args.patterns or [str(p) for p in config.get('freeze', 'apps') or () if str(p)]
+    if not patterns:
+        # A unit that runs it unconfigured stays up, doing nothing, instead of failing and restarting.
+        print('wattif freeze: no apps to freeze (name them, or set [freeze] apps in the configuration); idling',
+              file=sys.stderr)
+        while True:
+            signal.pause()
+    desktop = compositor.detect()
+    if desktop.command is None:
+        print(f"wattif freeze: {compositor.unsupported()} isn't supported (niri and sway are): nothing says which "
+              'apps are in use, so nothing is frozen', file=sys.stderr)
+    throttle.run(Freezer(patterns, after=args.after * 60, every=args.every * 60, thaw=args.thaw, desktop=desktop))
 
 
 if __name__ == '__main__':
