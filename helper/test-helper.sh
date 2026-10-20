@@ -78,8 +78,7 @@ SUDO_UID=1000 lab sleep-restore 2>/dev/null; check "sleep-restore refuses under 
 
 # sleep-safe: GPU DPM back to auto, APST to the cmdline value (both noted); the flag makes changes refuse.
 echo 'default [performance] powersave powersupersave' > "$S"/module/pcie_aspm/parameters/policy
-echo low > "$S"/class/drm/card1/device/power_dpm_force_performance_level
-echo 100000 > "$S"/class/nvme/nvme0/power/pm_qos_latency_tolerance_us
+lab gpudpm low >/dev/null; lab apst 100000 >/dev/null  # The helper's own changes: sleep-safe's to put back.
 echo activating > "$ROOT/hooks-state"
 lab sleep-safe; check "sleep-safe succeeds" '[ $? -eq 0 ]'
 echo active > "$ROOT/hooks-state"
@@ -102,6 +101,16 @@ check "after resume apst stays at the cmdline value" '[ "$(cat "$S"/class/nvme/n
 check "sleep-restore logs what stayed" 'grep -q "after resume, left at the boot-time values: .*gpudpm .*low" "$ROOT/calls"'
 check "sleep-restore clears the flag and the note" '[ ! -e "$ROOT"/run/wattif-helper/sleeping ] && [ ! -e "$ROOT"/run/wattif-helper/pre-sleep ]'
 lab gpudpm low >/dev/null; check "changes work after resume" '[ $? -eq 0 ] && [ "$(cat "$S"/class/drm/card1/device/power_dpm_force_performance_level)" = low ]'
+
+# What the helper didn't change (you, TLP, a udev rule) sleep-safe leaves alone.
+rm -f "$ROOT"/run/wattif-helper/changed-*
+echo low > "$S"/class/drm/card1/device/power_dpm_force_performance_level
+echo 5000 > "$S"/class/nvme/nvme0/power/pm_qos_latency_tolerance_us
+echo activating > "$ROOT/hooks-state"
+lab sleep-safe; check "sleep-safe leaves others' values" '[ $? -eq 0 ] && [ "$(cat "$S"/class/drm/card1/device/power_dpm_force_performance_level)" = low ] && [ "$(cat "$S"/class/nvme/nvme0/power/pm_qos_latency_tolerance_us)" = 5000 ]'
+echo deactivating > "$ROOT/hooks-state"
+lab sleep-restore >/dev/null 2>&1
+echo inactive > "$ROOT/hooks-state"
 
 # A stale flag (the hooks' unit is down, sleep-restore never ran) is cleared and logged.
 echo activating > "$ROOT/hooks-state"

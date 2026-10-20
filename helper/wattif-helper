@@ -111,6 +111,10 @@ hooks_only() { # sleep-safe/-restore belong to the suspend hooks, not to sudo
   [ -z "${SUDO_UID:-}" ] || { echo "wattif-helper: $cmd runs from the suspend hooks only" >&2; exit 2; }
 }
 aspm_now() { grep -o '\[[a-z]*\]' "$ASPM" | tr -d '[]' || true; }
+# What this helper changed since boot ($RUN is a tmpfs): sleep-safe puts back
+# only those, never what you, TLP or a udev rule set.
+mark() { mkdir -p "$RUN/wattif-helper"; : > "$RUN/wattif-helper/changed-$1"; }
+changed() { [ -e "$RUN/wattif-helper/changed-$1" ]; }
 cmdline_value() { grep -o "$1=[^ ]*" "$CMDLINE" | tail -n 1 | cut -d= -f2 || true; }
 # Set the ASPM policy with every PCI function awake. A runtime-suspended
 # function puts back the link control it saved before the change when it
@@ -179,6 +183,7 @@ case "$cmd" in
   aspm)
     [ $# -eq 1 ] && [[ "$1" =~ ^(default|performance|powersave|powersupersave)$ ]] || usage
     begin_change
+    mark aspm
     set_aspm "$1"; cat "$ASPM"
     ;;
   boost)
@@ -209,6 +214,7 @@ case "$cmd" in
     begin_change
     drives=("$SYS"/class/nvme/nvme*/power/pm_qos_latency_tolerance_us)
     some "$SYS/class/nvme/nvme*/power/pm_qos_latency_tolerance_us" "${drives[@]}"
+    mark apst
     for f in "${drives[@]}"; do echo "$1" > "$f"; echo "$f=$(cat "$f")"; done
     ;;
   wifips)
@@ -224,6 +230,7 @@ case "$cmd" in
     begin_change
     levels=("$SYS"/class/drm/card*/device/power_dpm_force_performance_level)
     some "$SYS/class/drm/card*/device/power_dpm_force_performance_level" "${levels[@]}"
+    mark gpudpm
     for f in "${levels[@]}"; do echo "$1" > "$f"; echo "$f=$(cat "$f")"; done
     ;;
   cpucap)
@@ -263,8 +270,9 @@ case "$cmd" in
   sleep-safe)
     # Experiments may have relaxed settings that matter on the way into suspend
     # (on some machines, ASPM and NVMe APST are boot-time workarounds for
-    # crashes there); put back what the kernel command line asked for, and GPU
-    # DPM auto, noting what was there for the log.
+    # crashes there): of those this helper changed since boot, put back what the
+    # kernel command line asked for, and GPU DPM auto, noting what was there for
+    # the log.
     # The flag first: from now on changes refuse, then wait for one under way.
     hooks_only
     mkdir -p "$RUN/wattif-helper"
@@ -274,12 +282,12 @@ case "$cmd" in
     failed=0
     policy=$(cmdline_value pcie_aspm.policy)
     current=$(aspm_now)
-    if [ -n "$policy" ] && [ "$policy" != "$current" ]; then
+    if changed aspm && [ -n "$policy" ] && [ "$policy" != "$current" ]; then
       echo "aspm $current" >> "$saved"
       set_aspm "$policy" || failed=1
     fi
     latency=$(cmdline_value nvme_core.default_ps_max_latency_us)
-    if [ -n "$latency" ]; then
+    if changed apst && [ -n "$latency" ]; then
       for f in "$SYS"/class/nvme/nvme*/power/pm_qos_latency_tolerance_us; do
         value=$(cat "$f")
         if [ "$value" != "$latency" ]; then
@@ -289,6 +297,7 @@ case "$cmd" in
       done
     fi
     for f in "$SYS"/class/drm/card*/device/power_dpm_force_performance_level; do
+      changed gpudpm || break
       value=$(cat "$f")
       if [ "$value" != auto ]; then
         echo "gpudpm $f $value" >> "$saved"
