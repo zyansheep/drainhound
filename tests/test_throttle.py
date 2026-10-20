@@ -1,8 +1,12 @@
+import json
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from wattif import throttle
+from wattif import compositor, config, throttle
 from wattif.throttle import UNLIMITED, Throttle
 
 
@@ -133,6 +137,119 @@ class ThrottleTests(unittest.TestCase):
         stream.buffer = '{"WindowFocusChanged": {"id": 4}}\n{"Window'
         self.assertEqual(throttle.lines(stream), [{'WindowFocusChanged': {'id': 4}}])
         self.assertEqual(stream.buffer, '{"Window')
+
+    def test_labels_drop_every_launchers_prefix_and_random_suffix(self):
+        self.assertEqual([throttle.label(s) for s in (
+            'app-gnome-org.gnome.Terminal-3061.scope', 'app-flatpak-com.valvesoftware.Steam-4100.scope',
+            'app-kde-org.kde.dolphin-0123456789abcdef0123456789abcdef.scope', 'app-gnome\\x2dcalculator-9.scope',
+            'app-niri-gnome\\x2dcalculator-9.scope', 'app-firefox.scope')],
+            ['Terminal', 'Steam', 'dolphin', 'gnome-calculator', 'gnome-calculator', 'firefox'])
+
+    def test_input_methods_terminals_and_editors_are_built_in_and_the_configuration_adds_more(self):
+        for name in ('fcitx', 'ibus', 'foot', 'terminal', 'code', 'zed'):
+            self.assertIn(name, throttle.KEEP)
+        self.assertEqual(throttle.keep_patterns(), throttle.KEEP)  # The default configuration adds none.
+        with mock.patch.dict(config.SETTINGS['throttle'], {'keep': ['blender']}):
+            self.assertEqual(throttle.keep_patterns(), throttle.KEEP + ('blender',))
+            self.assertEqual(throttle.keep_patterns(['gimp']), throttle.KEEP + ('gimp',))  # --keep instead.
+        self.assertEqual((throttle.QUOTA, throttle.GRACE), (config.DEFAULTS['throttle']['quota'],
+                                                            config.DEFAULTS['throttle']['grace']))
+
+    def test_the_command_line_overrides_the_configuration(self):
+        with mock.patch.object(throttle, 'run') as run, mock.patch.object(throttle.signal, 'signal'), \
+                mock.patch.object(throttle.compositor, 'detect', return_value=compositor.Niri()), \
+                mock.patch.dict(config.SETTINGS['throttle'], {'keep': ['blender']}):
+            throttle.main([])
+            agent = run.call_args.args[0]
+            self.assertEqual((agent.quota, agent.keep[-1]), (throttle.QUOTA * 1000, 'blender'))
+            self.assertIsInstance(agent.desktop, compositor.Niri)
+            throttle.main(['--quota', '7', '--keep', 'Krita'])
+            agent = run.call_args.args[0]
+            self.assertEqual((agent.quota, agent.keep), (7000, throttle.KEEP + ('krita',)))
+
+    def test_sway_windows_are_throttled_the_same_way(self):
+        tree = {'type': 'root', 'nodes': [{'type': 'output', 'name': 'eDP-1', 'nodes': [
+            {'id': 5, 'type': 'workspace', 'nodes': [{'id': 21, 'type': 'con', 'pid': 2240, 'focused': True},
+                                                     {'id': 22, 'type': 'con', 'pid': 2243, 'focused': False}]}]}]}
+        sway = compositor.Sway(clock=lambda: self.now, query=lambda kind: tree if kind == 'get_tree' else [
+            {'id': 5, 'output': 'eDP-1', 'visible': True}])
+        capped = Throttle(self.apps, quota=5, battery=lambda: True, proc=self.proc, clock=lambda: self.now,
+                          desktop=sway)
+        sway.started()
+        self.assertEqual(capped.apply(), ['app-md.Obsidian-2243.scope'])  # Floorp has focus.
+        sway.event({'change': 'focus', 'container': {'id': 22, 'type': 'con', 'pid': 2243, 'focused': True}})
+        self.assertEqual(capped.apply(), [])  # Obsidian now; Floorp in its grace period.
+
+    def test_nothing_is_capped_once_the_compositors_stream_has_ended(self):
+        self.assertTrue(self.throttle.apply())
+        self.throttle.desktop.clear()  # What run() does when the stream ends.
+        self.assertEqual(self.throttle.apply(), [])
+        self.assertEqual(set(self.limits().values()), {UNLIMITED})
+
+
+class Stop(Exception):
+    pass
+
+
+class RunTests(unittest.TestCase):
+    """throttle.run with stand-in event streams (small Python programs)."""
+
+    def test_a_compositor_stream_that_ends_is_forgotten_and_started_again(self):
+        events = [{'WorkspacesChanged': {'workspaces': [{'id': 1, 'output': 'eDP-1', 'is_active': True}]}},
+                  {'WindowsChanged': {'windows': [{'id': 3, 'pid': 42, 'workspace_id': 1, 'is_focused': True}]}}]
+        text = chr(10).join(map(json.dumps, events))
+        printer = f'import time; print({text!r}, flush=True); time.sleep(0.5)'  # niri for a moment.
+        seen, started = [], []
+
+        class Desktop(compositor.Niri):
+            command = (sys.executable, '-c', printer)
+
+            def started(self):
+                started.append(time.monotonic())
+
+        class Agent(throttle.Session):
+            state_path = Path(tempfile.mkdtemp()) / 'state.json'
+            released = False
+
+            def step(self, media_known):
+                seen.append((self.desktop.known, set(self.desktop.windows), media_known))
+                if len(started) >= 2 and self.desktop.known:  # Back after a restart.
+                    raise Stop
+                return {'known': self.desktop.known}
+
+            def release(self):
+                Agent.released = True
+
+        agent = Agent(desktop=Desktop())
+        pw = (sys.executable, '-c', 'import time; print("[]", flush=True); time.sleep(30)')
+        with mock.patch.object(throttle, 'RESCAN', 0.2), self.assertRaises(Stop):
+            throttle.run(agent, pw_command=pw)
+        known = [k for k, _, _ in seen]
+        ended = known.index(False, known.index(True))  # Known, then forgotten when the stream ended,
+        self.assertEqual(seen[ended][1], set())
+        self.assertTrue(known[-1])  # then known again once it was started again.
+        self.assertEqual(len(started), 2)
+        self.assertTrue(Agent.released)
+        self.assertFalse(Agent.state_path.exists())
+
+    def test_without_a_compositor_only_pipewire_is_followed(self):
+        steps = []
+
+        class Agent(throttle.Session):
+            state_path = Path(tempfile.mkdtemp()) / 'state.json'
+
+            def step(self, media_known):
+                steps.append(media_known)
+                if len(steps) > 2:
+                    raise Stop
+                return {}
+
+            def release(self):
+                pass
+        pw = (sys.executable, '-c', 'import time; print("[]", flush=True); time.sleep(30)')
+        with mock.patch.object(throttle, 'RESCAN', 0.1), self.assertRaises(Stop):
+            throttle.run(Agent(desktop=compositor.Desktop()), pw_command=pw)
+        self.assertTrue(steps[-1])
 
 
 if __name__ == '__main__':

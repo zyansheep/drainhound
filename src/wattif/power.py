@@ -1406,7 +1406,7 @@ class Monitor:
             'apps': apps, 'net': net, 'wifi_dbm': wifi_signal(self.proc), 'disk': disk,
             'usb': usb_active(self.sys), 'pci': pci_active(self.sys), 'audio': audio_streams(self.proc),
             'display': shown, 'settings': system, 'lid': lid_state(self.proc),
-            'locked': any(entry[3] == 'swaylock' for entry in processes.values()),
+            'locked': any(entry[3] in (config.get('session', 'lockers') or ()) for entry in processes.values()),
             **thermal(self.sys),
         }
         for name, path in (config.get('log', 'extra') or {}).items():

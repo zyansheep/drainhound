@@ -4,16 +4,19 @@ Neither imports numpy or GTK. The panel is told over D-Bus (GTK's
 org.gtk.Actions), started first through its systemd unit, or else directly.
 """
 import json
+import math
 import os
 import shutil
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 from . import config
 
 TABS = ('timeline', 'experiments')
 STALE = 15  # s: eta.json older than this means wattif eta isn't running.
+SNAPSHOT_STALE = 30  # s: the collector's snapshot.json (written every 2 s) older than this is left out.
 
 
 def panel(argv):
@@ -90,13 +93,104 @@ def waybar(argv):
         time.sleep(2)
 
 
-def battery_label(path=None, now=None):
-    """The label wattif eta last published, or '--' while it is stale."""
+def battery_label(path=None, now=None, snapshot=None):
+    """The label wattif eta last published, or '--' while it is stale. With
+    [waybar] tooltip, a label without a tooltip of its own gets one (tooltip()),
+    for bars that show nothing else on hover."""
     now = time.time() if now is None else now
+    wanted = config.get('waybar', 'tooltip')
     try:
         detail = json.loads((path or config.RUNTIME / 'eta.json').read_text())
         if now - float(detail['updated']) < STALE and isinstance(detail.get('waybar'), dict):
-            return detail['waybar']
+            label = detail['waybar']
+            if wanted and 'tooltip' not in label:
+                label = dict(label, tooltip=tooltip(detail, read_snapshot(snapshot, now)))
+            return label
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        pass
+    stale = {'text': '--', 'class': ['unknown']}
+    return dict(stale, tooltip="No estimate: wattif eta isn't running") if wanted else stale
+
+
+def read_snapshot(path=None, now=None):
+    """The battery-use block of the collector's snapshot.json ({'title', 'rows',
+    'footer'}) while it is fresh, else None."""
+    try:
+        snapshot = json.loads(Path(path or config.RUNTIME / 'snapshot.json').read_text())
+        fresh = (now or time.time()) - float(snapshot['timestamp']) < SNAPSHOT_STALE
+        if fresh and isinstance(snapshot['battery'], dict):
+            return snapshot['battery']
     except (OSError, ValueError, KeyError, TypeError):
         pass
-    return {'text': '--', 'class': ['unknown']}
+    return None
+
+
+def finite(*values):
+    return all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in values)
+
+
+def hours_text(hours):
+    """'2 h 05 m', '45 min', and whole hours from ten up ('23 h'): the panel's durations."""
+    if not finite(hours):
+        return '--'
+    if hours >= 10:
+        return f'{round(hours)} h'
+    minutes = round(max(0.0, hours) * 60)
+    return f'{minutes // 60} h {minutes % 60:02d} m' if minutes >= 60 else f'{minutes} min'
+
+
+def span(low, high):
+    return f' (80%: {hours_text(low)}–{hours_text(high)})' if finite(low, high) else ''
+
+
+def escape(text):
+    """Waybar reads a tooltip as Pango markup."""
+    return str(text).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+
+def tooltip(detail, battery=None):
+    """Time left (or to full) with its 80% interval, how long a suspend from now
+    would last, and what uses the battery (the collector's block), as Pango
+    markup. From eta.json's numbers, without numpy: this runs every 2 s."""
+    classes = detail.get('classes') if isinstance(detail.get('classes'), list) else []
+    lines = []
+    pct, watts = detail.get('pct'), detail.get('watts')
+    head = ' · '.join(filter(None, [f'{pct:.0f}%' if finite(pct) else '',
+                                    f'{abs(watts):.1f} W' if finite(watts) else '']))
+    hours, low, high = detail.get('hours'), detail.get('low'), detail.get('high')
+    if 'discharging' in classes:
+        if finite(detail.get('cutout')):
+            end = detail['poweroff'] if finite(detail.get('poweroff')) else detail['cutout']
+            pm = f" ±{detail['cutout_pm']:.0f} s" if finite(detail.get('cutout_pm')) else ''
+            lines.append(f"{'Powers off' if finite(detail.get('poweroff')) else 'Cuts out'} at "
+                         f"{time.strftime('%H:%M:%S', time.localtime(end))}{pm}")
+        elif finite(hours):
+            lines.append(f'{hours_text(hours)} left{span(low, high)}')
+        if detail.get('charger'):
+            lines.append(f"Charger {detail['charger']}")
+    elif 'charging' in classes:
+        target = detail.get('target')
+        if finite(hours):
+            lines.append(f"{hours_text(hours)} to {f'{target:.0f}%' if finite(target) else 'full'}{span(low, high)}")
+        if finite(detail.get('banked')):
+            lines.append(f"Unplugged now: ~{hours_text(detail['banked'])} on battery")
+    elif 'plugged' in classes:
+        lines.append('On AC')
+    asleep = detail.get('sleep')
+    if isinstance(asleep, dict) and finite(asleep.get('hours')):
+        lines.append(f"Asleep from now: ~{hours_text(asleep['hours'])}{span(asleep.get('low'), asleep.get('high'))}")
+    text = escape('\n'.join(filter(None, [head, *lines])))
+    listed = []  # (name, value) of each row of the block, then its parts under it.
+    for row in (battery or {}).get('rows') or []:
+        if isinstance(row, dict):
+            listed.append((str(row.get('name', '')), str(row.get('value', ''))))
+            listed += [('  ' + str(part.get('name', '')), str(part.get('value', '')))
+                       for part in row.get('parts') or [] if isinstance(part, dict)]
+    if battery and (battery.get('title') or listed):
+        text += ('\n\n' if text else '') + escape(battery.get('title') or '')
+        if listed:  # Monospaced, so the values line up.
+            width = max(len(name) for name, _ in listed)
+            text += '\n<tt>' + escape('\n'.join(f'{name:<{width}}  {value}' for name, value in listed)) + '</tt>'
+        if battery.get('footer'):
+            text += '\n' + escape(battery['footer'])
+    return text

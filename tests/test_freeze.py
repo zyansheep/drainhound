@@ -1,9 +1,13 @@
+import contextlib
+import io
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from wattif import freeze
+from wattif import compositor, config, freeze, throttle
 from wattif.freeze import AFTER, EVERY, THAW, Freezer
 
 
@@ -128,6 +132,103 @@ class FreezeTests(unittest.TestCase):
         freeze.release_left(state, self.apps)
         self.assertEqual(self.frozen(), {'app-niri-floorp-2240.scope'})
         self.assertFalse(state.exists())
+
+    def test_without_the_compositors_state_nothing_is_frozen_and_what_was_thaws(self):
+        self.freezer.step(True)
+        self.wait(AFTER)
+        self.assertEqual(self.frozen(), self.OBSIDIAN | {'app-niri-steam-3000.scope'})
+        self.freezer.desktop.clear()  # The stream ended: niri exited, or restarts.
+        state = self.freezer.step(True)
+        self.assertEqual((self.frozen(), state['frozen']), (set(), []))
+        self.wait(AFTER + 60)  # However long it stays away: nothing says the apps aren't in use.
+        self.assertEqual(self.frozen(), set())
+        for event in ({'WorkspacesChanged': {'workspaces': [{'id': 1, 'output': 'eDP-1', 'is_active': True},
+                                                            {'id': 2, 'output': 'eDP-1', 'is_active': False}]}},
+                      {'WindowsChanged': {'windows': [{'id': 2, 'pid': 2243, 'workspace_id': 2, 'is_focused': False},
+                                                      {'id': 3, 'pid': 3000, 'workspace_id': 2,
+                                                       'is_focused': False}]}}):
+            self.freezer.window_event(event)
+        self.wait(AFTER - 10)
+        self.assertEqual(self.frozen(), set())  # Back: AFTER starts again from when it was.
+        self.wait(20)
+        self.assertEqual(self.frozen(), self.OBSIDIAN | {'app-niri-steam-3000.scope'})
+
+    def test_without_a_compositor_to_follow_nothing_is_ever_frozen(self):
+        blind = Freezer(['obsidian', 'steam'], self.apps, battery=lambda: True, proc=self.proc,
+                        clock=lambda: self.now, desktop=compositor.Desktop())
+        for _ in range(3):
+            self.now += AFTER
+            self.assertEqual(blind.step(True)['frozen'], [])
+        self.assertEqual(self.frozen(), set())
+
+    def test_defaults_come_from_the_configuration_and_flags_override_them(self):
+        self.assertEqual((AFTER, EVERY, THAW), (config.DEFAULTS['freeze']['after'] * 60,
+                                                config.DEFAULTS['freeze']['every'] * 60,
+                                                config.DEFAULTS['freeze']['thaw']))
+        with mock.patch.object(throttle, 'run') as run, mock.patch.object(freeze.signal, 'signal'), \
+                mock.patch.object(freeze, 'release_left'), \
+                mock.patch.object(freeze.compositor, 'detect', return_value=compositor.Niri()), \
+                mock.patch.dict(config.SETTINGS['freeze'], {'apps': ['obsidian', 'steam']}):
+            freeze.main([])
+            agent = run.call_args.args[0]
+            self.assertEqual((agent.patterns, agent.after, agent.every, agent.thaw),
+                             (('obsidian', 'steam'), AFTER, EVERY, THAW))
+            freeze.main(['Krita', '--after', '5', '--thaw', '3'])
+            agent = run.call_args.args[0]
+            self.assertEqual((agent.patterns, agent.after, agent.thaw), (('krita',), 300, 3))
+
+    def test_with_nothing_to_freeze_it_idles(self):
+        with mock.patch.object(throttle, 'run') as run, mock.patch.object(freeze.signal, 'signal'), \
+                mock.patch.object(freeze, 'release_left'), \
+                mock.patch.object(freeze.signal, 'pause', side_effect=SystemExit(0)) as pause, \
+                contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+            freeze.main([])  # The default configuration names no apps.
+        pause.assert_called_once()
+        run.assert_not_called()
+        self.assertIn('no apps to freeze', err.getvalue())
+
+
+class Stop(Exception):
+    pass
+
+
+class RunTests(unittest.TestCase):
+    def test_apps_frozen_while_niri_ran_thaw_when_its_stream_ends(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            apps, proc = Path(tmp) / 'app.slice', Path(tmp) / 'proc'
+            scope = apps / 'app-niri-steam-3000.scope'
+            scope.mkdir(parents=True)
+            (scope / 'cgroup.freeze').write_text('0\n')
+            (proc / '3000').mkdir(parents=True)
+            (proc / '3000' / 'cgroup').write_text(f'0::/user.slice/app.slice/{scope.name}\n')
+            events = [{'WorkspacesChanged': {'workspaces': [{'id': 1, 'output': 'eDP-1', 'is_active': True},
+                                                            {'id': 2, 'output': 'eDP-1', 'is_active': False}]}},
+                      {'WindowsChanged': {'windows': [{'id': 3, 'pid': 3000, 'workspace_id': 2,
+                                                       'is_focused': False}]}}]
+            # niri for a moment (its state, then it dies), and PipeWire with no streams.
+            text = chr(10).join(map(json.dumps, events))
+            niri = (sys.executable, '-c', f'import time; print({text!r}, flush=True); time.sleep(0.6)')
+            pw = (sys.executable, '-c', 'import time; print("[]", flush=True); time.sleep(30)')
+            seen = []
+
+            class Dies(compositor.Niri):
+                command = niri
+
+            class Watched(Freezer):
+                state_path = Path(tmp) / 'freeze.json'
+
+                def step(self, media_known):
+                    state = super().step(media_known)
+                    seen.append((self.desktop.known, (scope / 'cgroup.freeze').read_text().strip()))
+                    if ('1' in dict(seen).values() or len(seen) > 100) and not self.desktop.known:
+                        raise Stop
+                    return state
+
+            agent = Watched(['steam'], apps, battery=lambda: True, proc=proc, after=0, desktop=Dies())
+            with mock.patch.object(throttle, 'RESCAN', 0.2), self.assertRaises(Stop):
+                throttle.run(agent, pw_command=pw)
+        self.assertIn((True, '1'), seen)  # Frozen while niri was there,
+        self.assertEqual(seen[-1], (False, '0'))  # thawed once its stream ended.
 
 
 if __name__ == '__main__':

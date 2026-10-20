@@ -801,6 +801,23 @@ def banner_text(state, enabled, now=None, frozen='', quarantine=None):
     return text.strip()
 
 
+# The charts' categorical slots, validated on the panel's dark surface #222226
+# in this order (adjacent stack pairs cleared CVD ΔE 8.4 / normal 19.3).
+BLUE, ORANGE, GREEN, AMBER, PINK, DARK_GREEN, PURPLE = (
+    '#3987e5', '#d95926', '#199e70', '#c98500', '#d55181', '#008300', '#9085e9')
+GROUP_SLOTS = (BLUE, ORANGE, GREEN, PINK, PURPLE)  # The app groups', in that order.
+
+
+def chart_colors(groups):
+    """{stack name: colour}, bottom up: the neutrals of the always-on baseline,
+    the display, the app groups ([(name, prefixes)]: report.GROUPS, as
+    configured) taking GROUP_SLOTS by position (past the fifth they repeat),
+    and "Other apps"."""
+    return {report.IDLE: '#707076', 'Rest of system': '#aaaab0', 'Display': AMBER,
+            **{name: GROUP_SLOTS[i % len(GROUP_SLOTS)] for i, (name, _) in enumerate(groups)},
+            'Other apps': DARK_GREEN}
+
+
 def check(out=sys.stdout, budget=BUDGET, history=None):
     """Gather each period the panel shows (from the real database by default);
     0 if every part worked within the budget."""

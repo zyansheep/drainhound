@@ -1191,11 +1191,24 @@ GOLDEN_MODEL = {
     'soc:aspm': -0.40013907676817784, 'soc:profile': -0.0444838483274508, 't0': 1790000040.0, 't1': 1790035980.0,
     'usb': 0.29999999999999966, 'video': 0.9999999999999996, 'wifi': 0.2982796135730895}
 GOLDEN_TYPICAL = 8.749513557545683
+# The groups the pinned numbers were computed with (the original author's, now
+# set through [apps] groups), and the phrases they get now ('Close the browser'
+# and 'No builds or EDA jobs' before).
+OLD_GROUPS = {
+    'Browser': ['floorp', 'firefox', 'chromium', 'chrome', 'brave', 'zen'],
+    'Builds & EDA': ['openroad', 'yosys', 'strands', 'rustc', 'cargo', 'cc1', 'c compiler', 'c++ compiler', 'ld',
+                     'make', 'nix', 'klayout', 'verilator', 'iverilog', 'gcc', 'clang', 'cmake', 'ninja'],
+    'Coding tools': ['t3 code', 'vscodium', 'vs code', 'electron', 'claude', 'codex', 'node', 'cursor', 'kimi'],
+    'Chat & media': ['vesktop', 'signal', 'obsidian', 'pipewire', 'wireplumber', 'mpv', 'spotify'],
+    'Desktop & system': ['kernel', 'niri', 'waybar', 'notifications', 'wi-fi panel', 'system monitor', 'xwayland',
+                         'fcitx5', 'vicinae', 'systemd', 'dbus', 'networkmanager', 'iwd', 'tailscale', 'swayidle',
+                         'aw-', 'xdg-', 'swaylock', 'awww', 'wl-'],
+}
 GOLDEN_WHAT_IF = [  # name, minutes, low, high (rows[-200:], 50 Wh, 20 replicates)
-    ('Close the browser', 100.32823427236517, 97.62472194848975, 103.06890027683532),
+    ('Close browser', 100.32823427236517, 97.62472194848975, 103.06890027683532),
     ('Close Floorp', 100.32823427236517, 97.62472194848975, 103.06890027683532),
     ('Brightness at minimum', 75.93187860041502, 72.1013537687258, 77.74824983219452),
-    ('No builds or EDA jobs', 27.573273640893042, 27.212968638555523, 29.72639112365928),
+    ('Close builds & EDA', 27.573273640893042, 27.212968638555523, 29.72639112365928),
     ('Close yosys', 27.573273640893042, 27.212968638555523, 29.72639112365928),
     ('Brightness −20 points', 23.692304531353486, 22.13919572844455, 24.005643875972243)]
 GOLDEN_POWER = 8.94082383609107
@@ -1209,6 +1222,13 @@ GOLDEN_IDLE = {'Memory & I/O links': 0.6695594930266624, 'Fabric & display engin
 class TwoStageUnchangedTests(unittest.TestCase):
     def assert_close(self, a, b, msg=None):
         self.assertAlmostEqual(a, b, delta=1e-9 * max(1.0, abs(b)), msg=msg)
+
+    def setUp(self):
+        groups = report.configured_groups(OLD_GROUPS)
+        for patch in (mock.patch.object(report, 'GROUPS', groups),
+                      mock.patch.object(report, 'APP_GROUPS', [name for name, _ in groups] + ['Other apps'])):
+            patch.start()
+            self.addCleanup(patch.stop)
 
     def test_results_with_chip_power_are_as_before(self):
         minutes = golden_minutes()

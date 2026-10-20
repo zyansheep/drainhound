@@ -941,12 +941,16 @@ def clock(hours):
 
 
 # Font Awesome glyphs as escapes: private-use characters are invisible in most
-# editors and were once silently lost, leaving the charging bolt blank.
+# editors and were once silently lost, leaving the charging bolt blank. With
+# [waybar] glyphs = 'text', icon() shows TEXT_GLYPHS instead, in the bar's font.
 BOLT, PLUG, HOURGLASS, POWER = '\uf0e7', '\uf1e6', '\uf252', '\uf011'
+TEXT_GLYPHS = {BOLT: '⚡', PLUG: '🔌', HOURGLASS: '⏳', POWER: '⚠'}  # Emoji fonts have these; few have ⏻.
 APPROX = "<span size='small' alpha='70%'>~</span>"
 
 
 def icon(glyph):
+    if config.get('waybar', 'glyphs') != 'fontawesome':
+        return TEXT_GLYPHS.get(glyph, glyph)
     return f"<span font_family='Font Awesome 7 Free' weight='heavy' size='small'>{glyph}</span>"
 
 

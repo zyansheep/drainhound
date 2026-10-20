@@ -8,8 +8,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from wattif import collector
+from wattif import collector, config
 from wattif.collector import History, processes, temperatures, process_label, process_identity, browser_labels, TICKS, PAGE
+from tests import test_power
 
 
 class MonitorTests(unittest.TestCase):
@@ -201,6 +202,89 @@ class MonitorTests(unittest.TestCase):
             power.update.assert_called_once_with(boot, wall, {})  # Clocks read after the scan, together.
             self.assertEqual(json.loads((directory / 'snapshot.json').read_text())['battery'], state['battery'])
             self.assertEqual((directory / 'snapshot.json').stat().st_mode & 0o777, 0o600)  # Its process names: yours.
+
+
+class PortableNamesTests(unittest.TestCase):
+    def test_every_firefox_family_browser_gets_its_sites_from_the_bridge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            current = {(42, 100): ('LibreWolf web · PID 42', 1, 100), (43, 100): ('Floorp worker · PID 43', 1, 100),
+                       (44, 100): ('Chromium web · PID 44', 1, 100)}  # Chromium has no bridge: left as it is.
+            (directory / '7.json').write_text(json.dumps({'timestamp': 10, 'browser': 'LibreWolf', 'processes': [
+                {'pid': pid, 'start': 100, 'origin': 'https://example.org', 'titles': ['A & B']}
+                for pid in (42, 43, 44)]}))
+            state = {'cpu': [{'name': name} for name, *_ in current.values()], 'memory': []}
+            browser_labels(state, current, directory, now=10)
+            self.assertEqual([row['name'] for row in state['cpu']],
+                             ['LibreWolf · https://example.org · A & B · PID 42',
+                              'Floorp · https://example.org · A & B · PID 43', 'Chromium web · PID 44'])
+            browser_labels(state, current, None, now=10)  # No bridge directory: nothing to do.
+        self.assertEqual(process_label(5, 'Isolated Web Co', 'Zen Browser', ''), 'Zen Browser web · PID 5')
+        self.assertEqual(process_label(6, 'chromium', 'Brave', 'renderer'), 'Brave web · PID 6')
+
+    def test_the_bridge_directory_follows_the_configuration(self):
+        with mock.patch.dict(os.environ, {'XDG_RUNTIME_DIR': '/run/user/1000'}):
+            self.assertEqual(collector.browser_directory(), Path('/run/user/1000/firefox-processes'))
+            with mock.patch.dict(config.SETTINGS['apps'], {'firefox_processes': '$XDG_RUNTIME_DIR/floorp-monitor'}):
+                self.assertEqual(collector.browser_directory(), Path('/run/user/1000/floorp-monitor'))
+        with mock.patch.dict(os.environ, clear=True):
+            self.assertIsNone(collector.browser_directory())
+        with tempfile.TemporaryDirectory() as tmp:  # collect() reads where browser_directory says.
+            asked = []
+            power = mock.Mock()
+            power.update.return_value = {'rows': []}
+            began = time.clock_gettime(time.CLOCK_BOOTTIME)
+            with mock.patch('wattif.collector.clocks', return_value=(began + 0.1, time.time())):
+                collector.collect(power, History(), Path(tmp), began, scan=lambda: {}, sensors=lambda: [],
+                                  browsers=lambda: asked.append(1))
+            self.assertEqual(asked, [1])
+
+    def test_names_are_generic_and_the_configuration_adds_its_own(self):
+        for exe, name in (('librewolf', 'LibreWolf'), ('brave', 'Brave'), ('signal-desktop', 'Signal'),
+                          ('gnome-shell', 'GNOME Shell'), ('code', 'VS Code')):
+            self.assertEqual(collector.APP_NAMES[exe], name)
+        self.assertNotIn('chatgpt', collector.APP_NAMES)
+        self.assertEqual([key for key in collector.ELECTRON_APPS if key not in collector.APP_NAMES], [])
+        self.assertEqual(collector.configured_names({'MyEDA': 'My EDA', 'yosys': 'Yosys'}),
+                         {'myeda': 'My EDA', 'yosys': 'Yosys'})
+        self.assertEqual(collector.configured_names(), {})  # The default configuration adds none.
+        self.assertEqual(collector.configured_names(['not', 'a', 'table']), {})
+
+    def test_electron_apps_are_named_by_their_installed_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp)
+            (p / 'exe').symlink_to('/usr/lib/electron33/electron')
+            for path, name in ((b'/usr/lib/signal-desktop/resources/app.asar', 'Signal'),
+                               (b'/usr/share/element/resources/app.asar', 'Element'),
+                               (b'/opt/my-notes/resources/app.asar', 'Electron')):
+                (p / 'cmdline').write_bytes(b'electron\0' + path + b'\0')
+                self.assertEqual(process_identity(p, 'electron'), (name, ''))
+            # [apps] names keys name Electron apps too.
+            with mock.patch.object(collector, 'ELECTRON_APPS', collector.ELECTRON_APPS + ('my-notes',)), \
+                    mock.patch.dict(collector.APP_NAMES, {'my-notes': 'My Notes'}):
+                self.assertEqual(process_identity(p, 'electron'), ('My Notes', ''))
+
+
+class ScreenLockTests(unittest.TestCase):
+    """power.Monitor's `locked`: one of [session] lockers is running."""
+    setUp, tearDown, monitor = (test_power.MonitorTests.setUp, test_power.MonitorTests.tearDown,
+                                test_power.MonitorTests.monitor)
+
+    def record(self, locker):
+        monitor = self.monitor()
+        running = {(77, 100): (locker, 0.0, 0, locker)}
+        for _ in range(6):
+            self.uptime[0] += 2
+            monitor.update(self.uptime[0], self.wall + self.uptime[0] - 1000, running)
+        monitor.close()
+        return monitor.log.recent(0)[-1]
+
+    def test_any_configured_locker_means_locked(self):
+        self.assertTrue(self.record('hyprlock')['locked'])
+        self.assertFalse(self.record('Firefox')['locked'])
+        with mock.patch.dict(config.SETTINGS['session'], {'lockers': ['my-locker']}):
+            self.assertTrue(self.record('my-locker')['locked'])
+
 
 if __name__ == '__main__':
     unittest.main()

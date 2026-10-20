@@ -10,23 +10,27 @@ capped, the emoji picker took 4–6 s to paste. Apps playing or recording audio 
 and so is everything on AC. KEEP is where real work runs in the background:
 terminals and editors/IDEs (builds, agent CLIs and language servers run in
 their scopes; capped, a build ran 10× slower whenever another window had
-focus), T3 Code's agents and the input method that serves the focused app.
+focus), agent apps and the input method that serves the focused app.
 
 An app is every systemd scope in app.slice with the same launch pid: Electron
 apps move their main process into a scope of their own (app-vesktop-2295)
-and leave the renderers in the one niri started (app-niri-vesktop-2295), so
-freeing only the window's scope left Discord's renderers capped — frozen —
-while it was focused. The quota is the app's: its scopes share it equally (a
+and leave the renderers in the one the launcher started
+(app-niri-vesktop-2295), so freeing only the window's scope left Discord's
+renderers capped — frozen — while it was focused. The quota is the app's: its scopes share it equally (a
 two-scope app gets QUOTA/2 per scope, not QUOTA each).
 
     wattif throttle [--quota N] [--keep PATTERN ...]
     wattif throttle --release      (lift every quota; the unit's ExecStopPost)
 
 wattif-throttle.service runs it; wattif experiment's throttle-apps setting starts
-and stops that unit. It follows focus from niri's event stream and streams
-from `pw-dump --monitor`, so between changes it does nothing but a RESCAN for
-new apps and AC changes. RUNTIME/throttle.json says what it throttles, for
-the collector. Stopping it lifts every quota.
+and stops that unit. It follows focus from the compositor's event stream
+(compositor.py: niri or sway; elsewhere it knows no windows, so it caps
+nothing) and streams from `pw-dump --monitor`, so between changes it does
+nothing but a RESCAN for new apps and AC changes. RUNTIME/throttle.json says
+what it throttles, for the collector. Stopping it lifts every quota.
+
+The quota, the grace period and more apps to keep come from the configuration
+([throttle] quota, grace, keep); --quota and --keep override them.
 """
 import argparse
 import json
@@ -39,19 +43,25 @@ import sys
 import time
 from pathlib import Path
 
+from . import compositor
 from . import config
 
-QUOTA = 10  # % of one core per background app, shared by its scopes.
-GRACE = 120  # s an app stays free after it loses focus.
+QUOTA = config.get('throttle', 'quota')  # % of one core per background app, shared by its scopes.
+GRACE = config.get('throttle', 'grace')  # s an app stays free after it loses focus.
 PERIOD = 100_000  # µs: cgroup cpu.max's period.
 MINIMUM = 1000  # µs: the smallest quota cpu.max takes.
 UNLIMITED = f'max {PERIOD}'
 # Matched (case-insensitively) anywhere in the scope's name, systemd escapes undone.
-TERMINALS = ('foot', 'kitty', 'alacritty', 'wezterm', 'ghostty', 'konsole', 'gnome-terminal', 'xterm',
-             'terminator', 'tilix')
-EDITORS = ('code', 'codium', 'zed', 'emacs', 'neovide', 'jetbrains', 'sublime', 'gvim')  # 'code': VS Code, T3 Code.
-# Agents keep working; the input method types into the focused app; builds run in terminals and editors.
-KEEP = ('t3code', 'fcitx5') + TERMINALS + EDITORS
+TERMINALS = ('foot', 'kitty', 'alacritty', 'wezterm', 'ghostty', 'konsole', 'terminal', 'xterm', 'tilix',
+             'terminator', 'ptyxis', 'kgx', 'gnome.console', 'blackbox', 'contour', 'urxvt', 'tmux', 'zellij')
+# 'code': VS Code, Code - OSS and agent apps named so (T3 Code); 'terminal': GNOME's, Xfce's, MATE's, ...
+EDITORS = ('code', 'codium', 'cursor', 'windsurf', 'zed', 'emacs', 'neovide', 'gvim', 'jetbrains', 'intellij',
+           'pycharm', 'android-studio', 'sublime', 'kate', 'kdevelop', 'qtcreator', 'builder', 'eclipse', 'lapce')
+INPUT_METHODS = ('fcitx', 'ibus')  # They type into the focused app (and have no window to be capped by).
+# Builds, agent CLIs and language servers run in terminals and editors; agents keep working.
+KEEP = INPUT_METHODS + TERMINALS + EDITORS
+# Who started a scope: app-<launcher>-<app id>-<pid or random>.scope (systemd's naming for desktop apps).
+LAUNCHERS = ('niri', 'gnome', 'flatpak', 'kde')
 RESCAN = 5  # s: new apps, AC changes.
 RUNTIME = config.RUNTIME
 STATE = RUNTIME / 'throttle.json'
@@ -71,49 +81,20 @@ def on_battery(power=Path('/sys/class/power_supply')):
 
 
 class Session:
-    """What the desktop is doing, from niri's and PipeWire's event streams:
-    which app has focus, which have windows, which play or record media.
-    wattif throttle and wattif freeze (freeze.py) act on it."""
+    """What the desktop is doing, from the compositor's and PipeWire's event
+    streams: which app has focus, which have windows, which play or record
+    media. wattif throttle and wattif freeze (freeze.py) act on it. `desktop`
+    is a compositor backend (main() picks it with compositor.detect(); niri's
+    by default)."""
 
-    def __init__(self, apps=APPS, battery=on_battery, proc=Path('/proc'), clock=time.monotonic):
+    def __init__(self, apps=APPS, battery=on_battery, proc=Path('/proc'), clock=time.monotonic, desktop=None):
         self.apps, self.battery, self.proc, self.clock = apps, battery, proc, clock
-        self.windows, self.focused, self.nodes = {}, None, {}  # window id → pid; PipeWire node id → what we know
-        # Window id → its workspace, and when it last had focus (niri's focus_timestamp: CLOCK_MONOTONIC, s).
-        self.placed, self.focus_times = {}, {}
-        self.workspaces = {}  # Workspace id → [output, active]
-
-    def window(self, window):
-        self.windows[window['id']] = window.get('pid')
-        self.placed[window['id']] = window.get('workspace_id')
-        if stamp := window.get('focus_timestamp'):
-            self.focus_times[window['id']] = stamp.get('secs', 0) + stamp.get('nanos', 0) / 1e9
+        self.desktop = desktop if desktop is not None else compositor.Niri()
+        self.nodes = {}  # PipeWire node id → what we know
 
     def window_event(self, event):
-        """One line of `niri msg -j event-stream`."""
-        if 'WindowsChanged' in event:
-            windows = event['WindowsChanged']['windows']
-            self.windows, self.placed, self.focus_times = {}, {}, {}
-            for window in windows:
-                self.window(window)
-            self.focused = next((w['id'] for w in windows if w.get('is_focused')), None)
-        elif 'WindowOpenedOrChanged' in event:
-            window = event['WindowOpenedOrChanged']['window']
-            self.window(window)
-            if window.get('is_focused'):
-                self.focused = window['id']
-        elif 'WindowClosed' in event:
-            for known in (self.windows, self.placed, self.focus_times):
-                known.pop(event['WindowClosed']['id'], None)
-        elif 'WindowFocusChanged' in event:
-            self.focused = event['WindowFocusChanged']['id']
-        elif 'WorkspacesChanged' in event:
-            self.workspaces = {w['id']: [w.get('output'), bool(w.get('is_active'))]
-                               for w in event['WorkspacesChanged']['workspaces']}
-        elif 'WorkspaceActivated' in event:  # Active on its output, instead of the one there was.
-            output = self.workspaces.get(event['WorkspaceActivated']['id'], [None])[0]
-            for workspace, known in self.workspaces.items():
-                if known[0] == output:
-                    known[1] = workspace == event['WorkspaceActivated']['id']
+        """One event from the compositor's stream (niri's: one line of `niri msg -j event-stream`)."""
+        self.desktop.event(event)
 
     def media_event(self, objects):
         """One batch of `pw-dump --monitor`: nodes added, changed (possibly only
@@ -150,7 +131,11 @@ class Session:
 
     def focused_app(self):
         """The focused window's app (app_of), or None."""
-        return app_of(self.scope_of(self.windows.get(self.focused)) or '') or None
+        return app_of(self.scope_of(self.desktop.pid(self.desktop.focused)) or '') or None
+
+    def windowed(self):
+        """Apps with a window."""
+        return {app_of(self.scope_of(w['pid']) or '') for w in self.desktop.windows.values()} - {''}
 
     def playing(self):
         """Apps with an audio or video stream running."""
@@ -158,16 +143,16 @@ class Session:
 
     def shown(self):
         """Apps with a window on a workspace that is active on its output: maybe
-        on screen (niri doesn't say which of its columns are in view)."""
-        return {app_of(self.scope_of(pid) or '') for window, pid in self.windows.items()
-                if self.workspaces.get(self.placed.get(window), [None, False])[1]}
+        on screen (compositor.Desktop.shown)."""
+        return {app_of(self.scope_of(self.desktop.pid(window)) or '') for window in self.desktop.windows
+                if self.desktop.shown(window)}
 
     def last_focused(self):
-        """{app: when one of its windows last had focus} (niri's clock, CLOCK_MONOTONIC)."""
+        """{app: when one of its windows last had focus} (CLOCK_MONOTONIC)."""
         out = {}
-        for window, stamp in self.focus_times.items():
-            app = app_of(self.scope_of(self.windows.get(window)) or '')
-            if app:
+        for window in self.desktop.windows.values():
+            app, stamp = app_of(self.scope_of(window['pid']) or ''), window.get('focus')
+            if app and stamp is not None:
                 out[app] = max(out.get(app, stamp), stamp)
         return out
 
@@ -176,10 +161,10 @@ class Throttle(Session):
     state_path = STATE
 
     def __init__(self, apps=APPS, quota=QUOTA, keep=KEEP, battery=on_battery, proc=Path('/proc'), grace=GRACE,
-                 clock=time.monotonic):
-        super().__init__(apps, battery, proc, clock)
+                 clock=time.monotonic, desktop=None):
+        super().__init__(apps, battery, proc, clock, desktop)
         self.keep, self.grace = tuple(k.lower() for k in keep), grace
-        self.quota = quota * PERIOD // 100  # µs per period for a whole app.
+        self.quota = int(quota * PERIOD // 100)  # µs per period for a whole app.
         self.limit = f'{self.quota} {PERIOD}'
         self.current, self.left = None, {}  # The focused app; when each app last lost focus.
 
@@ -198,7 +183,7 @@ class Throttle(Session):
         self.left = {app: left for app, left in self.left.items() if now - left < self.grace}
         free |= set(self.left)
         free |= {app_of(s) for s in scopes if any(k in unescape(s).lower() for k in self.keep)}
-        windowed = {app_of(self.scope_of(pid) or '') for pid in self.windows.values()} - {''}
+        windowed = self.windowed()  # Empty once the compositor's stream has ended (Desktop.clear): nothing capped.
         capped = {s for s in scopes if app_of(s) in windowed and app_of(s) not in free}
         shares = {}  # The app's quota, split between its scopes.
         for scope in capped:
@@ -244,10 +229,16 @@ def unescape(scope):
 
 
 def label(scope):
-    """'app-niri-floorp-2240.scope' → 'floorp', 'app-md.Obsidian-2243.scope' → 'Obsidian'."""
-    name = unescape(scope).removesuffix('.scope').removeprefix('app-').removeprefix('niri-')
-    name = name.rpartition('-')[0] if name.rpartition('-')[2].isdigit() else name
-    return name.rpartition('.')[2]
+    """'app-niri-floorp-2240.scope' → 'floorp', 'app-md.Obsidian-2243.scope' →
+    'Obsidian', 'app-gnome-org.gnome.Terminal-3061.scope' → 'Terminal': the
+    launcher (LAUNCHERS) and the trailing pid or random id go, as
+    experiment.unit_label's do; so does a reverse-DNS app id's domain. Done on
+    the escaped name, where only systemd's own separators are '-' (an app id's
+    are '\\x2d'), so 'app-gnome\\x2dcalculator-9.scope' stays 'gnome-calculator'."""
+    name = scope.removesuffix('.scope').removeprefix('app-')
+    name = re.sub(rf'^(?:{"|".join(LAUNCHERS)})-', '', name)
+    name = re.sub(r'-(?:\d+|[0-9a-f]{16,})$', '', name)
+    return unescape(name).rpartition('.')[2]
 
 
 def write_state(state, path=STATE):
@@ -280,40 +271,39 @@ class Stream:
             self.buffer += chunk.decode(errors='replace')
             return True
         self.selector.unregister(self.process.stdout)
+        self.process.stdout.close()
         self.process.wait()
-        self.process, self.retry = None, time.monotonic() + RESCAN  # It exited (niri or PipeWire restarting).
+        self.process, self.retry = None, time.monotonic() + RESCAN  # It exited (the compositor or PipeWire restarting).
         return False
 
     def stop(self):
         if self.process:
             self.process.terminate()
+            try:
+                self.process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
+            self.process.stdout.close()
 
 
-def lines(stream):
-    *complete, stream.buffer = stream.buffer.split('\n')
-    return [json.loads(line) for line in complete if line.strip()]
+lines = compositor.json_lines  # niri: one event per line.
+batches = compositor.json_values  # pw-dump: one JSON array per batch of changes.
 
 
-def batches(stream):
-    """pw-dump prints one JSON array per batch of changes."""
-    decoder, out = json.JSONDecoder(), []
-    while True:
-        text = stream.buffer.lstrip()
-        try:
-            value, end = decoder.raw_decode(text)
-        except ValueError:
-            stream.buffer = text
-            return out
-        out.append(value)
-        stream.buffer = text[end:]
-
-
-def run(agent, niri_command=('niri', 'msg', '-j', 'event-stream'), pw_command=('pw-dump', '--monitor')):
-    """Feed `agent` (a Session: Throttle, freeze.Freezer) niri's and PipeWire's
-    events and act (its step()) after each batch, or every RESCAN; its state
-    goes to agent.state_path. Stopping releases what it did."""
+def run(agent, pw_command=('pw-dump', '--monitor')):
+    """Feed `agent` (a Session: Throttle, freeze.Freezer) the compositor's
+    (agent.desktop's) and PipeWire's events and act (its step()) after each
+    batch, or every RESCAN; its state goes to agent.state_path. When a stream
+    ends, what it said is forgotten until it is back: the windows (so nothing
+    acts on a dead compositor's) and the media streams (apps are left alone
+    meanwhile). Stopping releases what it did."""
     selector = selectors.DefaultSelector()
-    niri, pw = Stream(list(niri_command), selector), Stream(list(pw_command), selector)
+    desktop = agent.desktop
+    windows = Stream(list(desktop.command), selector) if desktop.command else None
+    if windows is not None and windows.process is not None:
+        desktop.started()
+    pw = Stream(list(pw_command), selector)
     started, last = time.time(), None
     try:
         while True:
@@ -321,32 +311,45 @@ def run(agent, niri_command=('niri', 'msg', '-j', 'event-stream'), pw_command=('
                 stream = key.data
                 if not stream.read():
                     if stream is pw:
-                        agent.nodes.clear()  # Unknown until it is back (apps are left alone meanwhile).
+                        agent.nodes.clear()
+                    else:
+                        desktop.clear()
                     continue
-                if stream is niri:
-                    for event in lines(niri):
-                        agent.window_event(event)
+                if stream is windows:
+                    for event in desktop.decode(windows):
+                        desktop.event(event)
                 else:
                     for batch in batches(pw):
                         agent.media_event(batch)
-            for stream in (niri, pw):
+            for stream in filter(None, (windows, pw)):
                 if stream.process is None and time.monotonic() >= stream.retry:
                     stream.start()
+                    if stream is windows and stream.process is not None:
+                        desktop.started()
             state = {'pid': os.getpid(), 'since': started, **agent.step(pw.process is not None)}
             if state != last:
                 write_state(state, agent.state_path)
                 last = state
     finally:
-        niri.stop()
-        pw.stop()
+        for stream in filter(None, (windows, pw)):
+            stream.stop()
         agent.release()
         agent.state_path.unlink(missing_ok=True)
 
 
+def keep_patterns(extra=None):
+    """Scope patterns never throttled: KEEP and the configuration's [throttle] keep (or `extra`)."""
+    extra = config.get('throttle', 'keep') if extra is None else extra
+    return KEEP + tuple(str(k) for k in extra or ())
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog='wattif throttle', description=__doc__.split('\n\n')[0])
-    parser.add_argument('--quota', type=int, default=QUOTA, help='%% of one core per background app (all its scopes)')
-    parser.add_argument('--keep', action='append', help=f'scope patterns never throttled (default: {", ".join(KEEP)})')
+    parser.add_argument('--quota', type=int, default=QUOTA,
+                        help=f'%% of one core per background app, all its scopes (default: [throttle] quota, {QUOTA})')
+    parser.add_argument('--keep', action='append',
+                        help='a scope pattern never throttled, instead of [throttle] keep; terminals, editors and '
+                             f'input methods always are ({", ".join(KEEP)})')
     parser.add_argument('--release', action='store_true', help='lift every quota and exit')
     args = parser.parse_args(argv)
     if args.release:
@@ -354,7 +357,11 @@ def main(argv=None):
         STATE.unlink(missing_ok=True)
         return
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    run(Throttle(quota=max(1, min(args.quota, 100)), keep=args.keep if args.keep is not None else KEEP))
+    desktop = compositor.detect()
+    if desktop.command is None:
+        print(f"wattif throttle: {compositor.unsupported()} isn't supported (niri and sway are): no windows are "
+              'known, so nothing is capped', file=sys.stderr)
+    run(Throttle(quota=max(1, min(int(args.quota), 100)), keep=keep_patterns(args.keep), desktop=desktop))
 
 
 if __name__ == '__main__':

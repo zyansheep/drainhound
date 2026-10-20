@@ -42,17 +42,41 @@ from . import store  # noqa: E402
 
 LOG = config.LOG  # The JSONL archive, models.json and index.json.
 
-# Stable groups so a color always means the same thing across periods.
-GROUPS = [
-    ('Browser', ('Floorp', 'Firefox', 'Chromium', 'Chrome', 'Brave', 'Zen')),
-    ('Builds & EDA', ('openroad', 'yosys', 'strands', 'rustc', 'cargo', 'cc1', 'C compiler', 'C++ compiler',
-                      'ld', 'make', 'nix', 'klayout', 'verilator', 'iverilog', 'gcc', 'clang', 'cmake', 'ninja')),
-    ('Coding tools', ('T3 Code', 'VSCodium', 'VS Code', 'Electron', 'claude', 'codex', 'node', 'Cursor', 'kimi')),
-    ('Chat & media', ('Vesktop', 'Signal', 'signal', 'Obsidian', 'PipeWire', 'WirePlumber', 'mpv', 'spotify')),
-    ('Desktop & system', ('Kernel', 'Niri', 'Waybar', 'Notifications', 'Wi-Fi panel', 'System monitor', 'Xwayland',
-                          'fcitx5', 'vicinae', 'systemd', 'dbus', 'NetworkManager', 'iwd', 'tailscale', 'swayidle',
-                          'aw-', 'xdg-', 'swaylock', 'awww', 'wl-')),
+# Stable groups so a color always means the same thing across periods: name →
+# prefixes of the app names the collector logs (its display names, else the
+# executable's), matched ignoring case. [apps] groups replaces them.
+DEFAULT_GROUPS = [
+    ('Browsers', ('firefox', 'librewolf', 'floorp', 'zen browser', 'waterfox', 'mullvad browser', 'chromium',
+                  'chrome', 'brave', 'vivaldi', 'microsoft edge', 'opera', 'gnome web', 'falkon', 'qutebrowser')),
+    # Editors and IDEs, terminals, compilers and build tools, coding agents.
+    ('Coding tools', ('vs code', 'code - oss', 'vscodium', 'cursor', 'windsurf', 'zed', 't3 code', 'emacs', 'neovim',
+                      'nvim', 'vim', 'gvim', 'neovide', 'helix', 'sublime', 'kate', 'text editor', 'jetbrains',
+                      'foot', 'kitty', 'alacritty', 'wezterm', 'ghostty', 'konsole', 'gnome terminal', 'console',
+                      'ptyxis', 'xterm', 'tilix', 'tmux', 'zellij', 'bash', 'zsh', 'fish',
+                      'c compiler', 'c++ compiler', 'cc1', 'gcc', 'g++', 'clang', 'rustc', 'cargo', 'ld', 'lld',
+                      'mold', 'make', 'cmake', 'ninja', 'meson', 'javac', 'gradle', 'node', 'npm', 'pnpm', 'bun',
+                      'deno', 'nix', 'claude', 'codex', 'gemini', 'aider', 'opencode', 'copilot')),
+    ('Chat & media', ('vesktop', 'discord', 'signal', 'slack', 'element', 'telegram', 'teams', 'zoom', 'thunderbird',
+                      'spotify', 'mpv', 'vlc', 'celluloid', 'totem', 'obs studio', 'pipewire', 'wireplumber',
+                      'pulseaudio', 'easyeffects')),
+    ('Desktop & system', ('kernel', 'niri', 'sway', 'hyprland', 'gnome shell', 'gnome-shell', 'kwin', 'plasma',
+                          'xwayland', 'xorg', 'waybar', 'polybar', 'notifications', 'mako', 'dunst', 'swaync',
+                          'fcitx', 'ibus', 'swayidle', 'hypridle', 'swaylock', 'hyprlock', 'swaybg', 'swww', 'xdg-',
+                          'wl-', 'systemd', 'dbus', 'networkmanager', 'iwd', 'wpa_supplicant', 'bluetoothd',
+                          'upowerd', 'power-profiles', 'polkit', 'gvfs', 'gsd-', 'at-spi', 'wattif')),
 ]
+
+
+def configured_groups(groups=None):
+    """[(name, prefixes)]: [apps] groups ({name: [prefix, ...]}, in order) if set, else DEFAULT_GROUPS."""
+    groups = config.get('apps', 'groups') if groups is None else groups
+    if not isinstance(groups, dict) or not groups:
+        return DEFAULT_GROUPS
+    return [(str(name), tuple(str(p).lower() for p in ([prefixes] if isinstance(prefixes, str) else prefixes or ())))
+            for name, prefixes in groups.items() if str(name) != 'Other apps']
+
+
+GROUPS = configured_groups()
 APP_GROUPS = [name for name, _ in GROUPS] + ['Other apps']
 IDLE = power.IDLE
 DEVICES = (('Display', 'bl'), ('Wi-Fi', 'wifi'), ('Storage', 'disk'), ('USB devices', 'usb'),
@@ -79,10 +103,22 @@ def display_name(app):
 
 
 def group_of(app):
+    name = app.lower()
     for group, prefixes in GROUPS:
-        if app.startswith(prefixes):
+        if name.startswith(prefixes):
             return group
     return 'Other apps'
+
+
+def system_group():
+    """The desktop's own group (the kernel's): its apps aren't for closing."""
+    group = group_of('Kernel')
+    return None if group == 'Other apps' else group
+
+
+def close_phrase(group):
+    """'Close coding tools', 'Close EDA jobs': the group's name, lower-cased unless it starts with an acronym."""
+    return f'Close {group[:1].lower() + group[1:] if group[1:2].islower() else group}'
 
 
 def load_range(start, end, db=None, apps=True):
@@ -571,13 +607,11 @@ def candidates(rows, model, top=5):
         return lambda c: c['chip'] * (c['load'] * columns[:, 0] + raised(c) * share
                                       + c['gpu'] * columns[:, 1] + c['video'] * columns[:, 2])
     items = {}
-    phrases = {'Browser': 'Close the browser', 'Builds & EDA': 'No builds or EDA jobs',
-               'Coding tools': 'Close coding tools', 'Chat & media': 'Close chat & media',
-               'Other apps': 'Close other apps'}
+    system = system_group()
     for group in APP_GROUPS:
-        if group in phrases and members.get(group):
-            items[phrases[group]] = activity(members[group])
-    apps = [name for name, _ in usage.most_common() if name != 'Kernel' and group_of(name) != 'Desktop & system']
+        if group != system and members.get(group):
+            items[close_phrase(group)] = activity(members[group])
+    apps = [name for name, _ in usage.most_common() if name != 'Kernel' and group_of(name) != system]
     for name in apps[:top]:
         items[f'Close {display_name(name)}'] = activity({name})
     bl = np.array([m.get('bl') or 0 for m in rows])
