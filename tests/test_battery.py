@@ -53,6 +53,31 @@ class BatteryTests(unittest.TestCase):
         self.assertAlmostEqual(batteries.energy_wh(reading), 1.5 * 15.5)  # At the voltage now.
         self.assertIsNone(reading['mains'])                               # No charger known.
 
+    def test_the_unit_is_the_one_with_a_now_and_a_full_charge(self):
+        # A bq27xxx gauge: energy_now, but the full charge only as charge_full (read in Wh, it had none).
+        path = supply(self.root, 'BAT0', type='Battery', status='Discharging', energy_now=22_000_000,
+                      charge_now=1_500_000, charge_full=3_000_000, charge_full_design=3_200_000,
+                      current_now=1_000_000, voltage_now=14_700_000, capacity=50)
+        reading = batteries.read(self.root)
+        self.assertEqual((reading['unit'], reading['now'], reading['full'], reading['design']), ('Ah', 1.5, 3.0, 3.2))
+        (path / 'energy_full').write_text('44000000\n')                         # Both whole: Wh first.
+        self.assertEqual((batteries.unit_of(path), batteries.read(self.root)['full']), ('Wh', 44.0))
+        (path / 'energy_full').write_text('0\n')                                # A full of 0 is none.
+        self.assertEqual(batteries.unit_of(path), 'Ah')
+        (path / 'charge_now').unlink()                                         # Neither whole: the one with a now,
+        reading = batteries.read(self.root)
+        self.assertEqual((reading['unit'], reading['now'], reading['capacity']), ('Wh', 22.0, 50))
+        (path / 'energy_now').unlink()
+        (path / 'energy_full').unlink()
+        self.assertEqual(batteries.unit_of(path), 'Ah')                         # else the one with a full,
+        (path / 'charge_full').unlink()
+        (path / 'charge_full_design').unlink()
+        (path / 'energy_full').write_text('44000000\n')
+        self.assertEqual(batteries.unit_of(path), 'Wh')
+        (path / 'energy_full').unlink()
+        self.assertEqual(batteries.unit_of(path), 'Ah')                         # else Ah.
+        self.assertIsNone(batteries.read(self.root)['now'])
+
     def test_signs_follow_the_status(self):
         path = supply(self.root, 'BAT0', **dict(THINKPAD, status='Charging'))
         self.assertEqual(batteries.supply_watts(path), ('Charging', -8.5, 8.5))

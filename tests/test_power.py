@@ -2,6 +2,7 @@ import contextlib
 import io
 import json
 import os
+import socket
 import sqlite3
 import tempfile
 import time
@@ -15,6 +16,34 @@ from wattif.power import (PRIOR, Deltas, FastSampler, GpuClients, IdleStates, Mo
                    chip_rails, clock_means, clock_split, clocks, cpu_frequency, device_deltas, experiment_assignment,
                    idle_deltas, idle_parts, interrupts, load_attribution, log_footer, network, own_cpu, parse_fdinfo,
                    percentages, settings, subtract, summarize, TICKS)
+
+
+# `niri msg -j outputs` and `swaymsg -r -t get_outputs` (sway 1.10: an LVDS panel, a monitor it has
+# powered down, one disabled).
+NIRI_OUTPUTS = {'eDP-1': {'name': 'eDP-1', 'make': 'BOE', 'model': '0x0BCA', 'current_mode': 1, 'vrr_enabled': False,
+                          'modes': [{'width': 2256, 'height': 1504, 'refresh_rate': 47998, 'is_preferred': False},
+                                    {'width': 2256, 'height': 1504, 'refresh_rate': 59999, 'is_preferred': True}],
+                          'logical': {'x': 0, 'y': 0, 'width': 1504, 'height': 1003, 'scale': 1.5}},
+                'HDMI-A-1': {'name': 'HDMI-A-1', 'current_mode': None, 'modes': [], 'logical': None}}
+SWAY_OUTPUTS = [
+    {'id': 3, 'type': 'output', 'name': 'LVDS-1', 'make': 'AU Optronics', 'model': '0x213E', 'active': True,
+     'dpms': True, 'power': True, 'primary': False, 'scale': 1.0, 'transform': 'normal',
+     'adaptive_sync_status': 'disabled', 'current_workspace': '1',
+     'modes': [{'width': 1366, 'height': 768, 'refresh': 60008, 'picture_aspect_ratio': 'none'},
+               {'width': 1366, 'height': 768, 'refresh': 40005, 'picture_aspect_ratio': 'none'}],
+     'current_mode': {'width': 1366, 'height': 768, 'refresh': 40005, 'picture_aspect_ratio': 'none'}},
+    {'id': 4, 'type': 'output', 'name': 'DP-2', 'active': True, 'dpms': False, 'power': False, 'scale': 2.0,
+     'adaptive_sync_status': 'enabled', 'modes': [{'width': 3840, 'height': 2160, 'refresh': 60000}],
+     'current_mode': {'width': 3840, 'height': 2160, 'refresh': 60000}},
+    {'type': 'output', 'name': 'HDMI-A-1', 'active': False, 'dpms': False, 'power': False, 'primary': False,
+     'modes': [{'width': 1920, 'height': 1080, 'refresh': 60000}], 'current_workspace': None}]
+
+
+def unix_socket(stack, path):
+    """A listening Unix socket at `path` (what NIRI_SOCKET and SWAYSOCK name), closed with `stack`."""
+    listener = stack.enter_context(socket.socket(socket.AF_UNIX))
+    listener.bind(str(path))
+    return str(path)
 
 
 def metrics(soc_mw, vdd_mw, revision=(2, 1)):
@@ -329,6 +358,69 @@ class PowerTests(unittest.TestCase):
             values, status = fast.take()
             self.assertEqual((values['bat']['w'], values['soc']['w'], status), (8.0, 5.0, 'Discharging'))
             self.assertEqual([path.name for path in fast.battery], ['BAT1'])
+
+    def test_a_battery_put_in_is_found_and_one_taken_out_leaves_the_rest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sys = Path(tmp)
+            supplies = sys / 'class/power_supply'
+
+            def battery(name, watts, present=1):
+                for key, value in (('type', 'Battery'), ('status', 'Discharging'), ('present', present),
+                                   ('power_now', int(watts * 1e6))):
+                    put(supplies / name / key, str(value))
+            battery('BAT0', 8.0)
+            fast = FastSampler(sys)
+            fast.sample()
+            fast.take()
+            battery('BAT1', 2.0)                     # Put in while BAT0 reads well: no failed read says so.
+            for _ in range(power.MISSES):
+                fast.sample()
+            values, _ = fast.take()
+            self.assertEqual([path.name for path in fast.battery], ['BAT0', 'BAT1'])
+            self.assertEqual((values['bat']['min'], values['bat']['max']), (8.0, 10.0))
+            for child in (supplies / 'BAT1').iterdir():  # Taken out: BAT0 is still read, at once.
+                child.unlink()
+            (supplies / 'BAT1').rmdir()
+            fast.sample()
+            values, status = fast.take()
+            self.assertEqual((values['bat']['w'], values['bat']['n'], status), (8.0, 1, 'Discharging'))
+            self.assertEqual([path.name for path in fast.battery], ['BAT0'])
+            battery('BAT1', 0.0)
+            for _ in range(power.MISSES):
+                fast.sample()
+            self.assertEqual(len(fast.battery), 2)
+            put(supplies / 'BAT1/present', '0')      # Its bay empty, the directory left: gone at the next look.
+            for _ in range(power.MISSES):
+                fast.sample()
+            self.assertEqual([path.name for path in fast.battery], ['BAT0'])
+
+    def test_the_panels_mode_is_logged_from_niri_or_sway(self):
+        with tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as stack:
+            niri, sway = unix_socket(stack, Path(tmp) / 'niri.sock'), unix_socket(stack, Path(tmp) / 'sway.sock')
+            replies, asked = {'niri': json.dumps(NIRI_OUTPUTS), 'swaymsg': json.dumps(SWAY_OUTPUTS)}, []
+
+            def run(command):
+                asked.append(command)
+                return replies[command[0]]
+            with mock.patch('shutil.which', lambda name: f'/run/current-system/sw/bin/{name}'):
+                self.assertEqual(power.compositor_outputs(run, {'NIRI_SOCKET': niri}), {'name': 'niri', 'outputs': [
+                    {'name': 'eDP-1', 'w': 2256, 'h': 1504, 'hz': 60.0, 'vrr': False, 'scale': 1.5, 'on': True},
+                    {'name': 'HDMI-A-1', 'w': None, 'h': None, 'hz': None, 'vrr': None, 'scale': None, 'on': False}]})
+                self.assertEqual(asked[-1], ['niri', 'msg', '-j', 'outputs'])
+                self.assertEqual(power.compositor_outputs(run, {'SWAYSOCK': sway}), {'name': 'sway', 'outputs': [
+                    {'name': 'LVDS-1', 'w': 1366, 'h': 768, 'hz': 40.01, 'vrr': False, 'scale': 1.0, 'on': True},
+                    {'name': 'DP-2', 'w': 3840, 'h': 2160, 'hz': 60.0, 'vrr': True, 'scale': 2.0, 'on': False},
+                    {'name': 'HDMI-A-1', 'w': None, 'h': None, 'hz': None, 'vrr': None, 'scale': None, 'on': False}]})
+                self.assertEqual(asked[-1], ['swaymsg', '-r', '-t', 'get_outputs'])
+                both = {'NIRI_SOCKET': niri, 'SWAYSOCK': sway}       # niri first, as throttle and freeze pick.
+                self.assertEqual(power.compositor_outputs(run, both)['name'], 'niri')
+                for environ in ({}, {'HYPRLAND_INSTANCE_SIGNATURE': 'x', 'XDG_CURRENT_DESKTOP': 'Hyprland'}):
+                    self.assertIsNone(power.compositor_outputs(run, environ))
+                for reply in ('', 'not json', '5'):                  # No reply, or nothing like one.
+                    replies['swaymsg'] = reply
+                    self.assertIsNone(power.compositor_outputs(run, {'SWAYSOCK': sway}))
+            with mock.patch('shutil.which', lambda name: None):     # NIRI_SOCKET set, niri not on PATH.
+                self.assertIsNone(power.compositor_outputs(run, {'NIRI_SOCKET': niri}))
 
     def test_the_chips_rails_come_from_gpu_metrics(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -668,6 +760,20 @@ class MonitorTests(unittest.TestCase):
         self.assertAlmostEqual(record['cpu']['busy_s'], 10.0, places=3)  # 2 s of CPU per 2 s, over 10 s.
         self.assertEqual(self.rows('SELECT mhz_active, active_n, min_mhz FROM records'), [(3000.0, 1.0, 406.0)])
         self.assertEqual(self.rows('SELECT ghz_active, purity FROM minutes'), [(3.0, 1.0)])
+
+    def test_records_log_the_compositors_outputs_and_the_store_the_panels_rate(self):
+        with contextlib.ExitStack() as stack, mock.patch('shutil.which', lambda name: f'/usr/bin/{name}'):
+            sway = unix_socket(stack, Path(self.tmp.name) / 'sway.sock')
+            outputs = power.compositor_outputs(lambda command: json.dumps(SWAY_OUTPUTS), {'SWAYSOCK': sway})
+        with mock.patch('wattif.power.Commands.read', return_value={'compositor': outputs}):
+            monitor = self.monitor()
+            for _ in range(6):
+                self.tick(monitor)
+            monitor.close()
+        (record,) = monitor.log.recent(0)
+        self.assertEqual(record['display']['compositor'], outputs)
+        self.assertNotIn('niri', record['display'])
+        self.assertEqual(self.rows('SELECT hz, screen_on FROM records'), [(40.01, 1)])   # LVDS-1's.
 
     def test_configured_state_files_are_logged_with_each_record(self):
         state = Path(self.tmp.name) / 'panel.json'

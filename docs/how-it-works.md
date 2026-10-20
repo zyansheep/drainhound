@@ -102,7 +102,8 @@ can't teach it. Below 5%:
 - the time comes from the gauge's own slope, extrapolated to the cutoff;
 - a black box fsyncs the last reading every 2 s, since the database can lose
   its last seconds;
-- notifications come at 5 minutes and 1 minute;
+- notifications come at 5 minutes and 1 minute (`battery.notify = false`
+  turns them off);
 - with `battery.poweroff = true`, it runs `systemctl poweroff` 45 s before the
   early edge of the cutoff's estimate (only once a cut-out has taught the
   cutoff, and only when two readings agree), and records that the boot was
