@@ -93,11 +93,12 @@ DEFAULTS = {
     },
     # What a setting goes back to when experiments end, on each power source.
     # None, or the string "found" (TOML has no null): as wattif found it in this
-    # boot before it first changed it, on that power source (where wattif only
-    # changed it on battery, on AC it is left to whatever your system sets when
-    # plugged in). A value instead is put back whatever was found; the original
-    # author's udev rules, say: profile = {battery = "power-saver", ac =
-    # "balanced"}, abm = {battery = 3, ac = 0}.
+    # boot before it first changed it, on that power source; the profile and ABM,
+    # which udev rules often switch when you plug in, are left on AC to whatever
+    # your system sets then (wattif only takes back a value of its own still
+    # there). A value is put back whatever was found: the original author's
+    # udev rules, say, as profile = {battery = "power-saver", ac = "balanced"}
+    # and abm = {battery = 3, ac = 0}.
     'stock': {
         # power-profiles-daemon's profile. As found; on battery, until seen there,
         # power-saver (what common udev rules set).

@@ -2,6 +2,7 @@ import json
 import math
 import os
 import random
+import socket
 import subprocess
 import tempfile
 import time
@@ -1544,10 +1545,48 @@ class ExperimentTests(unittest.TestCase):
         self.box.followable = False  # Hyprland, GNOME, KDE, X11: wattif throttle caps nothing there.
         self.assertNotIn('throttle-apps', self.real_catalog())
         self.assertFalse(THROTTLE_FOLLOWABLE())
-        socket = self.box.root / 'niri.sock'
-        socket.touch()
-        os.environ['NIRI_SOCKET'] = str(socket)
+        path = self.box.root / 'niri.sock'
+        with socket.socket(socket.AF_UNIX) as listening:  # compositor.detect wants a socket there, not a stale name.
+            listening.bind(str(path))
+        os.environ['NIRI_SOCKET'] = str(path)
         self.assertTrue(THROTTLE_FOLLOWABLE())
+
+    def test_app_scopes_in_nested_slices_are_found_and_frozen_by_their_unit_name(self):
+        # uwsm, app2unit and Flatpak start apps in app.slice/app-graphical.slice.
+        root = self.box.root / 'cgroup'
+
+        def scope(path, usec, populated=1):
+            tree(root / 'app.slice' / path, {'cpu.stat': f'usage_usec {usec}\nuser_usec 0',
+                                             'cgroup.events': f'populated {populated}\nfrozen 0', 'cgroup.procs': '412'})
+        scope('app-niri-floorp-2240.scope', 9_000_000)
+        scope('app-graphical.slice/app-niri-t3code-6a5fdff9.scope', 30_000_000)
+        scope('app-graphical.slice/app-flatpak-com.valvesoftware.Steam-3.scope', 2_000_000)
+        scope('app-graphical.slice/app-gone-9.scope', 5, populated=0)
+        t3code, steam = ('app-graphical.slice/app-niri-t3code-6a5fdff9.scope',
+                         'app-graphical.slice/app-flatpak-com.valvesoftware.Steam-3.scope')
+        calls = []
+        with mock.patch.object(experiment_module, 'user_slice', lambda: root), \
+                mock.patch.object(experiment_module, 'run', lambda command, check=True, **_: calls.append(command) or ''):
+            self.assertEqual([(u['unit'], u['label']) for u in experiment_module.freezable_units()],
+                             [(t3code, 't3code'), ('app-niri-floorp-2240.scope', 'floorp'), (steam, 'Steam')])
+            targets = experiment_module.freeze_targets(['floorp'])
+            self.assertEqual(targets, [t3code, steam])
+            experiment_module.freeze_all_set(targets, 'frozen')
+            self.assertEqual(experiment_module.freeze_get(t3code), 'running')  # The kernel's view, through the slice.
+        self.assertEqual(calls, [['systemctl', '--user', 'freeze', 'app-niri-t3code-6a5fdff9.scope'],
+                                 ['systemctl', '--user', 'freeze', 'app-flatpak-com.valvesoftware.Steam-3.scope']])
+
+    def test_on_battery_means_no_charger_online_whatever_kind(self):
+        supplies = self.box.root / 'sys/class/power_supply'
+        tree(supplies, {'BAT0/type': 'Battery', 'BAT0/status': 'Charging', 'ucsi-source-psy-USBC000:001/type': 'USB',
+                        'ucsi-source-psy-USBC000:001/online': '1'})
+        self.assertFalse(ON_BATTERY())  # Charging over USB-C, with no Mains supply: before, "on battery".
+        (supplies / 'ucsi-source-psy-USBC000:001/online').write_text('0\n')
+        self.assertTrue(ON_BATTERY())
+        (supplies / 'ucsi-source-psy-USBC000:001/type').write_text('Unknown\n')
+        self.assertTrue(ON_BATTERY())  # No charger to read: on battery, as it has one.
+        (supplies / 'BAT0/type').write_text('Unknown\n')
+        self.assertFalse(ON_BATTERY())  # A desktop: never.
 
     # --- Unchanged helpers ----------------------------------------------------------------------
 

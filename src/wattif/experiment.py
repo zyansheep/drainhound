@@ -115,18 +115,14 @@ PROBE = RUNTIME / 'helper.json'  # helper_usable()'s last answer, for this boot.
 
 
 def listed(section, key):
-    """config [section] key as a list of strings: a string alone is one item, never
-    its characters ("steam" would be s, t, e, a, m)."""
-    value = config.get(section, key)
-    if value is None:
+    """config [section] key as a list of strings (throttle.string_list: a string
+    alone is one item, never its characters; empty ones are dropped). Anything
+    else is ignored, said on stderr: this is read on import."""
+    try:
+        return throttle.string_list(config.get(section, key), f'config [{section}] {key}')
+    except SystemExit as refused:
+        print(f'{refused}; ignoring it', file=sys.stderr)
         return []
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, (list, tuple)):
-        return [str(item) for item in value]
-    print(f'wattif experiment: config [{section}] {key}: expected a list, not {value!r}; ignoring it',
-          file=sys.stderr)
-    return []
 
 
 def helper_command():
@@ -376,6 +372,11 @@ def apst_boot():
     return read(SYS / 'module/nvme_core/parameters/default_ps_max_latency_us')
 
 
+# An app scope ("unit" below) is its path in app.slice: its unit name, or behind the
+# slices it is in ('app-graphical.slice/app-niri-foot-6a5fdff9.scope': uwsm,
+# app2unit and Flatpak start apps there). systemctl takes the unit name alone
+# (throttle.unit).
+
 def cgroup(unit):
     return user_slice() / 'app.slice' / unit
 
@@ -385,7 +386,7 @@ def freeze_get(unit):
     events = read(cgroup(unit) / 'cgroup.events')
     if events is not None:
         return 'frozen' if 'frozen 1' in events.split('\n') else 'running'
-    state = run(['systemctl', '--user', 'show', unit, '-P', 'FreezerState'], check=False)
+    state = run(['systemctl', '--user', 'show', throttle.unit(unit), '-P', 'FreezerState'], check=False)
     return 'frozen' if state.startswith('frozen') else 'running'
 
 
@@ -456,7 +457,7 @@ def test_freeze(units, seconds):
 
 
 def live_units(units):
-    return [unit for unit in units if (user_slice() / 'app.slice' / unit).is_dir()]
+    return [unit for unit in units if cgroup(unit).is_dir()]
 
 
 def freeze_all_get(units):
@@ -466,7 +467,7 @@ def freeze_all_get(units):
 
 def freeze_all_set(units, value):
     for unit in live_units(units):  # Apps that exited meanwhile are skipped.
-        run(['systemctl', '--user', 'freeze' if value == 'frozen' else 'thaw', unit], check=False)
+        run(['systemctl', '--user', 'freeze' if value == 'frozen' else 'thaw', throttle.unit(unit)], check=False)
 
 
 BOOT_ENTRY = re.compile(r'[a-z0-9][a-z0-9_-]{0,31}')  # The entry patterns `wattif-helper next-boot` takes.
@@ -930,7 +931,7 @@ def catalog(unit=None, units=None):
                 aspm_get, lambda v: lab('aspm', v),
                 lambda cur: 'powersupersave' if cur != 'powersupersave' else 'performance',
                 root=True, sleep_restored=True, levels=lambda: ('powersupersave', 'performance'), as_found=True,
-                # Never seen (a change logged before wattif saved what it found): a guess, the
+                # Never seen (changed by an older wattif, which saved nothing): a guess, the
                 # kernel's usual build default.
                 baseline=lambda on: cmdline_param('pcie_aspm.policy') or found('aspm', on, aspm_get) or 'default'),
         Setting('apst', 'NVMe autonomous power states (APST)',
@@ -940,7 +941,7 @@ def catalog(unit=None, units=None):
                 apst_get, lambda v: lab('apst', v),
                 lambda cur: APST_DEFAULT if cur == '0' else '0', root=True, sleep_restored=True,
                 levels=lambda: (APST_DEFAULT, '0'), as_found=True,
-                # Without nvme_core's parameter to read: a guess, its default.
+                # Never seen, and no nvme_core parameter to read: a guess, the kernel's default.
                 baseline=lambda on: (cmdline_param('nvme_core.default_ps_max_latency_us') or found('apst', on, apst_get)
                                      or apst_boot() or APST_DEFAULT)),
         Setting('boost', 'CPU boost', 'Clocks above base frequency for short bursts.' + risky_note('boost'),
@@ -965,7 +966,7 @@ def catalog(unit=None, units=None):
                 gpu_dpm_get, lambda v: lab('gpudpm', v),
                 lambda cur: 'low' if cur != 'low' else 'auto', root=True,
                 visible='Video, WebGL and memory-heavy work get slower.', levels=lambda: ('low', 'auto'),
-                as_found=True, baseline=lambda on: found('gpu-dpm', on, gpu_dpm_get) or 'auto'),  # Unseen: the driver's.
+                as_found=True, baseline=lambda on: found('gpu-dpm', on, gpu_dpm_get) or 'auto'),  # Unseen: amdgpu's.
         Setting('cpu-cap', 'CPU frequency cap', cpu_cap_text() + risky_note('cpu-cap'),
                 cpu_cap_get, lambda v: lab('cpucap', v),
                 lambda cur: CPU_CAP if cur == 'none' else 'none', root=True,
@@ -982,8 +983,8 @@ def catalog(unit=None, units=None):
         Setting('refresh', 'Display refresh rate', 'Lower internal-panel refresh rate.' + risky_note('refresh'),
                 refresh_get, refresh_set,
                 refresh_alternative, visible='Motion looks slightly less smooth.', levels=refresh_levels,
-                # The mode you use, not the highest: a 120 Hz panel you run at 60 Hz stays at 60.
-                # Only never seen (a change logged before wattif saved it) is the highest a guess.
+                # The mode you use, not the highest: a 120 Hz panel you run at 60 Hz stays at 60
+                # (the highest is a guess for a mode never seen).
                 as_found=True, baseline=lambda on: found('refresh', on, refresh_get) or refresh_levels()[1]),
     ]
     if wifi:
@@ -997,7 +998,7 @@ def catalog(unit=None, units=None):
         specs.append(Setting(
             'freeze', f'Close {unit_label(unit)}', 'Freezes the app (cgroup freezer) to measure its cost.',
             lambda: freeze_get(unit),
-            lambda v: run(['systemctl', '--user', 'freeze' if v == 'frozen' else 'thaw', unit]),
+            lambda v: run(['systemctl', '--user', 'freeze' if v == 'frozen' else 'thaw', throttle.unit(unit)]),
             lambda cur: 'frozen', visible='The app stops responding during B blocks.', unit=unit,
             baseline=lambda on: 'running'))
     if units:
@@ -1032,12 +1033,12 @@ def listing(specs):
 
 
 def unit_label(unit):
-    match = re.match(r'app-(?:niri-|gnome-|flatpak-)?(.+?)(?:-\d+)?\.scope$', unit)
-    if match:
-        return match.group(1).replace('\\x2d', '-')
-    cgroup = user_slice() / 'app.slice' / unit
+    """An app scope's name as wattif throttle and freeze show it (throttle.label);
+    another scope's (systemd-run's run-*.scope), its first process's."""
+    if throttle.unit(unit).startswith('app-'):
+        return throttle.label(unit)
     try:
-        pid = (cgroup / 'cgroup.procs').read_text().split()[0]
+        pid = (cgroup(unit) / 'cgroup.procs').read_text().split()[0]
         return Path(f'/proc/{pid}/comm').read_text().strip()
     except (OSError, IndexError):
         return unit
@@ -1047,10 +1048,20 @@ def user_slice():
     return Path(f'/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service')
 
 
+def scopes(slice_=None):
+    """Every scope in app.slice and in the slices there, as its path in app.slice, sorted."""
+    slice_ = slice_ or user_slice() / 'app.slice'
+    found = [path.name for path in slice_.glob('*.scope')]
+    for nested in slice_.glob('*.slice'):
+        found += [f'{nested.name}/{scope}' for scope in scopes(nested)]
+    return sorted(found)
+
+
 def freezable_units():
     """App scopes by total CPU time (largest first), for the panel's picker."""
     units = []
-    for scope in (user_slice() / 'app.slice').glob('*.scope'):
+    for name in scopes():
+        scope = cgroup(name)
         try:
             usage = int((scope / 'cpu.stat').read_text().split('\n')[0].split()[1])
             # populated covers sub-cgroups too (Flatpak apps live one level down).
@@ -1058,18 +1069,16 @@ def freezable_units():
                 continue
         except (OSError, IndexError, ValueError):
             continue
-        units.append({'unit': scope.name, 'label': unit_label(scope.name), 'cpu_s': round(usage / 1e6)})
+        units.append({'unit': name, 'label': unit_label(name), 'cpu_s': round(usage / 1e6)})
     return sorted(units, key=lambda u: -u['cpu_s'])
 
 
 def on_battery():
-    """An AC adapter offline and the laptop's battery discharging (not a mouse's or a
-    headset's: scope Device)."""
-    for supply in (SYS / 'class/power_supply').glob('*'):
-        if read(supply / 'type') == 'Mains' and read(supply / 'online') == '1':
-            return False
-    return any(read(s / 'type') == 'Battery' and read(s / 'status') == 'Discharging' and read(s / 'scope') != 'Device'
-               for s in (SYS / 'class/power_supply').glob('*'))
+    """No charger online, as wattif throttle, the estimator and the collector read
+    it (battery.mains_online: a Mains supply, or with none, laptops that charge
+    only over USB-C, the system's USB supplies); with no charger to read, on
+    battery if the system has a battery (not a mouse's or a headset's: scope Device)."""
+    return throttle.on_battery(SYS / 'class/power_supply')
 
 
 def screen_locked():
@@ -1491,11 +1500,11 @@ def stock_names(specs, ledger):
 
 
 def trip(found, specs, battery, ledger, restore=True):
-    """The incident brake: every setting wattif experiment changed back to stock
-    (stock_names) and a notification; the run
-    that trips it stops. For an incident that may be a setting's doing (the
-    kernel's, or a crash reset while awake) also: the suspects (changed in the
-    QUARANTINE_WINDOW before it, or off stock at it) quarantined until `release`,
+    """The incident brake: what wattif experiment changed back to stock
+    (stock_names) and a notification; the run that trips it stops. For an
+    incident that may be a setting's doing (the kernel's, or a crash reset while
+    awake) also: the suspects (changed in the QUARANTINE_WINDOW before it, or off
+    stock at it) quarantined until `release`,
     applied settings dropped and automatic experiments off. One that isn't (a
     boot that died asleep or without a shutdown: 'quarantine' False) leaves them
     on: they start again at the next login (or `wattif experiment resume`)."""
