@@ -102,7 +102,8 @@ can't teach it. Below 5%:
 - the time comes from the gauge's own slope, extrapolated to the cutoff;
 - a black box fsyncs the last reading every 2 s, since the database can lose
   its last seconds;
-- notifications come at 5 minutes and 1 minute;
+- notifications come at 5 minutes and 1 minute (`battery.notify = false`
+  turns them off);
 - with `battery.poweroff = true`, it runs `systemctl poweroff` 45 s before the
   early edge of the cutoff's estimate (only once a cut-out has taught the
   cutoff, and only when two readings agree), and records that the boot was
@@ -191,9 +192,10 @@ comfort|battery --apply` switches.
   only: the reconciler puts them back to stock on AC and sets them again on
   battery.
 
-**Boot-level settings** (e.g. panel self-refresh on amdgpu) can't change at
-runtime. With `experiments.boot_arms` configured, the panel picks the boot
-entry for the next restart only. Boots are compared on their baselines, with a
+**Boot-level settings** can't change at runtime. Panel self-refresh on amdgpu
+is the one wattif compares: with a `psr` arm in `experiments.boot_arms` (a boot
+entry that sets `amdgpu.dcdebugmask` without its 0x10 bit), the panel picks the
+entry for the next restart only, the arm with less battery time first. Boots are compared on their baselines, with a
 Welch t interval over boots once each arm has 5.
 
 ## What-if
@@ -212,7 +214,13 @@ battery, every app with a window except the focused one gets a CPU quota
 (cgroup `cpu.max`, 10% of a core per app by default). The quota lifts the
 moment the app is focused and stays off for 2 minutes after it loses focus.
 An app is every systemd scope with its launch pid: Electron apps split into
-two. Never throttled:
+two. Scopes in nested slices (uwsm, app2unit and Flatpak use
+`app.slice/app-graphical.slice`) count too; a Flatpak app's sandboxes are one
+app, and so is a launcher's randomly named scope with the app of its name. A
+window belongs to the app its pid's scope says, or, when the pid says nothing
+(niri gives every X11 window xwayland-satellite's), to the app its app id
+names. While the focused window belongs to no app wattif can tell, nothing is
+capped. Never throttled:
 
 - apps playing or recording audio or video (a *running* PipeWire stream);
 - apps without a window (helpers, clipboard servers);
@@ -226,4 +234,6 @@ window on a workspace in view gets `cgroup.freeze`, so it uses no CPU at all.
 It thaws at once when you focus it, switch to its workspace, start it again or
 plug in, and every 10 minutes it thaws for 10 s so timers and sync catch up.
 An app that is busy (over a quarter of a core) or playing media keeps running.
-Without live compositor state, nothing is frozen.
+Without live compositor state, nothing is frozen; nor while a focused or
+visible window belongs to no app wattif can tell (under niri, a game Steam
+started), since it might be one of yours.

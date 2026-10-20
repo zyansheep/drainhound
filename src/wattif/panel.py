@@ -16,11 +16,15 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("Gdk", "4.0")
 gi.require_version("Graphene", "1.0")  # compute_bounds() returns a Graphene.Rect.
-gi.require_version("Gtk4LayerShell", "1.0")
 gi.require_version("Pango", "1.0")
 gi.require_version("PangoCairo", "1.0")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango, PangoCairo  # noqa: E402
-from gi.repository import Gtk4LayerShell as GtkLayerShell  # noqa: E402
+
+try:  # Optional: without it (or a compositor that has it) the panel is a normal window.
+    gi.require_version("Gtk4LayerShell", "1.0")
+    from gi.repository import Gtk4LayerShell as GtkLayerShell  # noqa: E402
+except (ValueError, ImportError):
+    GtkLayerShell = None
 
 from . import config
 from . import eta  # noqa: E402,F401 - first: it limits BLAS threads before numpy loads
@@ -597,7 +601,7 @@ class BatteryPanel(Adw.Application):
         self.window.connect('notify::is-active', self.focus_changed)
         # A layer-shell overlay under the bar where the compositor has it
         # (wlroots compositors, niri, KDE); elsewhere (GNOME, X11) a normal window.
-        self.layered = GtkLayerShell.is_supported()
+        self.layered = GtkLayerShell is not None and GtkLayerShell.is_supported()
         if self.layered:
             self.window.set_decorated(False)
             GtkLayerShell.init_for_window(self.window)
@@ -1569,6 +1573,11 @@ def main(argv):
         render(argv[1], *(argv[2:3] or ['Day']))
         return 0
     if argv[:1] == ['serve'] and (argv[1:2] in ([], ['--open']) and len(argv) <= 3):
+        # The layer-shell library is preloaded for this process (launch.preload);
+        # the commands the panel's buttons run don't need it.
+        os.environ['LD_PRELOAD'] = os.environ.pop('WATTIF_PRELOADED', os.environ.get('LD_PRELOAD', ''))
+        if not os.environ['LD_PRELOAD']:
+            del os.environ['LD_PRELOAD']
         # Hidden until toggled (the unit's ExecStart); --open shows it at once, on TAB if given.
         app = BatteryPanel()
         if argv[1:2] == ['--open']:

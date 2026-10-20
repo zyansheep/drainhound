@@ -34,10 +34,13 @@ falls near empty), and in the last FINAL_MINUTES its slope over two minutes
 gives the second it cuts out (backtested on five deaths, leaving each out:
 within ~10 s on average, 35 s at worst, from two minutes before). Below
 LOW_BATTERY a black box fsyncs the last reading every 2 s (lastgasp.json), so
-the next boot learns exactly when it died. Once a death has taught the cutoff,
-wattif eta powers the laptop off cleanly once the early edge of the cutoff is
-POWEROFF_SECONDS away (and counts down to that), recording the power-off so it
-isn't taken for a death — unless the battery cut the shutdown short.
+the next boot learns exactly when it died. With [battery] poweroff = true, once
+a death has taught the cutoff, wattif eta powers the laptop off cleanly once the
+early edge of the cutoff is POWEROFF_SECONDS away (and counts down to that),
+recording the power-off so it isn't taken for a death — unless the battery cut
+the shutdown short; without it, it counts down to the cutoff and warns. Its
+notifications follow [battery] notify. The trends are of one set of batteries:
+one put in or taken out starts them over.
 
 Charging. The label shows the time on battery banked so far (current energy
 at the typical battery draw) and the time to the charge limit, both marked ~
@@ -164,6 +167,13 @@ def entry_unit(entry):
 def minutes_unit(minutes):
     """The unit of the latest minute with a charge (the battery now), Ah without one."""
     return next((unit_of(m) for m in reversed(minutes) if m.get('charge') is not None), 'Ah')
+
+
+def latest_unit(known):
+    """The unit of the latest death deaths.json remembers (`known`: the battery
+    that last died, most likely this one), None with none."""
+    cuts = [d for d in known if number(d.get('cut')) is not None and not d.get('poweroff')]
+    return entry_unit(max(cuts, key=lambda d: number(d.get('t')) or 0.0)) if cuts else None
 
 
 def pack_volts(params=None, nominal=None):
@@ -1049,13 +1059,20 @@ class Live:
     (batteries.read); with none (`absent`: a desktop) it shows so and trains nothing."""
 
     def __init__(self, sys_root=Path('/sys'), proc=Path('/proc'), gasp=None, notify=None, poweroff=None,
-                 deaths=None, models=None, db=None, runtime=None, endings=None, clock=time.time, monotonic=boottime):
+                 deaths=None, models=None, db=None, runtime=None, endings=None, clock=time.time, monotonic=boottime,
+                 allow_poweroff=None, allow_notify=None):
         self.supplies = sys_root / 'class/power_supply'
         self.absent, self.unit, self.nominal = False, None, None  # The battery's unit and voltage_min_design, once read.
+        # The batteries the samples are of: (names, unit); None before the first reading, () with none.
+        self.pack = None
+        self.cutoff_read = None  # The unit load_cutoff last read deaths.json in (None: not yet).
         self.samples = collections.deque()
         self.boot, self.gasp, self.deaths = power.boot_id(proc), gasp or GASP, deaths or DEATHS
         self.models, self.db, self.runtime, self.endings = models or MODELS, db, runtime or RUNTIME, endings
         self.clock, self.monotonic = clock, monotonic
+        # [battery] poweroff and notify, unless given: whether it may power off, and notify at all.
+        self.allow_poweroff = battery_switch('poweroff') if allow_poweroff is None else allow_poweroff
+        self.allow_notify = battery_switch('notify') if allow_notify is None else allow_notify
         self.notify, self.warned = notify or send_notification, set()
         self.poweroff, self.due, self.powering_off, self.retry_at = poweroff or power_off, None, False, 0.0
         self.last, self.low, self.complaints = None, False, set()
@@ -1068,13 +1085,27 @@ class Live:
         """The cutoff from deaths.json, whatever models.json says (missing, old, or a
         refit failing): without it the power-off would be disarmed. A deaths.json
         that can't be read leaves the cutoff as it was; it never stops the loop.
-        In the battery's unit (Ah until one is read): a cutoff in another unit is
-        dropped, never used (it was another battery's, and would mistime the power-off)."""
-        unit = self.unit or 'Ah'
+        In the battery's unit: a cutoff in another unit is dropped, never used (it
+        was another battery's, and would mistime the power-off). Before an
+        estimate has read the battery it is read here; with none readable yet,
+        in the unit of the last death (latest_unit), and with no death either the
+        cutoff stays as it is. Never taken for Ah meanwhile: that dropped a
+        cutoff learned in Wh until the battery was read. estimate() loads it
+        again once the battery says another unit (cutoff_read)."""
+        if self.unit is None and (reading := batteries.read(self.supplies)) is not None:
+            self.unit, self.nominal = reading['unit'], reading['nominal']
+        unit = self.unit
         try:
-            cutoff = fit_cutoff([], load_gasps(self.deaths), unit=unit, volts=pack_volts(self.params, self.nominal))
+            known = load_gasps(self.deaths)
+            if (unit := unit or latest_unit(known)) is None:
+                return  # No battery read and no death: nothing to load, nor a unit to load it in.
+            self.cutoff_read = unit
+            cutoff = fit_cutoff([], known, unit=unit, volts=pack_volts(self.params, self.nominal))
         except Exception as error:  # noqa: BLE001 - the warnings and power-off must run regardless
             self.complain('cutoff from deaths.json', error)
+            if unit is None:
+                return
+            self.cutoff_read = unit
             if self.params.get('cutoff_unit', 'Ah') == unit:
                 return
             cutoff = no_cutoff(unit, pack_volts(self.params, self.nominal))
@@ -1148,9 +1179,15 @@ class Live:
     def sample(self, mono):
         """The batteries now (looked up afresh: one can come and go), combined, in
         their unit (`unit`: charge, full and the gauge's trends are in Ah or Wh).
-        None with no battery (`absent`) or none readable."""
+        None with no battery (`absent`) or none readable. Another set of
+        batteries than the samples are of (one put in or taken out, or read in
+        another unit) starts the trends over (repack)."""
         reading = batteries.read(self.supplies)
         self.absent = reading is None
+        pack = () if reading is None else (tuple(reading['names']), reading['unit'])
+        if self.pack is not None and pack != self.pack:
+            self.repack()
+        self.pack = pack
         if reading is None or reading['now'] is None:
             return None
         status = reading['status'] or 'Unknown'
@@ -1178,6 +1215,17 @@ class Live:
         return {'status': status, 'kind': kind, 'watts': watts, 'charge': charge, 'full': full,
                 'volts': reading['volts'], 'pct': pct, 'limit': reading['limit'], 'capacity': capacity,
                 'mains': mains, 'unit': reading['unit'], 'nominal': reading['nominal']}
+
+    def repack(self):
+        """The batteries changed: their combined charge jumps (a 50 Wh pair down to
+        its 30 Wh internal one), which a trend across it reads as a fall steep
+        enough to warn of, or power off before, a cut that isn't coming. So the
+        samples go, with the power-off's first reading and the warnings already
+        given (the end is another battery's now)."""
+        self.samples.clear()
+        self.mains_since = None
+        self.due = None
+        self.warned.clear()
 
     def weak_charger(self, mono):
         """Mains online for WEAK_SECONDS and the battery still discharging: the charger can't keep up."""
@@ -1240,8 +1288,15 @@ class Live:
         self.gasp.unlink(missing_ok=True)
 
     def warns_off(self):
-        """Once a death has taught the cutoff, wattif eta powers off before it."""
-        return self.params.get('deaths', 0) >= 1
+        """Whether wattif eta powers off before the cutoff: allowed ([battery]
+        poweroff), and once a death has taught it. Otherwise the countdown, the
+        label and the warnings are the cutoff's, and say nothing of a power-off."""
+        return self.allow_poweroff and self.params.get('deaths', 0) >= 1
+
+    def say(self, title, body):
+        """A desktop notification, unless [battery] notify is off."""
+        if self.allow_notify:
+            self.notify(title, body)
 
     def warn(self, early, likely, weak=False):
         """A notification as the early edge of the end (`early` s away; `likely` its
@@ -1253,11 +1308,11 @@ class Live:
                 at = time.strftime('%H:%M:%S', time.localtime(self.clock() + max(0.0, early)))
                 when = f'In {countdown(early)} at the earliest, {countdown(likely)} likely'
                 if self.warns_off():
-                    self.notify(f'Powering off as soon as {at}',
-                                f'{when}: {POWEROFF_SECONDS} s before the battery could cut out. '
-                                + ("The charger can't keep up: use a stronger one." if weak else 'Plug in to stop it.'))
+                    self.say(f'Powering off as soon as {at}',
+                             f'{when}: {POWEROFF_SECONDS} s before the battery could cut out. '
+                             + ("The charger can't keep up: use a stronger one." if weak else 'Plug in to stop it.'))
                 else:
-                    self.notify(f'Battery cuts out as soon as {at}', f'{when}. ' + (
+                    self.say(f'Battery cuts out as soon as {at}', f'{when}. ' + (
                         "The charger can't keep up: save your work." if weak else 'Plug in, or save your work.'))
                 return
 
@@ -1291,14 +1346,14 @@ class Live:
         if self.plugged_now(mono):
             return
         weak = " The charger can't keep up." if self.weak_charger(mono) else ''
-        self.notify('Powering off', f'The battery could cut out in {countdown(timing["early"])}.{weak}')
+        self.say('Powering off', f'The battery could cut out in {countdown(timing["early"])}.{weak}')
         self.powering_off = True
         self.record_gasp(state, timing)
         if not self.poweroff():
             self.powering_off = False
             self.record_gasp(state, timing)
             self.retry_at = mono + POWEROFF_RETRY
-            self.notify("Couldn't power off", f'Trying again in {POWEROFF_RETRY} s. Plug in, or shut down now.')
+            self.say("Couldn't power off", f'Trying again in {POWEROFF_RETRY} s. Plug in, or shut down now.')
 
     def timing(self, params, forecast, final, steady):
         """When the battery cuts out, as {'seconds', 'early', 'late', 'rate', 'source'}
@@ -1346,8 +1401,9 @@ class Live:
             self.samples.clear()  # A suspend (or a stall): readings before it don't belong to the trend.
             self.mains_since = None
         self.last = mono
-        due, self.due = self.due, None  # Only a reading that qualifies again carries it on.
         state = self.sample(mono)
+        # Only a reading that qualifies again carries it on (and one of the same batteries: repack).
+        due, self.due = self.due, None
         if state is None:
             self.low = False
             if self.absent:  # A desktop: said plainly, and published so `wattif waybar battery` says it too.
@@ -1355,7 +1411,7 @@ class Live:
                         'detail': {'status': 'no battery', 'updated': now, 'text': 'no battery',
                                    'classes': ['no-battery']}}
             return {'text': '--', 'class': ['unknown']}
-        if state['unit'] != self.params.get('cutoff_unit', 'Ah'):
+        if state['unit'] != self.params.get('cutoff_unit', 'Ah') or state['unit'] != self.cutoff_read:
             self.load_cutoff()  # A battery in another unit than the cutoff (the first reading, a new battery).
         params = self.params
         result = {'status': state['status'], 'pct': state['pct'], 'watts': state['watts'], 'updated': now}
@@ -1493,6 +1549,18 @@ def power_off(timeout=10):
     if done.returncode:
         print(f'wattif eta: systemctl poweroff: {done.stderr.strip() or done.returncode}', file=sys.stderr)
     return done.returncode == 0
+
+
+def battery_switch(key):
+    """[battery] `key` (poweroff, notify): true or false. Anything else (a
+    string "false" is true to Python) is said on stderr and taken as the
+    default, so a typo never turns the power-off on."""
+    value, default = config.get('battery', key), config.DEFAULTS['battery'][key]
+    if isinstance(value, bool):
+        return value
+    print(f'wattif eta: [battery] {key} = {value!r} is not true or false; taking {str(default).lower()}',
+          file=sys.stderr)
+    return default
 
 
 def send_notification(title, body):

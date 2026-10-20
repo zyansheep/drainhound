@@ -9,7 +9,8 @@ library only (the collector runs on plain Python).
 Batteries report one of two ways (the kernel's power_supply ABI):
 charge_now/charge_full in µAh with current_now in µA, as a Framework 13's
 does, or energy_now/energy_full in µWh with power_now in µW, as most Intel
-laptops (ThinkPads, Dells) do. A reading keeps the battery's own unit: `unit`
+laptops (ThinkPads, Dells) do; some gauges have both, or half of each (unit_of
+picks). A reading keeps the battery's own unit: `unit`
 is 'Ah' or 'Wh' and `now`, `full` and `design` are in it. A charge becomes
 energy only where it has to, through the pack's voltage (nominal_volts).
 """
@@ -121,14 +122,26 @@ def watts(paths):
     return combined_status(statuses, total), total if read else None
 
 
+def unit_of(path):
+    """The unit a battery is read in: the first whose now and full charge both
+    read (a full of 0 doesn't), Wh before Ah; else the first with a now (a
+    charge with no full still counts down), else the first with a full.
+
+    Some gauges mix them: a bq27xxx (phones, tablets, some ARM laptops) has
+    energy_now but no energy_full, beside a complete charge_now/charge_full;
+    read in Wh, it had no full charge (no forecast, no cutoff)."""
+    readings = {unit: (number(path / now), number(path / full)) for unit, (now, full, _) in FILES.items()}
+    complete = [unit for unit, (now, full) in readings.items() if now is not None and full is not None and full > 0]
+    counting = [unit for unit, (now, _) in readings.items() if now is not None]
+    sized = [unit for unit, (_, full) in readings.items() if full is not None]
+    return next(iter(complete + counting + sized), 'Ah')
+
+
 def supply(path):
-    """One battery's readings, in its own unit: energy_now's Wh if it has it,
-    else charge_now's Ah (one with neither: whichever its full charge is in)."""
+    """One battery's readings, in its own unit (unit_of)."""
     status, signed, power = supply_watts(path)
-    energy, charge = number(path / 'energy_now'), number(path / 'charge_now')
-    unit = 'Wh' if energy is not None or (charge is None and (path / 'energy_full').exists()) else 'Ah'
-    now, full, design = (energy if unit == 'Wh' else charge, number(path / FILES[unit][1]),
-                         number(path / FILES[unit][2]))
+    unit = unit_of(path)
+    now, full, design = (number(path / name) for name in FILES[unit])
     volts, nominal = number(path / 'voltage_now'), number(path / 'voltage_min_design')
     return {'name': path.name, 'status': status, 'watts': signed, 'power': power, 'unit': unit,
             'now': now / 1e6 if now is not None else None, 'full': full / 1e6 if full is not None else None,

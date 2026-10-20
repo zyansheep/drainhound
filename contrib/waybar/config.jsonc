@@ -6,8 +6,9 @@
   // Time left with ± half its 80% interval and the live draw (`1:17 ±0:15 14.2W`);
   // charging: the battery time banked so far and the time to the charge limit.
   // The tooltip has the intervals, how long a suspend would last, and what is
-  // using the battery. Classes: discharging, charging, plugged, low, critical,
-  // fill0-fill100 (remaining energy), unknown.
+  // using the battery. Classes: discharging, charging, plugged, weak-charger
+  // (plugged in but still discharging), low, critical, fill0-fill100 (remaining
+  // energy), no-battery, unknown.
   "custom/wattif": {
     "exec": "wattif waybar battery",
     "return-type": "json",

@@ -44,7 +44,7 @@ change from your settings), `gain` (minutes per full charge) with its 90%
 `interval`, `delight` (👍 chance per block now → then), `apply` (the
 assignments `wattif experiment apply` takes), `text`.
 
-**`experiment.json`** (the runner): `mode` (manual/auto), `status`
+**`experiment.json`** (the runner): `mode` (`auto` for automatic runs), `status`
 (running/paused/done), `reason`, `block`, `block_start`/`block_end`,
 `washout_until`, `name`, `arm`, `value`, `tested` (seconds of battery time
 tested), `settled`, `worth {rows: [{hours, saves, costs}]}`.
@@ -75,7 +75,7 @@ layouts are migrated forward, never dropped.
 - **CPU**: `busy_s`, `user_s`, `sys_s`, `irq_s`, `iowait_s`, `steal_s`, `mhz`, `mhz_max`, `mhz_active`, `active_n`, `ctxt`, `intr`, C-states `c_poll_s`, `c1_s`, `c2_s`, `c3_s`, IPIs `ipi_call`, `ipi_timer`, `ipi_tlb`, `ipi_resched`, `irq_devices`
 - **GPU**: `gpu_busy`, `gpu_s`, `video_s`
 - **devices**: `wifi_rx`, `wifi_tx`, `net_rx`, `net_tx`, `wifi_dbm`, `disk_read`, `disk_write`, `disk_busy`, `usb`, `pci_active`, `audio_play`, `audio_rec`
-- **display**: `bl`, `kbd`, `abm`, `hz`, `screen_on`, `night_light`, `grayscale`
+- **display**: `bl`, `kbd`, `abm`, `hz`, `screen_on` (the internal panel's, eDP, LVDS or DSI, as niri or sway reports it), `night_light`, `grayscale`
 - **settings**: `profile`, `epp`, `governor`, `boost`, `amd_pstate`, `max_mhz`, `min_mhz`, `cpu_max_mhz`, `gpu_dpm`, `throttle`, `aspm`, `nvme_apst_us`, `dcdebugmask`, `wifi_ps`, `rfkill_bluetooth`, `rfkill_wlan`, `charge_limit`
 - **session**: `temp`, `fan`, `lid`, `locked`, `qol`
 - **experiment**: `exp_run`, `exp_name`, `exp_block`, `exp_arm`, `exp_value`, `exp_washout`

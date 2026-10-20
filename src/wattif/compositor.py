@@ -1,7 +1,9 @@
 """The desktop's windows, from the compositor's IPC, for wattif throttle and
-wattif freeze: each window's pid, its workspace and when it last had focus
-(CLOCK_MONOTONIC s), which window has focus, and which workspaces are shown on
-their outputs.
+wattif freeze: each window's pid and app id, its workspace and when it last had
+focus (CLOCK_MONOTONIC s), which window has focus, and which workspaces are
+shown on their outputs. An X11 window's pid is the client's where the
+compositor knows it (sway: _NET_WM_PID); niri gives xwayland-satellite's, so
+there the app id (the X11 class) is what says whose it is.
 
 A backend follows its compositor's event stream (a child process whose stdout
 throttle.run reads). `known` says whether its state is live: false until the
@@ -14,12 +16,13 @@ and wattif freeze went on freezing apps you were using.
             get_workspaces say where windows are and which workspaces are shown
             (its events don't), and focus times are kept here (sway has none)
 
-detect() picks one from the environment (NIRI_SOCKET, SWAYSOCK). Elsewhere
-(Hyprland, GNOME, KDE, X11) nothing is known: wattif throttle caps nothing and
-wattif freeze freezes nothing.
+detect() picks one from the environment (NIRI_SOCKET, SWAYSOCK) whose socket
+is there. Elsewhere (Hyprland, GNOME, KDE, X11) nothing is known: wattif
+throttle caps nothing and wattif freeze freezes nothing.
 """
 import json
 import os
+import stat
 import subprocess
 import time
 
@@ -36,7 +39,8 @@ class Desktop:
     def clear(self):
         """Forget every window and workspace: the stream ended (the compositor
         exited, or restarts), so none of it can be trusted."""
-        # Window id → {'pid', 'workspace' (its id), 'focus' (CLOCK_MONOTONIC s it last had focus, None: unknown)}.
+        # Window id → {'pid', 'app_id' (Wayland's, or the X11 class; None: none), 'workspace' (its id),
+        # 'focus' (CLOCK_MONOTONIC s it last had focus, None: unknown)}.
         self.windows = {}
         self.focused = None  # The focused window's id (None: none, or a layer surface, or an empty workspace).
         self.workspaces = {}  # Workspace id → {'output', 'active': shown on its output}.
@@ -76,7 +80,8 @@ class Niri(Desktop):
         stamp = window.get('focus_timestamp')
         focus = (stamp.get('secs', 0) + stamp.get('nanos', 0) / 1e9 if stamp
                  else self.windows.get(window['id'], {}).get('focus'))
-        self.windows[window['id']] = {'pid': window.get('pid'), 'workspace': window.get('workspace_id'), 'focus': focus}
+        self.windows[window['id']] = {'pid': window.get('pid'), 'app_id': window.get('app_id'),
+                                      'workspace': window.get('workspace_id'), 'focus': focus}
 
     def event(self, event):
         """One line of `niri msg -j event-stream`."""
@@ -154,6 +159,7 @@ class Sway(Desktop):
         before, windows, focused = self.windows, {}, None
         for workspace, node in views(tree):
             windows[node['id']] = {'pid': node.get('pid'), 'workspace': workspace,
+                                   'app_id': node.get('app_id') or (node.get('window_properties') or {}).get('class'),
                                    'focus': before.get(node['id'], {}).get('focus')}
             if node.get('focused'):
                 focused = node['id']
@@ -184,10 +190,11 @@ class Sway(Desktop):
 
 def views(node, workspace=None):
     """(workspace id, node) for every window in sway's tree, tiled or floating
-    (the scratchpad's are on its hidden workspace, never shown)."""
+    (the scratchpad's are on its hidden workspace, never shown). A window has a
+    pid, if only 0 (an X11 client that doesn't say its own); a split doesn't."""
     if node.get('type') == 'workspace':
         workspace = node.get('id')
-    if node.get('pid') and 'id' in node:
+    if 'pid' in node and 'id' in node:
         yield workspace, node
     for child in (node.get('nodes') or []) + (node.get('floating_nodes') or []):
         yield from views(child, workspace)
@@ -196,22 +203,35 @@ def views(node, workspace=None):
 BACKENDS = (('NIRI_SOCKET', Niri), ('SWAYSOCK', Sway))
 
 
-def detect(environ=None, clock=time.monotonic):
+def is_socket(path):
+    try:
+        return stat.S_ISSOCK(os.stat(path).st_mode)
+    except (OSError, ValueError):
+        return False
+
+
+def detect(environ=None, clock=time.monotonic, socket=is_socket):
     """The backend for the compositor this session runs (a Desktop that knows
-    nothing if it is none of them)."""
+    nothing if it is none of them). A NIRI_SOCKET or SWAYSOCK whose socket
+    isn't there is a compositor that has exited (a user service can keep an
+    old session's environment), as wattif experiment reads it too."""
     environ = os.environ if environ is None else environ
     for variable, backend in BACKENDS:
-        if environ.get(variable):
+        if environ.get(variable) and socket(environ[variable]):
             return backend(clock=clock)
     return Desktop(clock=clock)
 
 
-def unsupported(environ=None):
+def unsupported(environ=None, socket=is_socket):
     """What this session runs instead of a supported compositor, for messages."""
     environ = os.environ if environ is None else environ
     if environ.get('HYPRLAND_INSTANCE_SIGNATURE'):
         return 'Hyprland'
-    return environ.get('XDG_CURRENT_DESKTOP') or 'this session'
+    session = environ.get('XDG_CURRENT_DESKTOP') or 'this session'
+    for variable, _ in BACKENDS:
+        if environ.get(variable) and not socket(environ[variable]):
+            return f'{session} with a stale {variable} (no socket at {environ[variable]})'
+    return session
 
 
 def json_lines(stream):

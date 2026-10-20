@@ -66,9 +66,20 @@ def net_sum(record, key, wifi):
                if isinstance(n, dict) and name.startswith('wl') == wifi and name != 'lo')
 
 
+INTERNAL = ('eDP', 'LVDS', 'DSI')  # Connector names of a built-in panel.
+
+
 def edp(record):
-    return next((o for o in part(record, 'display').get('niri') or []
-                 if isinstance(o, dict) and str(o.get('name', '')).startswith('eDP')), {})
+    """The internal panel (eDP, LVDS or DSI) among the compositor's outputs, {}
+    without one: display.compositor's (niri or sway), else display.niri, which
+    records had before sway was logged, in the same shape. The hz and screen_on
+    columns keep their meaning (the internal panel's), so no migration: LVDS and
+    DSI panels, and sway, fill them from now on (rows stored before stay NULL)."""
+    shown = part(record, 'display')
+    outputs = part(shown, 'compositor').get('outputs') or shown.get('niri')
+    if not isinstance(outputs, list):
+        return {}
+    return next((o for o in outputs if isinstance(o, dict) and str(o.get('name', '')).startswith(INTERNAL)), {})
 
 
 def irq_devices(record):
