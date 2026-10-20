@@ -1,0 +1,330 @@
+#!/usr/bin/env bash
+# wattif-helper: the fixed-menu root helper behind wattif's power experiments.
+#
+# wattif runs it as `sudo -n wattif-helper <command>` (a NOPASSWD rule for this
+# one file; see the README), or from the suspend hooks as root. Every command
+# writes only the files it is about, with validated values: there is no generic
+# sysfs writer, and nothing reads a file it is given.
+#
+# Changes take $RUN/wattif-helper.lock, so experiments, the panel and the
+# suspend hooks never interleave (aspm wakes every PCI function, then puts each
+# back). The lock and $RUN/wattif-helper are root's alone (umask 077): anyone
+# who can open a file can hold a flock on it. Between sleep-safe (before
+# suspend) and sleep-restore (after resume) the `sleeping` flag makes changes
+# refuse (exit 75), so nothing undoes what sleep-safe restored on the way into
+# suspend. ./test-helper.sh checks this script against a fake /sys, /run and
+# /proc/cmdline.
+set -euo pipefail
+shopt -s nullglob
+umask 077
+# The tools it runs (coreutils, util-linux's flock and logger, grep, sed, awk,
+# systemd's bootctl/udevadm/systemctl, iw, jq); packages replace this line.
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH
+# Roots, one per line, so tests can point them at a fake tree.
+SYS=/sys
+RUN=/run
+CMDLINE=/proc/cmdline
+LOCK=$RUN/wattif-helper.lock
+SLEEPING=$RUN/wattif-helper/sleeping
+ASPM=$SYS/module/pcie_aspm/parameters/policy
+BUSY=75 # EX_TEMPFAIL: suspending, or another change holds the lock; wattif waits and retries.
+CHANGE_WAIT=10 # s a change waits for another's lock (wattif gives a call 30 s)
+# Units that are up from before suspend until after resume: systemd's own, and
+# NixOS's sleep-actions.service (powerManagement.powerDownCommands/resumeCommands).
+SLEEP_UNITS="sleep.target systemd-suspend.service systemd-hibernate.service systemd-hybrid-sleep.service systemd-suspend-then-hibernate.service sleep-actions.service"
+usage() {
+  cat >&2 <<'USAGE'
+usage: wattif-helper <command> [args]
+  status                 battery draw, chip power and the settings below
+  abm <0-4>              amdgpu panel power savings (ABM) on the internal panel
+  aspm <policy>          PCIe ASPM policy: default|performance|powersave|powersupersave
+  apst <microseconds>    NVMe APST at runtime (pm_qos_latency_tolerance_us; 0 = off)
+  boost <0|1>            CPU boost (turbo): per CPU, or intel_pstate's no_turbo
+  cpucap <MHz|none>      CPU frequency cap (scaling_max_freq on every policy)
+  gpudpm <auto|low>      amdgpu DPM level: low pins the GPU, memory and fabric clocks at their lowest
+  wifips <on|off>        Wi-Fi power save on every wireless interface
+  trigger power_supply   re-run the power_supply udev rules (your AC/battery policy) and wait for them
+  xhci-reset <BDF>       unbind and rebind a dead xHCI (USB) controller
+  next-boot <default|NAME|list>  boot the default entry, or one matching NAME, on the next restart only
+  sleep-safe             before suspend: the boot-time ASPM and APST and GPU DPM auto (suspend hook only)
+  sleep-restore          after resume: end the suspend lock-out (suspend hook only)
+Changes exit 75 while suspending (sleep-safe ran, sleep-restore not yet) or while another holds the lock.
+USAGE
+  exit 2
+}
+log() { # message [priority]: the journal (logger) and stderr
+  logger -t wattif-helper -p "user.${2:-notice}" -- "$1" 2>/dev/null || true
+  echo "wattif-helper: $1" >&2
+}
+# aspm's saved power/control values: put back on any exit, so a failure
+# half-way never leaves every PCI function pinned awake until reboot.
+controls=""
+put_back_controls() {
+  local c value
+  [ -n "$controls" ] && [ -f "$controls" ] || return 0
+  while read -r c value; do
+    echo "$value" > "$c" 2>/dev/null || log "could not put back $c=$value" warning
+  done < "$controls"
+  rm -f "$controls"
+  controls=""
+}
+cmd=${1:-}
+on_exit() {
+  local rc=$?
+  put_back_controls
+  case "$rc" in
+    0|2|"$BUSY") ;;
+    *) log "$cmd failed (exit $rc)" err ;;
+  esac
+  exit "$rc"
+}
+trap on_exit EXIT
+lock() { # seconds to wait for the other change
+  exec 9> "$LOCK"
+  flock -w "$1" 9
+}
+suspending() { # whether any unit of the suspend is up
+  local unit
+  for unit in $SLEEP_UNITS; do
+    case "$(systemctl show -P ActiveState "$unit" 2>/dev/null || true)" in
+      activating|active|deactivating|reloading) return 0 ;;
+    esac
+  done
+  return 1
+}
+# A change: wait for the lock, and refuse while suspending. The flag holds for
+# as long as a unit of the suspend is up: from sleep-safe through the suspend
+# and resume until sleep-restore has run. Once they are all down without
+# sleep-restore having cleared it (an aborted suspend, a failed hook) the flag
+# is stale.
+begin_change() {
+  lock "$CHANGE_WAIT" || { log "busy: another change holds $LOCK" warning; exit "$BUSY"; }
+  [ -e "$SLEEPING" ] || return 0
+  if suspending; then
+    echo "wattif-helper: suspending (sleep-safe ran, sleep-restore not yet); try again after resume" >&2
+    exit "$BUSY"
+  fi
+  log "clearing a stale sleeping flag (no suspend under way: sleep-restore did not run)" warning
+  rm -f "$SLEEPING"
+}
+hooks_only() { # sleep-safe/-restore belong to the suspend hooks, not to sudo
+  [ -z "${SUDO_UID:-}" ] || { echo "wattif-helper: $cmd runs from the suspend hooks only" >&2; exit 2; }
+}
+aspm_now() { grep -o '\[[a-z]*\]' "$ASPM" | tr -d '[]' || true; }
+cmdline_value() { grep -o "$1=[^ ]*" "$CMDLINE" | tail -n 1 | cut -d= -f2 || true; }
+# Set the ASPM policy with every PCI function awake. A runtime-suspended
+# function puts back the link control it saved before the change when it
+# next resumes, and a multi-function link only enables what all of its
+# functions enable, so changing it under suspended functions leaves links
+# without ASPM. The kernel ignores a write of the current policy, so a
+# reapply goes through another one. Written to work with or without errexit
+# (sleep-safe calls it with ||).
+set_aspm() {
+  local c value now
+  [ -e "$ASPM" ] || { log "no $ASPM (a kernel without CONFIG_PCIEASPM)" err; return 1; }
+  controls=$(mktemp) || return 1
+  for c in "$SYS"/bus/pci/devices/*/power/control; do
+    value=$(cat "$c" 2>/dev/null) || continue
+    echo "$c $value" >> "$controls"
+    echo on > "$c" 2>/dev/null || true
+  done
+  if [ "$(aspm_now)" = "$1" ]; then
+    if [ "$1" = performance ]; then echo default; else echo performance; fi > "$ASPM" || true
+  fi
+  echo "$1" > "$ASPM" || true
+  put_back_controls
+  now=$(aspm_now)
+  [ "$now" = "$1" ] || { log "aspm reads $now after writing $1" err; return 1; }
+}
+some() { # glob results exist, or say what is missing
+  [ "$#" -gt 1 ] || { echo "wattif-helper: $cmd: no ${1#"$SYS"/} here" >&2; exit 1; }
+}
+shift || true
+case "$cmd" in
+  status)
+    for b in "$SYS"/class/power_supply/*; do
+      [ "$(cat "$b/type" 2>/dev/null)" = Battery ] || continue
+      [ "$(cat "$b/scope" 2>/dev/null)" != Device ] || continue
+      if [ -r "$b/power_now" ]; then w=$(awk '{printf "%.2f W", $1/1e6}' "$b/power_now")
+      else w=$(awk -v v="$(cat "$b/voltage_now")" -v i="$(cat "$b/current_now")" 'BEGIN{printf "%.2f W", v*i/1e12}'); fi
+      echo "battery $(basename "$b"): $(cat "$b/status") $w ($(cat "$b/capacity")%)"
+    done
+    for h in "$SYS"/class/drm/card*/device/hwmon/hwmon*/power1_average "$SYS"/class/drm/card*/device/hwmon/hwmon*/power1_input; do
+      echo "gpu/chip $(basename "$h"): $(awk '{printf "%.2f W",$1/1e6}' "$h")"
+    done
+    [ -r "$ASPM" ] && echo "aspm: $(cat "$ASPM")"
+    for p in "$SYS"/class/drm/card*-eDP-*/amdgpu/panel_power_savings; do echo "abm: $(cat "$p")"; done
+    for f in "$SYS"/devices/system/cpu/cpufreq/boost "$SYS"/devices/system/cpu/intel_pstate/no_turbo; do echo "$(basename "$f"): $(cat "$f")"; done
+    for f in "$SYS"/firmware/acpi/platform_profile "$SYS"/devices/system/cpu/cpu0/cpufreq/energy_performance_preference "$SYS"/devices/system/cpu/cpu0/cpufreq/scaling_max_freq; do
+      echo "$(basename "$f"): $(cat "$f")"
+    done
+    for f in "$SYS"/class/drm/card*/device/power_dpm_force_performance_level "$SYS"/class/nvme/nvme*/power/pm_qos_latency_tolerance_us; do
+      echo "${f#"$SYS"/class/}: $(cat "$f")"
+    done
+    [ -e "$SLEEPING" ] && echo "sleeping: $(cat "$SLEEPING") (sleep-safe ran, sleep-restore not yet)"
+    exit 0
+    ;;
+  trigger)
+    [ $# -eq 1 ] && [ "$1" = power_supply ] || usage
+    begin_change
+    udevadm trigger --action=change --settle -s power_supply; echo triggered
+    ;;
+  abm)
+    [ $# -eq 1 ] && [[ "$1" =~ ^[0-4]$ ]] || usage
+    begin_change
+    panels=("$SYS"/class/drm/card*-eDP-*/amdgpu/panel_power_savings)
+    some "$SYS/class/drm/card*-eDP-*/amdgpu/panel_power_savings" "${panels[@]}"
+    for p in "${panels[@]}"; do echo "$1" > "$p"; echo "$p=$(cat "$p")"; done
+    ;;
+  aspm)
+    [ $# -eq 1 ] && [[ "$1" =~ ^(default|performance|powersave|powersupersave)$ ]] || usage
+    begin_change
+    set_aspm "$1"; cat "$ASPM"
+    ;;
+  boost)
+    # amd-pstate/acpi-cpufreq: per CPU, with the global switch left on
+    # (power-profiles-daemon writes the per-CPU files on every profile change,
+    # and the kernel refuses those writes while boost is off globally).
+    # intel_pstate: its global no_turbo, inverted.
+    [ $# -eq 1 ] && [[ "$1" =~ ^[01]$ ]] || usage
+    begin_change
+    cpufreq=$SYS/devices/system/cpu/cpufreq
+    if [ -e "$cpufreq/boost" ]; then
+      policies=("$cpufreq"/policy*/boost)
+      if [ ${#policies[@]} -gt 0 ]; then
+        echo 1 > "$cpufreq/boost"
+        for p in "${policies[@]}"; do echo "$1" > "$p"; done
+      else
+        echo "$1" > "$cpufreq/boost"
+      fi
+    elif [ -e "$SYS/devices/system/cpu/intel_pstate/no_turbo" ]; then
+      echo $((1 - $1)) > "$SYS/devices/system/cpu/intel_pstate/no_turbo"
+    else
+      echo "wattif-helper: boost: no cpufreq/boost or intel_pstate/no_turbo here" >&2; exit 1
+    fi
+    echo "boost=$1 max_mhz=$(( $(cat "$SYS"/devices/system/cpu/cpu0/cpufreq/scaling_max_freq) / 1000 ))"
+    ;;
+  apst)
+    [ $# -eq 1 ] && [[ "$1" =~ ^[0-9]{1,9}$ ]] || usage
+    begin_change
+    drives=("$SYS"/class/nvme/nvme*/power/pm_qos_latency_tolerance_us)
+    some "$SYS/class/nvme/nvme*/power/pm_qos_latency_tolerance_us" "${drives[@]}"
+    for f in "${drives[@]}"; do echo "$1" > "$f"; echo "$f=$(cat "$f")"; done
+    ;;
+  wifips)
+    [ $# -eq 1 ] && [[ "$1" =~ ^(on|off)$ ]] || usage
+    begin_change
+    for i in "$SYS"/class/net/*; do
+      [ -d "$i/wireless" ] || [ -e "$i/phy80211" ] || continue
+      iw dev "$(basename "$i")" set power_save "$1"; iw dev "$(basename "$i")" get power_save
+    done
+    ;;
+  gpudpm)
+    [ $# -eq 1 ] && [[ "$1" =~ ^(auto|low)$ ]] || usage
+    begin_change
+    levels=("$SYS"/class/drm/card*/device/power_dpm_force_performance_level)
+    some "$SYS/class/drm/card*/device/power_dpm_force_performance_level" "${levels[@]}"
+    for f in "${levels[@]}"; do echo "$1" > "$f"; echo "$f=$(cat "$f")"; done
+    ;;
+  cpucap)
+    # none = the highest the CPU can go (amd_pstate_max_freq, with boost, else
+    # cpuinfo_max_freq): the cap then follows boost, which sets the CPU's own maximum.
+    [ $# -eq 1 ] && [[ "$1" =~ ^([0-9]{3,4}|none)$ ]] || usage
+    begin_change
+    for p in "$SYS"/devices/system/cpu/cpufreq/policy*; do
+      if [ "$1" = none ]; then cat "$p/amd_pstate_max_freq" 2>/dev/null || cat "$p/cpuinfo_max_freq"; else echo "$1"000; fi > "$p/scaling_max_freq"
+    done
+    echo "max_mhz=$(( $(cat "$SYS"/devices/system/cpu/cpu0/cpufreq/scaling_max_freq) / 1000 ))"
+    ;;
+  xhci-reset)
+    # A dead xHCI controller ("HC died; cleaning up": every USB device on it
+    # gone) comes back by rebinding the driver, without a reboot.
+    [ $# -eq 1 ] || usage
+    bdf=$1
+    [[ "$bdf" =~ ^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$ ]] || usage
+    dev=$SYS/bus/pci/devices/$bdf
+    driver=$SYS/bus/pci/drivers/xhci_hcd
+    [ -e "$dev" ] || { echo "wattif-helper: no PCI device $bdf" >&2; exit 1; }
+    bound=""
+    [ -L "$dev/driver" ] && bound=$(basename "$(readlink "$dev/driver")")
+    # Bound to xhci_hcd, or unbound (a reset that stopped half-way) and an xHCI controller by class.
+    if [ "$bound" != xhci_hcd ] && { [ -n "$bound" ] || [ "$(cat "$dev/class")" != 0x0c0330 ]; }; then
+      echo "wattif-helper: $bdf is not an xHCI controller (driver: ${bound:-none})" >&2; exit 1
+    fi
+    begin_change
+    log "xhci-reset $bdf (driver: ${bound:-none})"
+    if [ "$bound" = xhci_hcd ]; then echo "$bdf" > "$driver/unbind"; sleep 1; fi
+    echo "$bdf" > "$driver/bind"
+    bound=""
+    [ -L "$dev/driver" ] && bound=$(basename "$(readlink "$dev/driver")")
+    echo "$bdf: driver=${bound:-none}"
+    [ "$bound" = xhci_hcd ]
+    ;;
+  sleep-safe)
+    # Experiments may have relaxed settings that matter on the way into suspend
+    # (on some machines, ASPM and NVMe APST are boot-time workarounds for
+    # crashes there); put back what the kernel command line asked for, and GPU
+    # DPM auto, noting what was there for the log.
+    # The flag first: from now on changes refuse, then wait for one under way.
+    hooks_only
+    mkdir -p "$RUN/wattif-helper"
+    date +%s > "$SLEEPING"
+    lock 30 || log "sleep-safe: proceeding without the lock" warning
+    saved=$RUN/wattif-helper/pre-sleep; : > "$saved"
+    failed=0
+    policy=$(cmdline_value pcie_aspm.policy)
+    current=$(aspm_now)
+    if [ -n "$policy" ] && [ "$policy" != "$current" ]; then
+      echo "aspm $current" >> "$saved"
+      set_aspm "$policy" || failed=1
+    fi
+    latency=$(cmdline_value nvme_core.default_ps_max_latency_us)
+    if [ -n "$latency" ]; then
+      for f in "$SYS"/class/nvme/nvme*/power/pm_qos_latency_tolerance_us; do
+        value=$(cat "$f")
+        if [ "$value" != "$latency" ]; then
+          echo "apst $f $value" >> "$saved"
+          echo "$latency" > "$f" || failed=1
+        fi
+      done
+    fi
+    for f in "$SYS"/class/drm/card*/device/power_dpm_force_performance_level; do
+      value=$(cat "$f")
+      if [ "$value" != auto ]; then
+        echo "gpudpm $f $value" >> "$saved"
+        echo auto > "$f" || failed=1
+      fi
+    done
+    [ "$failed" -eq 0 ] || { log "sleep-safe: a setting could not be put back before suspend" err; exit 1; }
+    ;;
+  sleep-restore)
+    # After resume: end the lock-out. What sleep-safe put back stays: wattif
+    # sets those settings again itself, after its post-resume wait and within
+    # its hold and daily limit.
+    hooks_only
+    lock 30 || log "sleep-restore: proceeding without the lock" warning
+    saved=$RUN/wattif-helper/pre-sleep
+    if [ -s "$saved" ]; then
+      log "after resume, left at the boot-time values: $(tr '\n' ';' < "$saved")"
+    fi
+    rm -f "$SLEEPING" "$saved"
+    echo "resumed: aspm=$(aspm_now)"
+    ;;
+  next-boot)
+    [ $# -eq 1 ] && [[ "$1" =~ ^[a-z0-9][a-z0-9_-]{0,31}$ ]] || usage
+    case "$1" in
+      list) bootctl list --no-pager ;;
+      default) bootctl set-oneshot ""; echo "next boot: default entry" ;;
+      *)
+        # The first entry (menu order, newest first) whose id, title or version
+        # names it: a NixOS specialisation ("specialisation-<name>"), or any entry with it.
+        id=$(bootctl list --json=short | jq -r --arg s "$1" \
+          '[.[] | select(((.id // "") + " " + (.title // "") + " " + (.version // "")) | test("specialisation[-_ ]?\\(?" + $s + "\\b"; "i"))][0].id
+           // [.[] | select((.id // "") | test("(^|[-_.])" + $s + "([-_.]|$)"; "i"))][0].id // empty')
+        [ -n "$id" ] || { echo "no boot entry for $1" >&2; bootctl list --no-pager >&2; exit 1; }
+        bootctl set-oneshot "$id"; echo "next boot: $id"
+        ;;
+    esac
+    ;;
+  *) usage ;;
+esac
