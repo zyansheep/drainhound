@@ -873,8 +873,9 @@ def plus_minus(low, high):
 RECOMMEND_KEYS = ('text', 'apply', 'change', 'gain', 'interval', 'delight')
 
 
-# Settings recommendations leave alone if experiment.py can't say which: its RISKY ones (as of 2026-10).
-RISKY = ('aspm', 'apst', 'gpu-dpm')
+# Settings recommendations leave alone if experiment.py can't say which: the
+# risky ones (config [experiments] risky, as experiment.RISKY).
+RISKY = tuple(config.get('experiments', 'risky') or ())
 
 
 def unrecommended():

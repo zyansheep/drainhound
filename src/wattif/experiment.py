@@ -21,18 +21,22 @@ panel's Experiments tab fits all settings' effects together (report.lever_effect
     wattif experiment start freeze-apps [--keep PATTERN ...]   (always only while locked)
     wattif experiment stop | restore [--stock]
     wattif experiment reconcile   (wattif-reconcile.timer: leftovers, applied settings, AC changes)
-    wattif experiment next-boot default|psr | boot-status      (boot-level experiments)
+    wattif experiment next-boot default|<arm> | boot-status   (boot-level experiments: config [experiments] boot_arms)
     wattif experiment test-freeze [--seconds 5] [--keep PATTERN]  (freeze now, measure, thaw)
     wattif experiment run | auto   (the wattif experiment / wattif experiments service bodies)
 
-Stock values are declarative (`Setting.baseline`), never captured from the
-live state: the kernel command line's ASPM policy and APST limit, GPU DPM auto,
-no CPU cap, Wi-Fi power saving on, no app throttle, power-profiles-daemon's
-boost for the profile, ABM by power-conf.nix's udev policy and your own profile
-(captured only while nothing of wattif experiment's holds it, per power source).
+catalog() offers only the settings this machine has (PROBES: the kernel's
+files, power-profiles-daemon, the compositor, the throttle unit). Stock values
+are declarative (`Setting.baseline`), never captured from the live state while
+a change of wattif experiment's holds the setting: the kernel command line's
+ASPM policy and APST limit, GPU DPM auto, no CPU cap, Wi-Fi power saving on, no
+app throttle, boost as the profile leaves it, and config [stock]'s profile and
+ABM per power source; your own profile, and ABM where config leaves it as
+found, are captured only while nothing of wattif experiment's holds them.
 
-RISKY settings (PCIe ASPM, NVMe APST, GPU DPM) touch the links and the data
-fabric that died awake three times in October 2026. They stay out of automatic
+Risky settings (config [experiments] risky; by default PCIe ASPM, NVMe APST and
+GPU DPM, which touch the links and the data fabric that died awake three times
+on a Framework 13 (Ryzen 7040) in October 2026) stay out of automatic
 experiments, `apply` and `goal --apply` unless asked for with --risky, and when
 they do change (automatic, manual and applied alike) they hold for RISKY_HOLD,
 never change within RESUME_SETTLE of a resume and change at most RISKY_DAILY
@@ -42,23 +46,26 @@ an xHCI death, a Bluetooth command timeout, a PCIe AER error, an amdgpu ring or
 NVMe timeout puts every setting back to stock, quarantines the settings changed
 in the QUARANTINE_WINDOW before it (and those still off stock), turns automatic
 experiments off and notifies. So does a boot that ended with a run active and
-a crash reset reason while awake (a sync flood; not a reboot or power-off). A
-boot that ended with a run active while asleep (s2idle never came back, or a
-sync flood after a suspend entry), or with no shutdown logged (a battery cut, a
-hard power-off), only stops the run (until the next login) and notifies: the
-s2idle crashes happen with or without experiments, and the settings are at
-their boot values after a reboot anyway. Quarantined settings stay out until
-`release`.
+a crash reset reason while awake (AMD's "Previous system reset reason", where
+the kernel prints one: a sync flood; not a reboot or power-off). A boot that
+ended with a run active while asleep (s2idle never came back, or a crash after
+a suspend entry), or with no shutdown logged (a battery cut, a hard power-off),
+only stops the run (until the next login) and notifies: such crashes can happen
+with or without experiments, and the settings are at their boot values after a
+reboot anyway. Quarantined settings stay out until `release`.
 
-Settings that cannot change at runtime (PSR: amdgpu.dcdebugmask) are boot-level
-experiments: the `psr` specialisation boots with PSR enabled, `next-boot` picks
-the entry for the next restart only, and the panel compares boots by arm.
+Settings that cannot change at runtime are boot-level experiments: config
+[experiments] boot_arms names boot entries (a NixOS specialisation, say), and
+`next-boot` picks one for the next restart only. A 'psr' arm (panel
+self-refresh through amdgpu.dcdebugmask) gets the panel's comparison of boots.
 
-Root settings go through `sudo -n wattif-helper` (the setuid wrapper); its
-pre-sleep hook restores the s2idle crash workarounds (ASPM, NVMe APST, GPU DPM)
-before every suspend and refuses changes until its post-resume hook has run.
-After resume they stay at stock: the runner and the reconciler set them again
-once RESUME_SETTLE has passed, within the hold and the daily limit.
+Root settings go through the root helper (config [helper] command: `sudo -n
+wattif-helper`); its pre-sleep hook puts the kernel command line's ASPM and
+NVMe APST and GPU DPM auto back before every suspend (on some machines those
+are workarounds for crashes in s2idle) and refuses changes until its
+post-resume hook has run. After resume they stay at stock: the runner and the
+reconciler set them again once RESUME_SETTLE has passed, within the hold and
+the daily limit.
 """
 import argparse
 import contextlib
@@ -103,10 +110,12 @@ SOURCE = RUNTIME / 'power-source.json'  # reconcile's view of AC/battery, and wh
 HELPER = list(config.get('helper', 'command'))
 BUSY_EXIT = 75  # The helper: suspending (its sleep-safe holds), or another change holds its lock.
 SYS = Path('/sys')
+PROC = Path('/proc')
 CMDLINE = Path('/proc/cmdline')
 
-# Settings on the PCIe links, the SSD's power states and the data fabric clocks.
-RISKY = ('aspm', 'apst', 'gpu-dpm')
+# Settings that can upset some hardware (config [experiments] risky; by default
+# the PCIe links, the SSD's power states and the GPU's and data fabric's clocks).
+RISKY = tuple(config.get('experiments', 'risky') or ())
 RISKY_HOLD = 45 * 60  # s a risky setting keeps a value once changed.
 RISKY_DAILY = 8  # Changes of one risky setting a day (both ways; going back to stock is never refused).
 RESUME_SETTLE = 60  # s after resume without any change (the hooks and the Wi-Fi module settle).
@@ -120,7 +129,7 @@ SETTLED = 'more testing would cost more than it saves'  # The runner's pause whi
 # exits BUSY_EXIT) plus the change itself, so a busy lock reads as Busy, not as
 # a timeout that leaves wattif-helper applying the change after we gave up.
 LAB_TIMEOUT = 30
-# s for `systemctl stop` of a run: its stop restores everything (TimeoutStopSec=180 in niri.nix).
+# s for `systemctl stop` of a run: its stop restores everything (its unit's TimeoutStopSec, 180 s).
 STOP_TIMEOUT = 240
 
 
@@ -183,25 +192,71 @@ def wifi_interface():
     return None
 
 
-def niri_internal():
-    outputs = json.loads(run(['niri', 'msg', '-j', 'outputs']) or '{}')
-    for output in outputs.values():
-        if str(output.get('name', '')).startswith(('eDP', 'LVDS', 'DSI')):
-            return output
+# The compositors whose IPC can change the internal panel's mode, by the
+# environment variable naming their socket (set in your session, and imported
+# into the systemd user manager's environment by both).
+COMPOSITORS = (('niri', 'NIRI_SOCKET'), ('sway', 'SWAYSOCK'))
+INTERNAL = ('eDP', 'LVDS', 'DSI')  # Connector names of a built-in panel.
+
+
+def compositor():
+    """'niri' or 'sway' while its IPC socket is there, else None (no refresh setting)."""
+    for name, variable in COMPOSITORS:
+        socket = os.environ.get(variable)
+        if socket and os.path.exists(socket):
+            return name
+    return None
+
+
+def internal_output():
+    """The internal panel as the compositor lists it: {'name', 'modes':
+    [(width, height, mHz)], 'current': (width, height, mHz) or None while off}."""
+    which = compositor()
+    if which == 'niri':  # {name: {'modes': [{'width', 'height', 'refresh_rate'}], 'current_mode': index}}
+        for output in json.loads(run(['niri', 'msg', '-j', 'outputs']) or '{}').values():
+            if str(output.get('name', '')).startswith(INTERNAL):
+                modes = [(m['width'], m['height'], m['refresh_rate']) for m in output.get('modes') or []]
+                index = output.get('current_mode')
+                return {'name': output['name'], 'modes': modes, 'current': modes[index] if index is not None else None}
+    elif which == 'sway':  # [{'name', 'active', 'modes': [{'width', 'height', 'refresh'}], 'current_mode': {…}}]
+        for output in json.loads(run(['swaymsg', '-r', '-t', 'get_outputs']) or '[]'):
+            if str(output.get('name', '')).startswith(INTERNAL):
+                mode = lambda m: (m['width'], m['height'], m['refresh'])
+                current = output.get('current_mode') if output.get('active', True) else None
+                return {'name': output['name'], 'modes': [mode(m) for m in output.get('modes') or []],
+                        'current': mode(current) if current else None}
     raise RuntimeError('no internal display')
 
 
+def mode_text(mode):
+    width, height, millihertz = mode
+    return f'{width}x{height}@{millihertz / 1000:.3f}'
+
+
+def refresh_set(value):
+    """The internal panel's mode, as refresh_get gives it (2256x1504@47.998)."""
+    name = internal_output()['name']
+    if compositor() == 'sway':
+        run(['swaymsg', 'output', name, 'mode', f'{value}Hz'])
+    else:
+        run(['niri', 'msg', 'output', name, 'mode', value])
+
+
 def refresh_get():
-    output = niri_internal()
-    mode = output['modes'][output['current_mode']]
-    return f"{mode['width']}x{mode['height']}@{mode['refresh_rate'] / 1000:.3f}"
+    current = internal_output()['current']
+    if current is None:
+        raise RuntimeError('the internal display is off')
+    return mode_text(current)
+
+
+def refresh_rates(output, size):
+    return sorted({m[2] / 1000 for m in output['modes'] if f'{m[0]}x{m[1]}' == size}, reverse=True)
 
 
 def refresh_alternative(current):
-    output = niri_internal()
+    output = internal_output()
     size, _, rate = current.partition('@')
-    rates = sorted({m['refresh_rate'] / 1000 for m in output['modes']
-                    if f"{m['width']}x{m['height']}" == size}, reverse=True)
+    rates = refresh_rates(output, size)
     lower = [r for r in rates if r < float(rate) - 1]
     target = lower[0] if lower else (rates[0] if rates else None)
     if target is None or abs(target - float(rate)) < 1:
@@ -211,12 +266,22 @@ def refresh_alternative(current):
 
 def refresh_levels():
     """(lowest, highest) refresh mode of the internal panel at its current size."""
-    output = niri_internal()
-    current = output['modes'][output['current_mode']]
-    modes = sorted((m for m in output['modes'] if (m['width'], m['height']) == (current['width'], current['height'])),
-                   key=lambda m: m['refresh_rate'])
-    mode = lambda m: f"{m['width']}x{m['height']}@{m['refresh_rate'] / 1000:.3f}"
-    return mode(modes[0]), mode(modes[-1])
+    output = internal_output()
+    current = output['current']
+    if current is None:
+        raise RuntimeError('the internal display is off')
+    modes = sorted((m for m in output['modes'] if m[:2] == current[:2]), key=lambda m: m[2])
+    return mode_text(modes[0]), mode_text(modes[-1])
+
+
+def refresh_available():
+    """A compositor that can change modes, and an internal panel with two refresh
+    rates more than 1 Hz apart at one size (whether it is on now or not)."""
+    if compositor() is None:
+        return False
+    output = internal_output()
+    sizes = {f'{m[0]}x{m[1]}' for m in output['modes']}
+    return any((rates := refresh_rates(output, size)) and rates[0] - rates[-1] >= 1 for size in sizes)
 
 
 def aspm_get():
@@ -246,6 +311,11 @@ def cpu_usec(unit):
         if line.startswith('usage_usec '):
             return int(line.split()[1])
     return None
+
+
+def freeze_keep():
+    """config [experiments] freeze_keep: scope patterns "Close every app" leaves running."""
+    return [str(pattern) for pattern in config.get('experiments', 'freeze_keep') or ()]
 
 
 def freeze_targets(keep):
@@ -316,8 +386,22 @@ def freeze_all_set(units, value):
         run(['systemctl', '--user', 'freeze' if value == 'frozen' else 'thaw', unit], check=False)
 
 
+BOOT_ENTRY = re.compile(r'[a-z0-9][a-z0-9_-]{0,31}')  # The entry patterns `wattif-helper next-boot` takes.
+
+
+def boot_arms():
+    """config [experiments] boot_arms: {arm: the boot entry pattern for `wattif-helper
+    next-boot`}, leaving out the helper's own words and patterns it would refuse."""
+    arms = config.get('experiments', 'boot_arms')
+    return {str(arm): str(entry) for arm, entry in arms.items()
+            if str(arm) not in ('default', 'list') and BOOT_ENTRY.fullmatch(str(entry))} if isinstance(arms, dict) else {}
+
+
 def psr_arm():
-    """Boot-level PSR arm from the running amdgpu.dcdebugmask (bit 0x10 disables PSR)."""
+    """The PSR boot arm this boot runs, where a 'psr' boot arm is configured: from the
+    running amdgpu.dcdebugmask (bit 0x10 disables PSR). None elsewhere."""
+    if 'psr' not in boot_arms():
+        return None
     mask = read(SYS / 'module/amdgpu/parameters/dcdebugmask')
     try:
         return 'default' if int(mask, 0) & 0x10 else 'psr'
@@ -334,12 +418,14 @@ class Setting:
         # () → (power-saving value, normal value), for `apply name=saving|normal`.
         self.levels = levels
         self.root, self.visible, self.sleep_restored, self.unit = root, visible, sleep_restored, unit
-        # udev switches these on AC/battery changes; never fight it while plugged in.
+        # The system sets these on AC/battery changes (udev rules, power-profiles-daemon):
+        # never fight it while plugged in.
         self.ac_managed = ac_managed
         self.units = units
         # (on_battery) → the stock value restores go back to: declarative, never the live value.
         self.baseline = baseline
-        # () → None: puts the stock value back another way than set() (ABM: the udev policy).
+        # (stock value, None while unknown) → None: puts the stock value back another
+        # way than set() (ABM as found: the system's power_supply udev rules).
         self.reset = reset
 
     def read(self):
@@ -362,17 +448,75 @@ class Setting:
             return None
 
 
+def command_exists(name):
+    return shutil.which(name) is not None
+
+
+def stock_value(key, on_battery):
+    """config [stock] `key` for this power source (a battery/ac table, or one value
+    for both); None: as found."""
+    value = config.get('stock', key)
+    return value.get('battery' if on_battery else 'ac') if isinstance(value, dict) else value
+
+
+def held(name):
+    """Whether something of wattif experiment's holds `name`: an applied value, or a
+    change of this boot not yet put back (a run's, a crashed run's)."""
+    return name in (load_applied().get('values') or {}) or name in leftovers(Ledger())
+
+
+def found(name, on, read_now):
+    """`name`'s value as found on power source `on` (battery or not) before wattif
+    experiment changed it: saved (POOL's 'found'), else read now while nothing of
+    wattif experiment's holds it and the machine is on that source. None until then."""
+    saved = (preferences().get('found') or {}).get(name)
+    value = saved.get('battery' if on else 'ac') if isinstance(saved, dict) else None
+    if value is not None:
+        return value
+    if bool(on) != on_battery() or held(name):
+        return None
+    return remember_found(name, on, read_now())
+
+
+def remember_found(name, on, value):
+    if value is not None:
+        key = 'battery' if on else 'ac'
+        saved = (preferences().get('found') or {}).get(name)
+        if not isinstance(saved, dict) or saved.get(key) != value:
+            update_preferences(lambda prefs: prefs.update(found=dict(
+                prefs.get('found') or {}, **{name: dict((prefs.get('found') or {}).get(name) or {}, **{key: value})})))
+    return value
+
+
 CPUFREQ = SYS / 'devices/system/cpu/cpufreq'
 
 
+def intel_pstate():
+    """intel_pstate's directory (no_turbo, turbo_pct), beside cpufreq's."""
+    return CPUFREQ.parent / 'intel_pstate'
+
+
 def boost_get():
-    """'1' while CPU boost is on: globally and on every CPU. power-profiles-daemon
-    sets it per CPU on each profile change (off for power-saver) and leaves the
-    global switch on, so the global switch alone says on while it is off."""
+    """'1' while CPU boost is on, None without a switch for it. amd-pstate and
+    acpi-cpufreq: globally and on every CPU (power-profiles-daemon sets it per CPU
+    on each profile change, off for power-saver, and leaves the global switch on,
+    so the global switch alone says on while it is off). intel_pstate: its
+    no_turbo, inverted."""
     overall = read(CPUFREQ / 'boost')
-    if overall is None:
-        return None
-    return '1' if overall == '1' and all(read(p) in (None, '1') for p in CPUFREQ.glob('policy*/boost')) else '0'
+    if overall is not None:
+        return '1' if overall == '1' and all(read(p) in (None, '1') for p in CPUFREQ.glob('policy*/boost')) else '0'
+    no_turbo = read(intel_pstate() / 'no_turbo')
+    return None if no_turbo is None else '0' if no_turbo == '1' else '1'
+
+
+def boost_available():
+    """A boost switch, and turbo frequencies for it to switch (intel_pstate's turbo_pct is 0 without)."""
+    return boost_get() is not None and read(intel_pstate() / 'turbo_pct') != '0'
+
+
+def profile_available():
+    """powerprofilesctl, for power-profiles-daemon (or tuned-ppd, which serves the same D-Bus API)."""
+    return command_exists('powerprofilesctl')
 
 
 def profile_get():
@@ -391,38 +535,88 @@ def profile_set(value):
 
 
 PROFILES = ('power-saver', 'balanced', 'performance')
-DEFAULT_PROFILE = {'battery': 'power-saver', 'ac': 'balanced'}  # niri.nix's udev rules.
 
 
 def own_profile(on_battery):
     """Your profile for this power source: captured (capture_profile) only while
-    nothing of wattif experiment's holds it, else what udev sets."""
-    key = 'battery' if on_battery else 'ac'
+    nothing of wattif experiment's holds it, else config [stock] profile's (what
+    common udev rules set), else balanced (power-profiles-daemon's own default)."""
     saved = preferences().get('own_profile')
-    value = saved.get(key) if isinstance(saved, dict) else None
-    return value if value in PROFILES else DEFAULT_PROFILE[key]
+    value = saved.get('battery' if on_battery else 'ac') if isinstance(saved, dict) else None
+    if value in PROFILES:
+        return value
+    configured = stock_value('profile', on_battery)
+    return configured if configured in PROFILES else 'balanced'
 
 
-def boost_stock(_on_battery=True):
-    """power-profiles-daemon's boost for the profile now (restored before boost): off under power-saver."""
-    return '0' if profile_get() == 'power-saver' else '1'
+def boost_follows_profile():
+    """Whether power-profiles-daemon sets boost with the profile: on amd-pstate in
+    active (EPP) mode it turns boost off per CPU for power-saver, on for the others."""
+    return (read(CPUFREQ.parent / 'amd_pstate/status') == 'active' and any(CPUFREQ.glob('policy*/boost'))
+            and profile_available())
 
 
-# power-conf.nix's udev ABM policy (panel_power_savings), by power source.
-ABM_POLICY = {True: '3', False: '0'}
+def boost_stock(on=True):
+    """config [stock] boost for power source `on`; else what the profile now leaves
+    it at (restored before boost) where power-profiles-daemon sets it with the
+    profile (off under power-saver), else on (the kernel's default). Which of
+    those it is, is remembered for battery_stock."""
+    configured = stock_value('boost', on)
+    if configured is not None:
+        return '1' if int(configured) else '0'
+    follows = boost_follows_profile()
+    if preferences().get('boost_follows_profile') != follows:
+        prefer(boost_follows_profile=follows)
+    return ('0' if profile_get() == 'power-saver' else '1') if follows else '1'
+
+
+def battery_stock():
+    """The profile, ABM and boost as they go back to on battery, from configuration
+    and what was seen before (never a live read): report.own_settings' answer
+    while no battery minute outside experiments says. ABM and boost are left out
+    until seen."""
+    prefs, values = preferences(), {'profile': own_profile(True)}
+    abm, boost, seen = stock_value('abm', True), stock_value('boost', True), (prefs.get('found') or {}).get('abm')
+    if abm is not None:
+        values['abm'] = str(int(abm))
+    elif isinstance(seen, dict) and seen.get('battery') is not None:
+        values['abm'] = seen['battery']
+    if boost is not None:
+        values['boost'] = '1' if int(boost) else '0'
+    elif isinstance(prefs.get('boost_follows_profile'), bool):  # As boost_stock found it.
+        values['boost'] = '0' if prefs['boost_follows_profile'] and values['profile'] == 'power-saver' else '1'
+    return values
+
+
+def abm_paths():
+    return sorted(SYS.glob('class/drm/card*-eDP-*/amdgpu/panel_power_savings'))
 
 
 def abm_get():
-    return read(next(iter(sorted(SYS.glob('class/drm/card*-eDP-*/amdgpu/panel_power_savings'))), '/nonexistent'))
+    paths = abm_paths()
+    return read(paths[0]) if paths else None
 
 
-def abm_reset():
-    """ABM back to the udev policy by running it again. The trigger runs niri.nix's
-    profile rule too, so the profile (and boost, which follows it) are put back
-    as they were; restore_settings restores those after ABM when they are its own."""
+def abm_stock(on_battery):
+    """config [stock] abm for this power source; where that is None, the value found
+    there before wattif experiment changed it (None until seen)."""
+    configured = stock_value('abm', on_battery)
+    if configured is not None:
+        if not 0 <= int(configured) <= 4:
+            raise ValueError(f'config [stock] abm: {configured} is not 0-4')
+        return str(int(configured))
+    return found('abm', on_battery, abm_get)
+
+
+def abm_reset(target=None):
+    """ABM back where config leaves it as found: the system's power_supply udev rules
+    run again (where one sets ABM, that is its policy), then `target`, the value
+    found, is written if they left another. The trigger runs any profile rule too,
+    so the profile (and boost, which may follow it) are put back as they were;
+    restore_settings restores those after ABM when they are its own."""
     try:
         profile = profile_get()
-    except Exception:  # noqa: BLE001 - power-profiles-daemon down: nothing to put back
+    except Exception:  # noqa: BLE001 - power-profiles-daemon down or absent: nothing to put back
         profile = None
     boost = boost_get()
     lab('trigger', 'power_supply')
@@ -432,11 +626,26 @@ def abm_reset():
     finally:
         if boost is not None and boost_get() != boost:
             lab('boost', boost)
+    if target is not None and abm_get() != target:
+        lab('abm', target)
+
+
+def abm_restore(target):
+    """ABM's reset where config leaves a power source as found: config [stock] abm's
+    value is written on the other, one left as found goes back by abm_reset."""
+    if target is not None and stock_value('abm', on_battery()) is not None:
+        lab('abm', target)
+    else:
+        abm_reset(target)
+
+
+def gpu_dpm_paths():
+    return sorted(SYS.glob('class/drm/card*/device/power_dpm_force_performance_level'))
 
 
 def gpu_dpm_get():
-    return next((read(path) for path in sorted(SYS.glob('class/drm/card*/device/power_dpm_force_performance_level'))),
-                None)
+    paths = gpu_dpm_paths()
+    return read(paths[0]) if paths else None
 
 
 THROTTLE_UNIT = config.UNITS['throttle']
@@ -446,7 +655,23 @@ def throttle_get():
     return 'on' if run(['systemctl', '--user', 'is-active', THROTTLE_UNIT], check=False) == 'active' else 'off'
 
 
-CPU_CAP = '2000'  # MHz: the CPU cap's power-saving value (base is 3501, boost 4972).
+def unit_loaded(unit):
+    """Whether the systemd user manager has `unit` (installed and loaded)."""
+    try:
+        return run(['systemctl', '--user', 'show', unit, '-P', 'LoadState'], check=False, timeout=5) == 'loaded'
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def configured_cap():
+    """config [stock] cpu_cap_mhz as the helper takes it ('' if it isn't a number)."""
+    try:
+        return str(int(config.get('stock', 'cpu_cap_mhz')))
+    except (TypeError, ValueError):
+        return ''
+
+
+CPU_CAP = configured_cap()  # MHz: the CPU cap's power-saving value.
 APST_DEFAULT = '100000'  # µs: nvme_core.default_ps_max_latency_us's default.
 
 
@@ -460,66 +685,132 @@ def cpu_cap_get():
     return 'none' if int(cap) >= int(top) - 50_000 else str(round(int(cap) / 100_000) * 100)
 
 
+def cpu_limits():
+    """(lowest, highest) MHz the CPU runs at: policy0's cpuinfo range (the highest
+    with boost, where amd-pstate says it; intel_pstate lowers it while boost is off)."""
+    policy = CPUFREQ / 'policy0'
+    low, high = (int(read(policy / f'cpuinfo_{end}_freq')) for end in ('min', 'max'))
+    return low // 1000, max(high, int(read(policy / 'amd_pstate_max_freq') or 0)) // 1000
+
+
+def cpu_cap_available():
+    """A frequency cap to write, and a configured one the CPU can run at, below its
+    maximum (or below what it has with boost: off, the maximum may be lower)."""
+    if not re.fullmatch(r'[0-9]{3,4}', CPU_CAP) or read(CPUFREQ / 'policy0/scaling_max_freq') is None:
+        return False
+    low, high = cpu_limits()
+    return low <= int(CPU_CAP) and (int(CPU_CAP) < high or boost_get() == '0')
+
+
+def cpu_cap_text():
+    try:
+        low, high = cpu_limits()
+        return f'Caps every core at {CPU_CAP} MHz (this CPU runs at {low}–{high} MHz).'
+    except (TypeError, ValueError):
+        return f'Caps every core at {CPU_CAP} MHz.'
+
+
+def wifi_available():
+    return wifi_interface() is not None and command_exists('iw')
+
+
+# What each setting needs on this machine (catalog() leaves out the rest): its
+# kernel files, power-profiles-daemon, a compositor that sets modes, the throttle unit.
+PROBES = {
+    'aspm': lambda: (SYS / 'module/pcie_aspm/parameters/policy').exists(),
+    'apst': lambda: bool(apst_paths()),
+    'boost': lambda: boost_available(),
+    'abm': lambda: bool(abm_paths()),
+    'profile': lambda: profile_available(),
+    'gpu-dpm': lambda: bool(gpu_dpm_paths()),
+    'cpu-cap': lambda: cpu_cap_available(),
+    'throttle-apps': lambda: unit_loaded(THROTTLE_UNIT),
+    'refresh': lambda: refresh_available(),
+    'wifi-ps': lambda: wifi_available(),
+}
+
+
+def available(name):
+    """Whether this machine has setting `name` (PROBES; app freezing always does)."""
+    probe = PROBES.get(name)
+    try:
+        return probe is None or bool(probe())
+    except (OSError, ValueError, TypeError, KeyError, IndexError, RuntimeError, subprocess.SubprocessError):
+        return False
+
+
+def risky_note(name):
+    return ' Risky: only with --risky.' if name in RISKY else ''
+
+
+SUSPEND_NOTE = ('where the kernel command line sets it (often a workaround for crashes), the root helper puts it '
+                'back for every suspend and it is set again a minute after resume.')
+
+
 def catalog(unit=None, units=None):
-    """Experiment specs; `unit` / `units` parameterize the wattif freeze experiments."""
+    """Experiment specs of the settings this machine has (available); `unit` / `units`
+    parameterize the wattif freeze experiments."""
     wifi = wifi_interface()
+    abm_found = stock_value('abm', True) is None or stock_value('abm', False) is None
     specs = [
         Setting('aspm', 'PCIe link power saving (ASPM)',
-                'Lets PCIe links (NVMe, Wi-Fi, GPU) sleep. Disabled at boot as an s2idle crash workaround; '
-                'restored for every suspend (set again a minute after resume). Risky: only with --risky.',
+                'Lets PCIe links (NVMe, Wi-Fi, GPU) sleep. Stock: pcie_aspm.policy, else the kernel\'s default; '
+                + SUSPEND_NOTE + risky_note('aspm'),
                 aspm_get, lambda v: lab('aspm', v),
                 lambda cur: 'powersupersave' if cur != 'powersupersave' else 'performance',
                 root=True, sleep_restored=True, levels=lambda: ('powersupersave', 'performance'),
                 baseline=lambda on: cmdline_param('pcie_aspm.policy') or 'default'),
         Setting('apst', 'NVMe autonomous power states (APST)',
-                'Lets the SSD drop into low-power states when idle. Disabled at boot as an s2idle crash '
-                'workaround; restored for every suspend (set again a minute after resume). Risky: only with --risky.',
+                'Lets the SSD drop into low-power states when idle. Stock: nvme_core.default_ps_max_latency_us, '
+                f'else {APST_DEFAULT} µs; ' + SUSPEND_NOTE + risky_note('apst'),
                 lambda: read(apst_paths()[0]) if apst_paths() else None,
                 lambda v: lab('apst', v),
-                lambda cur: '100000' if cur == '0' else '0', root=True, sleep_restored=True,
-                levels=lambda: ('100000', '0'),
+                lambda cur: APST_DEFAULT if cur == '0' else '0', root=True, sleep_restored=True,
+                levels=lambda: (APST_DEFAULT, '0'),
                 baseline=lambda on: cmdline_param('nvme_core.default_ps_max_latency_us') or APST_DEFAULT),
-        Setting('boost', 'CPU boost', 'Clocks above base frequency for short bursts.',
+        Setting('boost', 'CPU boost', 'Clocks above base frequency for short bursts.' + risky_note('boost'),
                 boost_get, lambda v: lab('boost', v),
                 lambda cur: '0' if cur == '1' else '1', root=True, visible='Bursty work gets slower.',
                 levels=lambda: ('0', '1'), baseline=boost_stock),
         Setting('abm', 'Panel adaptive backlight (ABM)',
-                'Dims the backlight and boosts pixel values to compensate.',
+                'Dims the backlight and boosts pixel values to compensate.' + risky_note('abm'),
                 abm_get, lambda v: lab('abm', v),
                 lambda cur: '0' if cur not in (None, '0') else '3', root=True, visible='Slight contrast change.',
-                ac_managed=True, levels=lambda: ('3', '0'), baseline=lambda on: ABM_POLICY[bool(on)],
-                reset=abm_reset),
-        Setting('profile', 'Power profile', 'power-profiles-daemon profile (platform profile and EPP).',
+                ac_managed=stock_value('abm', False) is None, levels=lambda: ('3', '0'), baseline=abm_stock,
+                reset=abm_restore if abm_found else None),
+        Setting('profile', 'Power profile', 'power-profiles-daemon profile (platform profile and EPP).'
+                + risky_note('profile'),
                 profile_get, profile_set,
                 lambda cur: 'balanced' if cur == 'power-saver' else 'power-saver',
-                visible='Responsiveness changes.', ac_managed=True, levels=lambda: ('power-saver', 'balanced'),
-                baseline=own_profile),
+                visible='Responsiveness changes.', ac_managed=stock_value('profile', False) is None,
+                levels=lambda: ('power-saver', 'balanced'), baseline=own_profile),
         Setting('gpu-dpm', 'GPU and memory clocks', 'amdgpu DPM low: pins the GPU, memory and fabric clocks at '
-                'their lowest (the fabric otherwise idles at 1600 MHz). Risky: only with --risky.',
+                'their lowest (on a Framework 13 (Ryzen 7040) the fabric otherwise idles at 1600 MHz).'
+                + risky_note('gpu-dpm'),
                 gpu_dpm_get, lambda v: lab('gpudpm', v),
                 lambda cur: 'low' if cur != 'low' else 'auto', root=True,
                 visible='Video, WebGL and memory-heavy work get slower.', levels=lambda: ('low', 'auto'),
                 baseline=lambda on: 'auto'),
-        Setting('cpu-cap', 'CPU frequency cap', f'Caps every core at {CPU_CAP} MHz (base 3501, boost 4972).',
+        Setting('cpu-cap', 'CPU frequency cap', cpu_cap_text() + risky_note('cpu-cap'),
                 cpu_cap_get, lambda v: lab('cpucap', v),
                 lambda cur: CPU_CAP if cur == 'none' else 'none', root=True,
                 visible='Bursty work gets slower.', levels=lambda: (CPU_CAP, 'none'), baseline=lambda on: 'none'),
         Setting('throttle-apps', 'Throttle background apps',
                 f'Caps every app but the focused one at {throttle.QUOTA}% of a core while on battery (wattif throttle); '
-                'apps playing or recording audio or video, terminals, editors, T3 Code and the input method are '
-                'left alone.',
+                'apps playing or recording audio or video, terminals, editors, the input method and those in '
+                'config [throttle] keep are left alone.' + risky_note('throttle-apps'),
                 throttle_get, lambda v: run(['systemctl', '--user', 'start' if v == 'on' else 'stop', THROTTLE_UNIT]),
                 lambda cur: 'off' if cur == 'on' else 'on',
                 visible='Background apps update slowly until you switch to them.', levels=lambda: ('on', 'off'),
                 baseline=lambda on: 'off'),
-        Setting('refresh', 'Display refresh rate', 'Lower internal-panel refresh rate.',
-                refresh_get, lambda v: run(['niri', 'msg', 'output', niri_internal()['name'], 'mode', v]),
+        Setting('refresh', 'Display refresh rate', 'Lower internal-panel refresh rate.' + risky_note('refresh'),
+                refresh_get, refresh_set,
                 refresh_alternative, visible='Motion looks slightly less smooth.', levels=refresh_levels,
                 baseline=lambda on: refresh_levels()[1]),
     ]
     if wifi:
         specs.append(Setting(
-            'wifi-ps', 'Wi-Fi power saving', 'Radio sleeps between beacons (adds latency).',
+            'wifi-ps', 'Wi-Fi power saving', 'Radio sleeps between beacons (adds latency).' + risky_note('wifi-ps'),
             lambda: run(['iw', 'dev', wifi, 'get', 'power_save']).split(':')[-1].strip(),  # Raises while gone.
             lambda v: lab('wifips', v),
             lambda cur: 'off' if cur == 'on' else 'on', root=True, visible='Network latency changes.',
@@ -538,7 +829,7 @@ def catalog(unit=None, units=None):
             'and the difference is what the apps cost in the background.',
             lambda: freeze_all_get(units), lambda v: freeze_all_set(units, v), lambda cur: 'frozen',
             visible='Only runs while the screen is locked.', units=units, baseline=lambda on: 'running'))
-    return {spec.name: spec for spec in specs}
+    return {spec.name: spec for spec in specs if available(spec.name)}
 
 
 def unit_label(unit):
@@ -573,15 +864,44 @@ def freezable_units():
 
 
 def on_battery():
+    """An AC adapter offline and the laptop's battery discharging (not a mouse's or a
+    headset's: scope Device)."""
     for supply in (SYS / 'class/power_supply').glob('*'):
         if read(supply / 'type') == 'Mains' and read(supply / 'online') == '1':
             return False
-    return any(read(s / 'type') == 'Battery' and read(s / 'status') == 'Discharging'
+    return any(read(s / 'type') == 'Battery' and read(s / 'status') == 'Discharging' and read(s / 'scope') != 'Device'
                for s in (SYS / 'class/power_supply').glob('*'))
 
 
 def screen_locked():
-    return subprocess.run(['pgrep', '-x', 'swaylock'], capture_output=True).returncode == 0
+    """Whether the screen is locked: a screen locker of config [session] lockers
+    runs, or logind's LockedHint (set by desktops that tell logind: GNOME, KDE…) says so."""
+    return locker_running() or locked_hint()
+
+
+def locker_running():
+    names = {str(name)[:15] for name in config.get('session', 'lockers') or ()}  # comm keeps 15 characters.
+    for comm in PROC.glob('[0-9]*/comm') if names else ():
+        try:
+            if comm.read_text().strip() in names:
+                return True
+        except OSError:
+            continue  # Exited meanwhile.
+    return False
+
+
+def locked_hint():
+    """LockedHint of this login session ($XDG_SESSION_ID), or of any of yours (a
+    user service runs outside them)."""
+    try:
+        sessions = ([os.environ['XDG_SESSION_ID']] if os.environ.get('XDG_SESSION_ID') else run(
+            ['loginctl', 'show-user', str(os.getuid()), '-p', 'Sessions', '--value'], check=False, timeout=5).split())
+        if not sessions:
+            return False
+        shown = run(['loginctl', 'show-session', *sessions, '-p', 'LockedHint'], check=False, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return 'LockedHint=yes' in shown.split()
 
 
 def write_state(state, path=None):
@@ -776,8 +1096,9 @@ def leftovers(ledger, exclude=()):
 
 # --- The watchdog ------------------------------------------------------------------------
 
-# Kernel messages that stop every experiment: how the awake failures of October
-# 2026 looked (a Bluetooth command timeout came ~5 s before each xHCI death).
+# Kernel messages that stop every experiment: how the awake failures on a
+# Framework 13 (Ryzen 7040) in October 2026 looked (a Bluetooth command timeout
+# came ~5 s before each xHCI death), and the GPU's and SSD's own timeouts.
 INCIDENTS = (
     ('xHCI controller died', re.compile(r'xhci_hcd .*HC died')),
     ('Bluetooth command timeout', re.compile(r'Bluetooth: hci\d+: command (?:0x[0-9a-f]+ )?tx timeout')),
@@ -785,11 +1106,14 @@ INCIDENTS = (
     ('amdgpu ring timeout', re.compile(r'amdgpu.*ring \S+ timeout')),
     ('NVMe timeout', re.compile(r'nvme nvme\d+: .*(?:timeout|controller is down)')),
 )
-# How the boot before this one ended (x86/amd, printed early in this boot): one
-# line per reason bit. Bit 11 carries no text and is always set here; the CF9
-# resets (reboot, also a panic or SysRq reboot) and the ACPI power state
-# transition (power-off) are clean. Anything else (bit 27: a data fabric sync
-# flood; a 4 s power button press, a thermal trip, a watchdog …) is a crash.
+# How the boot before this one ended, where the kernel says (x86/amd on recent
+# AMD CPUs and kernels, printed early in this boot; elsewhere nothing is printed,
+# and a boot is judged by its suspend marks and its shutdown alone): one
+# line per reason bit. Bit 11 carries no text and is always set on a Framework
+# 13 (Ryzen 7040); the CF9 resets (reboot, also a panic or SysRq reboot) and the
+# ACPI power state transition (power-off) are clean. Anything else (bit 27: a
+# data fabric sync flood; a 4 s power button press, a thermal trip, a watchdog …)
+# is a crash.
 RESET_REASON = re.compile(r'Previous system reset reason \[(0x[0-9a-fA-F]+)\]')
 CLEAN_RESETS = 0x800 | 0x40000 | 0x80000 | 0x100000 | 0x200000
 SYNC_FLOOD_BIT = 0x8000000
@@ -800,7 +1124,7 @@ JOURNAL_GREP = (r'HC died|tx timeout|AER: |PCIe Bus Error|ring \S+ timeout|nvme 
 
 
 class Journal:
-    """The kernel log through journalctl (users can't read /dev/kmsg here: dmesg_restrict)."""
+    """The kernel log through journalctl (dmesg_restrict usually keeps users from /dev/kmsg)."""
 
     @staticmethod
     def entries(command):
@@ -974,7 +1298,8 @@ def trip(found, specs, battery, ledger, restore=True):
 # --- Putting settings back -----------------------------------------------------------------
 
 # Restores go risky first (back to safety soonest), ABM before the profile (its
-# udev trigger runs the profile rule) and the profile before boost (which follows it).
+# reset re-runs the power_supply udev rules, which may set the profile) and the
+# profile before boost (which may follow it).
 RESTORE_ORDER = ('aspm', 'apst', 'gpu-dpm', 'abm', 'profile', 'boost', 'cpu-cap', 'wifi-ps', 'throttle-apps',
                  'refresh', 'freeze', 'freeze-apps')
 
@@ -987,7 +1312,7 @@ def risky_last(names):
     return sorted(names, key=lambda name: name in RISKY)
 
 
-READBACK = (8, 0.25)  # Tries and seconds between them: niri applies a mode change a moment later.
+READBACK = (8, 0.25)  # Tries and seconds between them: a compositor applies a mode change a moment later.
 
 
 def settled(spec, value):
@@ -1025,19 +1350,25 @@ def restore_settings(specs, names, battery, ledger=None, by='restore', captured=
             pending[name] = 'backing off after failed restores'
             continue
         if spec.ac_managed and not on:
-            continue  # udev applied the AC value.
+            continue  # The system applied the AC value.
         attempted, target = False, None
         try:
             target = spec.stock(on) if spec.baseline is not None else (captured or {}).get(name)
-            if target is None:
+            if target is None and not spec.reset:
                 raise RuntimeError('no stock value')
             now = spec.read()
-            if now != target:
+            if now != target or target is None:
                 if now is None:
                     raise RuntimeError('unavailable')
                 attempted = True
-                spec.reset() if spec.reset else spec.set(target)
-                now = settled(spec, target)
+                if target is None:  # As found, but never seen: what the system's own policy (its reset) sets.
+                    spec.reset(None)
+                    target = now = spec.read()
+                    if now is None:
+                        raise RuntimeError('unavailable')
+                else:
+                    spec.reset(target) if spec.reset else spec.set(target)
+                    now = settled(spec, target)
             if now != target:
                 raise RuntimeError(f'reads {now!r}, not {target!r}')
             if attempted and ledger:
@@ -1084,7 +1415,8 @@ def experiment(specs, minutes, only_locked=False, block=BLOCK, washout=WASHOUT, 
     for spec in specs:
         stock[spec.name] = spec.stock_or_none(True) if spec.baseline is not None else spec.read()
         if stock[spec.name] is None:
-            raise RuntimeError(f'{spec.name}: setting is not available here')
+            raise RuntimeError(f'{spec.name}: no stock value here (unavailable, or config [stock] leaves it as '
+                               'found and it was not seen on battery yet)')
     arms = {spec.name: {'A': stock[spec.name], 'B': spec.alternative(stock[spec.name])} for spec in specs}
     # `name`, `arm` and `value` are what the collector tags records with:
     # 'aspm+apst', 'BA' and {'aspm': …, 'apst': …} (a single setting: 'B' and its value).
@@ -1262,7 +1594,7 @@ def set_pool(names, risky=(), eligible=()):
     kept, refused = [], []
     for name in dict.fromkeys(names):
         if name in RISKY and name not in risky and name not in already:
-            refused.append((name, f'{name} is risky (PCIe/NVMe/fabric; the awake crashes): '
+            refused.append((name, f'{name} is risky (it can upset some hardware; config [experiments] risky): '
                                   f'`wattif experiment pool add {name} --risky` to include it'))
             continue
         kept.append(name)  # A quarantined one stays chosen: `release` brings it back.
@@ -1648,10 +1980,10 @@ def load_applied():
 
 def reconcile_applied(specs, battery, ledger, exclude=(), now=None, explicit=False, resumed=None):
     """Applied settings follow the power source: on each change to battery they
-    are set again, on each change to AC they go back to stock (udev's own for
-    ABM and the profile). Between changes, on battery, risky ones that are not in
-    place (the pre-sleep hook put them back to stock, and the post-resume one
-    leaves them there) are set again: never within RESUME_SETTLE of `resumed`
+    are set again, on each change to AC they go back to stock (the system's own
+    where it sets ABM or the profile on AC). Between changes, on battery, risky
+    ones that are not in place (the pre-sleep hook put them back to stock, and
+    the post-resume one leaves them there) are set again: never within RESUME_SETTLE of `resumed`
     (the last resume) and only as risky_allowed allows, so a held one is tried
     again on every call (every minute). Quarantined settings are left out.
     {name: why} for those that failed (retried next time)."""
@@ -1767,9 +2099,10 @@ def command_apply(assignments, risky=False, specs=None, battery=on_battery, ledg
 
 
 def capture_profile(battery, now=None, settle=60):
-    """Remember the profile as yours for this power source, unless wattif experiment
-    holds it (a run, an applied profile, a leftover) or the source changed under
-    `settle` seconds ago (udev may still be switching)."""
+    """Remember the profile as yours for this power source, and ABM as found where
+    config [stock] leaves it so, unless wattif experiment holds them (a run, an
+    applied value, a leftover) or the source changed under `settle` seconds ago
+    (udev may still be switching)."""
     now = now or time.time()
     on = battery()
     source = load_json(SOURCE)
@@ -1778,7 +2111,9 @@ def capture_profile(battery, now=None, settle=60):
         return None
     if now - source.get('since', now) < settle or now - source.get('captured', 0) < 300:
         return None
-    if 'profile' in (load_applied().get('values') or {}) or 'profile' in leftovers(Ledger()):
+    if stock_value('abm', on) is None and not held('abm'):
+        remember_found('abm', on, abm_get())
+    if held('profile'):
         return None
     try:
         value = profile_get()
@@ -1913,13 +2248,14 @@ def main(argv=None):
     start.add_argument('--risky', action='store_true', help=f'needed for {", ".join(RISKY)} (blocks of '
                                                             f'{RISKY_HOLD // 60} min)')
     start.add_argument('--keep', action='append',
-                       help='freeze-apps: leave scopes matching this (default: t3code, so agents keep running)')
+                       help='freeze-apps: leave scopes matching this (default: config [experiments] freeze_keep)')
     sub.add_parser('stop')
     apply = sub.add_parser('apply', help='set settings while on battery, e.g. cpu-cap=saving (until reboot)')
     apply.add_argument('assignments', nargs='+', metavar='name=value')
     apply.add_argument('--risky', action='store_true', help=f'also move {", ".join(RISKY)} off stock')
-    boot = sub.add_parser('next-boot')
-    boot.add_argument('arm', choices=['default', 'psr'])
+    boot = sub.add_parser('next-boot', help='the boot entry of an arm of config [experiments] boot_arms, for the '
+                                            'next restart only (default: the default entry)')
+    boot.add_argument('arm', choices=['default', *boot_arms()])
     sub.add_parser('boot-status')
     test = sub.add_parser('test-freeze', help='freeze the freeze-apps targets now for a few seconds, then thaw')
     test.add_argument('--seconds', type=float, default=5)
@@ -1943,7 +2279,7 @@ def main(argv=None):
                      applied=load_applied().get('values') or {}, resting=qol.resting())
         print(json.dumps(state, indent=1))
     elif args.command == 'test-freeze':
-        units = freeze_targets(args.keep if args.keep is not None else ['t3code'])
+        units = freeze_targets(args.keep if args.keep is not None else freeze_keep())
         print(json.dumps({'seconds': args.seconds, 'units': test_freeze(units, args.seconds),
                           'uncovered': uncovered()}, indent=1))
     elif args.command == 'start':
@@ -1952,7 +2288,7 @@ def main(argv=None):
         if {'freeze', 'freeze-apps'} & set(names) and len(names) > 1:
             parser.error('app-freezing experiments run on their own (they need the screen locked)')
         if names == ['freeze-apps']:
-            units = freeze_targets(args.keep if args.keep is not None else ['t3code'])
+            units = freeze_targets(args.keep if args.keep is not None else freeze_keep())
             if not units:
                 parser.error('no app scopes to freeze')
         known = catalog(args.unit, units)
@@ -1963,7 +2299,7 @@ def main(argv=None):
             if name in blocked:
                 parser.error(f'{name} is quarantined by the watchdog: `wattif experiment release {name}` first')
             if name in RISKY and not args.risky:
-                parser.error(f'{name} is risky (PCIe/NVMe/fabric, linked to awake crashes): add --risky')
+                parser.error(f'{name} is risky (it can upset some hardware; config [experiments] risky): add --risky')
         write_state({'names': names, 'minutes': max(8, min(args.minutes, 24 * 60)), 'unit': args.unit,
                      'units': units, 'only_locked': args.only_locked, 'risky': args.risky}, REQUEST)
         systemctl_wait('restart', MANUAL_UNIT, check=True)
@@ -2035,9 +2371,9 @@ def main(argv=None):
             if mine:
                 command_reconcile()
     elif args.command == 'next-boot':
-        print(lab('next-boot', args.arm))
+        print(lab('next-boot', 'default' if args.arm == 'default' else boot_arms()[args.arm]))
     elif args.command == 'boot-status':
-        print(json.dumps({'psr': psr_arm()}))
+        print(json.dumps({'arms': boot_arms(), 'psr': psr_arm()}))
     elif args.command == 'run':
         command_run()
 

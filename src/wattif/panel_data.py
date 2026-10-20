@@ -340,8 +340,10 @@ def collect(start, end, history, on_period, part, errors, timings, began):
                   goal=part('goal', experiment.goal, 'battery'), quarantine=quarantine,
                   retest=part('retest', lambda: experiment.preferences().get('retest'), None),
                   risky=tuple(experiment.RISKY),
-                  psr=part('panel self-refresh', lambda: cached('psr', lambda: report.boot_effect(minutes_all, energy,
-                                                                                                   typical)), None),
+                  # Boot-level PSR, where a 'psr' boot arm is configured (config [experiments] boot_arms).
+                  boot_arms=part('boot arms', experiment.boot_arms, {}),
+                  psr=part('panel self-refresh', lambda: cached('psr', lambda: report.boot_effect(
+                      minutes_all, energy, typical)) if 'psr' in experiment.boot_arms() else None, None),
                   psr_arm=part('boot arm', experiment.psr_arm, None),
                   catalog=part('settings', lambda: [experiment.describe(spec)
                                                     for spec in experiment.catalog().values()], []),
@@ -564,12 +566,12 @@ def lever_rows(settings, levers, quality, pool, risky=(), quarantine=None):
             includable, hint = False, 'Quarantined after a hardware incident: automatic experiments leave it alone'
         elif name in risky and name in pool:  # In the pool only if added with --risky (wattif experiment pool).
             detail += ' · risky: in automatic runs (added with --risky)'
-            hint = ('Risky for the hardware (PCIe/NVMe/fabric crashes); you added it with --risky. Untick to take '
-                    f'it out of automatic runs (back in only with `wattif experiment pool add {name} --risky`)')
+            hint = ('Risky for some hardware (config [experiments] risky); you added it with --risky. Untick to '
+                    f'take it out of automatic runs (back in only with `wattif experiment pool add {name} --risky`)')
         elif name in risky:
             detail += ' · risky: not in automatic runs'
-            includable, hint = False, ('Risky for the hardware (PCIe/NVMe/fabric crashes): automatic experiments '
-                                       f'vary it only after `wattif experiment pool add {name} --risky`')
+            includable, hint = False, ('Risky for some hardware (config [experiments] risky): automatic '
+                                       f'experiments vary it only after `wattif experiment pool add {name} --risky`')
         effect, progress = effects.get(name), (levers.get('progress') or {}).get(name)
         if effect and finite(effect.get('chance')):
             detail += f" · {effect['chance']:.0%} chance it saves"
@@ -794,7 +796,7 @@ def banner_text(state, enabled, now=None, frozen='', quarantine=None):
     elif status == 'paused':
         reason = state.get('reason') or 'no reason given'
         if reason == 'waiting for the screen to lock':
-            reason += ' (apps keep running until you lock with Ctrl+Alt+L)'
+            reason += ' (apps keep running until you lock the screen)'
         text = f"Paused: {state.get('label', 'an experiment')} — {reason}. Settings restored meanwhile." + frozen
     elif enabled:
         text = 'On; starting…'

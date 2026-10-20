@@ -328,7 +328,9 @@ class EtaTests(unittest.TestCase):
         for m in minutes:
             m.update(pct=50, volts=15.5, charge=2e6, unit='uAh')
         path = self.root / 'recommend.json'
-        eta.write_recommendations(minutes, [], path, exclude=())
+        # On battery, settings go back to power-saver, ABM 3 and no boost (the original author's laptop).
+        with mock.patch('wattif.experiment.battery_stock', lambda: {'profile': 'power-saver', 'abm': '3', 'boost': '0'}):
+            eta.write_recommendations(minutes, [], path, exclude=())
         written = json.loads(path.read_text())
         self.assertEqual(set(written), {'updated', 'battery', 'comfort'})
         self.assertEqual(set(written['battery']), set(eta.RECOMMEND_KEYS))

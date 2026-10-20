@@ -77,10 +77,17 @@ DEFAULTS = {
         'notify': True,  # Desktop notifications as the cutoff nears.
     },
     # What a setting goes back to when experiments end, where it isn't simply
-    # the boot-time value. These copy common udev rules; set them to yours.
+    # the boot-time value. These copy common udev rules; set them to yours. A
+    # None leaves the setting as found on that power source (on AC: to whatever
+    # your system sets when plugged in).
     'stock': {
+        # power-profiles-daemon's profile, until wattif has seen yours (it keeps
+        # the one you use on each power source).
         'profile': {'battery': 'power-saver', 'ac': 'balanced'},
         'abm': {'battery': None, 'ac': None},  # amdgpu panel power savings 0-4 (None: leave as found).
+        # CPU boost 0/1. None: as the profile leaves it (power-profiles-daemon on
+        # amd-pstate turns it off under power-saver), else on.
+        'boost': {'battery': None, 'ac': None},
         'cpu_cap_mhz': 2000,  # The CPU frequency cap's power-saving value.
     },
     'experiments': {
