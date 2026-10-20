@@ -35,6 +35,7 @@ import numpy as np  # noqa: E402
 from scipy.optimize import minimize, nnls  # noqa: E402
 from scipy.special import expit, ndtr, stdtrit  # noqa: E402
 
+from . import battery as batteries
 from . import config
 from . import power  # noqa: E402
 from . import store  # noqa: E402
@@ -423,19 +424,19 @@ def attribute(m, model):
 # --- What-if runtime ------------------------------------------------------------
 
 def full_energy(minutes, sys=Path('/sys'), reserve_wh=0.0):
-    """Usable Wh of a full charge: charge_full × mean discharge voltage (or
-    energy_full), less `reserve_wh`, the energy below the battery's cutoff
-    (wattif eta's eta.reserve_wh(): about 0.8 Wh, under 2% of a charge here)."""
+    """Usable Wh of a full charge: energy_full, or charge_full × mean discharge
+    voltage (without one logged, the pack's nominal voltage), of every battery
+    (batteries.read), less `reserve_wh`, the energy below the battery's cutoff
+    (wattif eta's eta.reserve_wh(): about 0.8 Wh, under 2% of a charge, on a
+    Framework 13). None without a full charge to go by."""
+    reading = batteries.read(sys / 'class/power_supply')
+    if reading is None or not reading['full']:
+        return None
+    if reading['unit'] == 'Wh':
+        return reading['full'] - (reserve_wh or 0.0)
     volts = [m['volts'] for m in minutes if m['st'] == 'D' and m.get('volts')]
-    for battery in sorted((sys / 'class/power_supply').glob('BAT*')):
-        try:
-            if (battery / 'energy_full').exists():
-                return float((battery / 'energy_full').read_text()) / 1e6 - (reserve_wh or 0.0)
-            charge = float((battery / 'charge_full').read_text()) / 1e6
-            return charge * (sum(volts) / len(volts) if volts else 15.4) - (reserve_wh or 0.0)
-        except (OSError, ValueError):
-            continue
-    return None
+    return (reading['full'] * (sum(volts) / len(volts) if volts else batteries.nominal_volts(reading))
+            - (reserve_wh or 0.0))
 
 
 def runtime_gain(energy, power, saved):
@@ -1595,7 +1596,9 @@ def sleep_drain(events, minutes=None):
         start = event['t1'] - gap
         if times is not None and not (status(start, False) == 'D' == status(store.minute_of(event['t1']), True)):
             continue
-        volts = before.get('volts') or after.get('volts') or 15.4
+        if before.get('unit') and after.get('unit') and before['unit'] != after['unit']:
+            continue  # Another battery (or kind of reading) after it: the drop means nothing.
+        volts = before.get('volts') or after.get('volts') or batteries.DEFAULT_VOLTS
         wh = drop / 1e6 if before.get('unit') == 'uWh' else drop / 1e6 * volts
         if wh / hours >= SLEEP_MAX_W:
             continue

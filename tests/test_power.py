@@ -30,6 +30,24 @@ def put(path, text):
     path.write_text(text)
 
 
+def gpu(sys, hwmon=None, card=None, revision=(2, 1), pci='0000:c1:00.0', watts=None, status='active'):
+    """A GPU's PCI device under `sys` (an APU's by default: its gpu_metrics is
+    format 2), with its amdgpu hwmon (`watts` PPT) and DRM card linked to it."""
+    device = sys / 'devices/pci0000:00' / pci
+    device.mkdir(parents=True, exist_ok=True)
+    (device / 'gpu_metrics').write_bytes(metrics(1500, 2250, revision))
+    put(device / 'power/runtime_status', status)
+    for link in ([sys / 'class/hwmon' / hwmon / 'device'] if hwmon else []) + (
+            [sys / 'class/drm' / card / 'device'] if card else []):
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(device)
+    if hwmon:
+        put(sys / 'class/hwmon' / hwmon / 'name', 'amdgpu')
+        if watts is not None:
+            put(sys / 'class/hwmon' / hwmon / 'power1_input', str(int(watts * 1e6)))
+    return device
+
+
 class PowerTests(unittest.TestCase):
     def test_battery_sign_and_current_voltage_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -299,8 +317,7 @@ class PowerTests(unittest.TestCase):
             put(sys / 'class/power_supply/BAT0/type', 'Battery')
             put(sys / 'class/power_supply/BAT0/status', 'Discharging')
             put(sys / 'class/power_supply/BAT0/power_now', '8000000')
-            put(sys / 'class/hwmon/hwmon2/name', 'amdgpu')
-            put(sys / 'class/hwmon/hwmon2/power1_input', '5000000')
+            gpu(sys, 'hwmon2', watts=5.0)
             fast = FastSampler(sys)
             fast.sample()
             self.assertEqual(fast.take()[0]['bat']['w'], 8.0)
@@ -311,7 +328,7 @@ class PowerTests(unittest.TestCase):
                 fast.sample()
             values, status = fast.take()
             self.assertEqual((values['bat']['w'], values['soc']['w'], status), (8.0, 5.0, 'Discharging'))
-            self.assertEqual(fast.battery.name, 'BAT1')
+            self.assertEqual([path.name for path in fast.battery], ['BAT1'])
 
     def test_the_chips_rails_come_from_gpu_metrics(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -430,6 +447,128 @@ class PowerTests(unittest.TestCase):
             self.assertEqual(log.index['days']['2000-01-01']['records'], 0)
 
 
+class Clock:
+    def __init__(self, t=1000.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+def rapl(sys, zone='intel-rapl:0', name='package-0', energy=0, top=262143328850, mode=0o644):
+    path = sys / 'class/powercap' / zone
+    put(path / 'name', name)
+    put(path / 'max_energy_range_uj', str(top))
+    put(path / 'energy_uj', str(energy))
+    (path / 'energy_uj').chmod(mode)
+    return path / 'energy_uj'
+
+
+class ChipTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.sys = Path(tmp.name)
+
+    def test_the_apus_ppt_not_a_discrete_gpus(self):
+        # An AMD laptop with a dGPU too: the dGPU probes first (card0, hwmon0).
+        gpu(self.sys, 'hwmon0', 'card0', revision=(1, 3), pci='0000:03:00.0', watts=30.0)
+        apu = gpu(self.sys, 'hwmon4', 'card1', watts=9.0)
+        put(apu / 'gpu_busy_percent', '7')
+        put(self.sys / 'devices/pci0000:00/0000:03:00.0/gpu_busy_percent', '90')
+        known = {}
+        chip = power.find_chip(self.sys, known)
+        self.assertEqual((chip.source, chip.read()), ('amdgpu', 9.0))
+        self.assertEqual(power.find_metrics(self.sys, known), apu / 'gpu_metrics')
+        self.assertEqual(power.find_gpu_busy(self.sys, known), apu / 'gpu_busy_percent')
+        self.assertEqual(sorted(known.values()), [False, True])            # Each GPU asked once:
+        (apu / 'gpu_metrics').write_bytes(metrics(1, 1, (1, 0)))
+        self.assertEqual(power.find_chip(self.sys, known).read(), 9.0)      # the answer is kept.
+        self.assertIsNone(power.find_chip(self.sys, sensor='none'))
+        self.assertEqual(power.find_chip(self.sys, sensor='amdgpu').read(), 30.0)   # Forced: the first, whatever.
+
+    def test_a_sleeping_dgpu_is_never_read(self):
+        # A hybrid laptop's dGPU, runtime-suspended: reading amdgpu's files would wake it.
+        device = gpu(self.sys, 'hwmon0', 'card0', revision=(2, 1), pci='0000:03:00.0', watts=30.0, status='suspended')
+        known = {}
+        self.assertFalse(power.integrated(device, known))
+        self.assertEqual(known, {})                                          # Not even judged for good.
+        self.assertIsNone(power.find_chip(self.sys, known))
+        self.assertIsNone(power.find_metrics(self.sys, known))
+        self.assertIsNone(power.FastSampler(self.sys).chip)
+
+    def test_intel_with_an_amd_dgpu_reads_rapl_when_allowed(self):
+        gpu(self.sys, 'hwmon2', 'card1', revision=(1, 1), pci='0000:01:00.0', watts=40.0)
+        put(self.sys / 'class/hwmon/hwmon5/name', 'coretemp')
+        self.assertIsNone(power.find_chip(self.sys))                         # Never the dGPU's power.
+        counter = rapl(self.sys, mode=0o000)                                 # Root only (Linux 5.10+).
+        if not os.access(counter, os.R_OK):                                  # (Root reads it anyway.)
+            self.assertIsNone(power.find_chip(self.sys))
+        counter.chmod(0o644)                                                 # The administrator allowed it.
+        rapl(self.sys, 'intel-rapl:0:0', 'core')                              # Part of the package's,
+        rapl(self.sys, 'intel-rapl-mmio:0', 'package-0')                     # and the same counter again.
+        rapl(self.sys, 'intel-rapl:1', 'psys')                               # The platform's, not the chip's.
+        clock = Clock()
+        chip = power.find_chip(self.sys, clock=clock)
+        self.assertEqual((chip.source, [z.name for z in chip.zones]), ('rapl', ['intel-rapl:0']))
+        self.assertIsNone(chip.read())                                       # A counter needs two readings.
+        counter.write_text('5000000')
+        clock.t += 0.5
+        self.assertAlmostEqual(chip.read(), 10.0)                            # 5 J in 0.5 s.
+        self.assertEqual(chip.span, 0.5)
+        self.assertEqual(power.find_chip(self.sys, sensor='amdgpu').read(), 40.0)   # Forced: amdgpu's, a dGPU's too.
+        self.assertEqual(power.find_chip(self.sys, sensor='rapl').source, 'rapl')
+
+    def test_the_rapl_counter_wraps_and_resets(self):
+        top = 262143328850
+        counter = rapl(self.sys, energy=top - 2_000_000, top=top)
+        clock = Clock()
+        chip = power.find_chip(self.sys, clock=clock)
+        chip.read()
+        counter.write_text('3000000')
+        clock.t += 0.5
+        self.assertAlmostEqual(chip.read(), 10.0)                            # 2 J to the top, 3 J past it.
+        clock.t += power.RAPL_GAP + 1                                        # A suspend between readings:
+        self.assertIsNone(chip.read())                                       # no power over it,
+        counter.write_text('4000000')
+        clock.t += 1.0
+        self.assertAlmostEqual(chip.read(), 1.0)                             # then on as before.
+        counter.write_text('3000000')                                        # Backwards by less than a wrap:
+        clock.t += 1.0
+        self.assertIsNone(chip.read())                                       # a reset, not ~262 kW.
+        counter.write_text('garbage')
+        self.assertIsNone(chip.read())
+
+    def test_a_counting_chip_source_gives_the_records_mean_by_time(self):
+        counter = rapl(self.sys)
+        clock = Clock()
+        with mock.patch.object(power, 'uptime', clock):
+            fast = power.FastSampler(self.sys)
+        joules = 0
+        for seconds, watts in ((0.5, 0), (0.5, 4.0), (1.5, 12.0)):            # The scan's longer interval drew more.
+            joules += watts * seconds * 1e6
+            counter.write_text(str(int(joules)))
+            clock.t += seconds
+            fast.sample()
+        values, _ = fast.take()
+        self.assertEqual(values['soc']['src'], 'rapl')
+        self.assertAlmostEqual(values['soc']['w'], (4.0 * 0.5 + 12.0 * 1.5) / 2.0, places=3)   # Not (4 + 12) / 2.
+        self.assertEqual((values['soc']['min'], values['soc']['max'], values['soc']['n']), (4.0, 12.0, 2))
+
+    def test_rails_come_only_from_a_table_laid_out_for_them(self):
+        table = self.sys / 'gpu_metrics'
+        for revision, rails in (((2, 1), (2.25, 1.5)), ((2, 2), (2.25, 1.5)), ((2, 4), (2.25, 1.5)),
+                                ((2, 0), None),   # Renoir's v2.0: socket and CPU power at those bytes.
+                                ((2, 5), None),   # A later layout nobody has checked.
+                                ((1, 3), None), ((3, 0), None)):
+            table.write_bytes(metrics(1500, 2250, revision))
+            self.assertEqual(power.chip_rails(table), rails, revision)
+        data = bytearray(metrics(1500, 2250))
+        data[0:2] = (200).to_bytes(2, 'little')                              # Its header says more than came.
+        table.write_bytes(bytes(data))
+        self.assertIsNone(power.chip_rails(table))
+
+
 def fake_machine(root, cpus=4):
     """A /sys and /proc with what the collector reads: a battery, amdgpu power,
     cpufreq, /proc/stat."""
@@ -440,8 +579,7 @@ def fake_machine(root, cpus=4):
         put(battery / name, value)
     put(sys / 'class/power_supply/ACAD/type', 'Mains')
     put(sys / 'class/power_supply/ACAD/online', '0')
-    put(sys / 'class/hwmon/hwmon3/name', 'amdgpu')
-    put(sys / 'class/hwmon/hwmon3/power1_input', '8000000')
+    gpu(sys, 'hwmon3', 'card1', watts=8.0)
     for cpu in range(cpus):
         put(sys / f'devices/system/cpu/cpu{cpu}/cpufreq/scaling_cur_freq', '406000' if cpu % 2 else '3000000')
         put(sys / f'devices/system/cpu/cpu{cpu}/cpufreq/scaling_min_freq', '406000')
@@ -606,6 +744,45 @@ class MonitorTests(unittest.TestCase):
         monitor.close()
         self.assertEqual(self.rows('SELECT count(*) FROM records'), [(2,)])
         self.assertIs(store.insert, real)
+
+    def test_records_without_a_battery_keep_everything_else(self):
+        for name in ('BAT1', 'ACAD'):
+            directory = self.sys / 'class/power_supply' / name
+            for child in directory.iterdir():
+                child.unlink()
+            directory.rmdir()
+        monitor = self.monitor()
+        for _ in range(6):
+            self.tick(monitor)
+        monitor.close()
+        (record,) = monitor.log.recent(0)
+        self.assertEqual((record['bat'], record['status'], record['ac']), ({}, None, None))
+        self.assertEqual((record['soc']['w'], record['soc']['src']), (8.0, 'amdgpu'))
+        self.assertNotIn('charge_limit', record['settings'])
+        self.assertEqual(self.rows('SELECT bat_w, charge, unit, soc_w, soc_src FROM records'),
+                         [(None, None, None, 8.0, 'amdgpu')])
+
+    def test_energy_batteries_and_two_of_them_are_logged_as_one(self):
+        battery = self.sys / 'class/power_supply/BAT1'
+        for name in ('charge_now', 'power_now'):
+            (battery / name).unlink()
+        put(battery / 'energy_now', '30000000')
+        put(battery / 'power_now', '8000000')
+        put(battery / 'charge_control_end_threshold', '80')
+        second = self.sys / 'class/power_supply/BAT2'
+        for name, value in (('type', 'Battery'), ('status', 'Unknown'), ('power_now', '0'), ('capacity', '90'),
+                            ('energy_now', '20000000'), ('voltage_now', '12500000')):
+            put(second / name, value)
+        monitor = self.monitor()
+        for _ in range(6):
+            self.tick(monitor)
+        monitor.close()
+        (record,) = monitor.log.recent(0)
+        self.assertEqual((record['status'], record['bat']['w'], record['bat']['charge'], record['bat']['unit']),
+                         ('Discharging', 8.0, 50000000.0, 'uWh'))
+        self.assertEqual((record['bat']['pct'], record['bat']['volts']), (70.0, 14.0))   # No full charges: plain means.
+        self.assertEqual(record['settings']['charge_limit'], 90.0)          # BAT2 has none: 100%.
+        self.assertEqual(self.rows('SELECT charge, unit FROM records'), [(50000000.0, 'uWh')])
 
 if __name__ == '__main__':
     unittest.main()

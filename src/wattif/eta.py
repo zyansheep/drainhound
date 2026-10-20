@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Time to empty / time to full with intervals, for the Waybar battery outline.
 
-Discharging. Remaining energy is ∫ V(q) dq over the remaining charge, with the
-loaded-voltage curve V(q) learned from the power log (each percent of this
-gauge's coulomb-counted charge holds ~15% less energy near empty than near full),
-and the battery's current reading calibrated against its charge counter. Future
+Every battery the laptop has counts, as one (battery.py). Discharging.
+Remaining energy is ∫ V(q) dq over the remaining charge, with the
+loaded-voltage curve V(q) learned from the power log (on a Framework 13 each
+percent of the gauge's coulomb-counted charge holds ~15% less energy near
+empty than near full), and the battery's current reading calibrated against
+its charge counter; a battery that counts energy (energy_now, in Wh: most
+Intel laptops) says it directly, its power reading calibrated against that
+counter. Future
 average draw over the horizon is forecast as an Ornstein–Uhlenbeck process in
 log watts, fitted to minute-level battery power: the recent draw decays toward
 the local level (the mean log draw of the last ~5 hours on battery, not a
@@ -19,8 +23,8 @@ day by day against the 30-day watts version: ~0.5 W closer over the next hour,
 on a par with the Chronos-2 forecasting model. The horizon is solved jointly
 with the answer (T = energy / mean draw over T).
 
-Empty is where the embedded controller cuts the power, not zero charge: it
-switches the laptop off with ~55 mAh still on the gauge (1.8% of full), so
+Empty is where the embedded controller cuts the power, not zero charge (a
+Framework 13's switches it off with ~55 mAh still on the gauge, 1.8% of full), so
 energy counts down to that cutoff, learned from every battery death
 (fit_cutoff) and only from real ones: the journal says how each boot ended
 (boot endings: a crash, a reboot, a shutdown or a death while suspended below
@@ -75,11 +79,11 @@ os.environ.setdefault('OMP_NUM_THREADS', '1')
 
 import numpy as np  # noqa: E402
 
+from . import battery as batteries
 from . import config
 from . import power  # noqa: E402
 from . import report  # noqa: E402
 from . import store  # noqa: E402
-from .power import find_battery  # noqa: E402
 
 Z80 = 1.2816  # 80% interval: 10th–90th percentile.
 REFIT = 15 * 60
@@ -88,10 +92,13 @@ MIN_ROWS = 60  # Battery minutes a refit needs; with fewer the draw and attribut
 RUNTIME = config.RUNTIME
 LEVEL_MINUTES = 300  # The local level: the last ~5 hours on battery (the best window in backtests of 100–1000).
 SCALE_MINUTES = (2, 5, 10, 15, 30, 60, 120, 240)  # Horizons fit_scale calibrates (log-interpolated between).
+# The cutoff and its spread are in the battery's own unit (cutoff_unit: Ah, or Wh
+# for a battery that reports energy): zero until a battery death says otherwise.
 DEFAULTS = {'mean': 15.0, 'level': math.log(15.0), 'level_n': 60, 'level_var': None, 'var': 0.08, 'tau': 20.0,
-            'scale': None, 'kappa': 1.0, 'volts': None, 'charge_curve': None, 'charge_sigma': 0.25, 'floor': 4.0,
-            'cutoff': 0.0, 'cutoff_spread': 0.003, 'deaths': 0}  # Ah: until a battery death says otherwise.
-DRAW_KEYS = ('mean', 'level', 'level_n', 'level_var', 'var', 'tau', 'scale', 'floor', 'volts', 'kappa')
+            'scale': None, 'kappa': 1.0, 'volts': None, 'median_volts': None, 'charge_curve': None,
+            'charge_sigma': 0.25, 'floor': 4.0, 'cutoff': 0.0, 'cutoff_spread': 0.003, 'deaths': 0,
+            'cutoff_unit': 'Ah'}
+DRAW_KEYS = ('mean', 'level', 'level_n', 'level_var', 'var', 'tau', 'scale', 'floor', 'volts', 'median_volts', 'kappa')
 CUTOFF_PCT = 3  # A boot that ended on battery below this percent was cut off (all five so far at 2%).
 FINAL_MINUTES = 3  # From here the gauge's slope over FINAL_SECONDS times the cutoff.
 FINAL_SECONDS = 120
@@ -103,6 +110,7 @@ POWEROFF_SECONDS = 45  # A clean power-off this long before the cutoff's early e
 DUE_SECONDS = 5  # The two readings that agree on the power-off come within this.
 POWEROFF_RETRY = 10  # s between attempts when `systemctl poweroff` fails.
 SUSPEND_GAP = 10  # s: a longer pause between estimates was a suspend (or a stall); the trends start over.
+IDLE_SECONDS = 10  # s between looks while there is no battery (a desktop): nothing to estimate or train.
 PLUGGED = ('Not charging', 'Full')
 # s: mains online this long while the battery still discharges is a charger too weak to keep up, and no
 # longer holds the power-off (on a plug-in the status has followed mains within one 10 s record).
@@ -135,6 +143,46 @@ def write_atomic(path, text):
 
 def backup(path):
     return path.with_name(path.name + '.bak')
+
+
+# --- Units --------------------------------------------------------------------------
+# A battery counts charge (Ah: charge_now) or energy (Wh: energy_now), and the
+# models keep its own: the cutoff, the gauge's trends, black boxes and deaths
+# (an entry without a unit is from before there were two: Ah). The power log's
+# minutes say theirs as 'uAh' or 'uWh'.
+
+def unit_of(m):
+    """'Ah' or 'Wh': a minute's (or record's) charge unit."""
+    return 'Wh' if m.get('unit') == 'uWh' else 'Ah'
+
+
+def entry_unit(entry):
+    """A death or black box's unit: Ah unless it says Wh."""
+    return 'Wh' if entry.get('unit') == 'Wh' else 'Ah'
+
+
+def minutes_unit(minutes):
+    """The unit of the latest minute with a charge (the battery now), Ah without one."""
+    return next((unit_of(m) for m in reversed(minutes) if m.get('charge') is not None), 'Ah')
+
+
+def pack_volts(params=None, nominal=None):
+    """Volts per Ah where no voltage curve says better: the battery's nominal
+    voltage (voltage_min_design: `nominal`), else the power log's median loaded
+    voltage (fit: 'median_volts'), else a 3-cell pack's (battery.DEFAULT_VOLTS)."""
+    return number(nominal) or number((params or {}).get('median_volts')) or batteries.DEFAULT_VOLTS
+
+
+def ah_size(unit, volts=None):
+    """One Ah in `unit`: 1, or `volts` Wh. Thresholds learned in Ah (a 10 mAh
+    margin, a 3 mAh spread) scale by it for a battery that counts energy."""
+    return 1.0 if unit == 'Ah' else volts or batteries.DEFAULT_VOLTS
+
+
+def no_cutoff(unit='Ah', volts=None):
+    """The cutoff before any death has taught one: zero, DEFAULTS' spread, in `unit`."""
+    return {'cutoff': DEFAULTS['cutoff'], 'cutoff_spread': DEFAULTS['cutoff_spread'] * ah_size(unit, volts),
+            'deaths': 0, 'cutoff_unit': unit}
 
 
 # --- Fitting ----------------------------------------------------------------------
@@ -268,19 +316,31 @@ def fit_voltage(rows):
     return [float(v) for v in np.clip(curve, min(volts) - 0.3, max(volts) + 0.3)]
 
 
-def fit_kappa(rows):
-    """Charge counter ÷ integrated current: how much the current reading under-reads."""
+KAPPA_MIN = {'Ah': 0.5, 'Wh': 6.0}  # Discharge fit_kappa needs: half an Ah, or ~that at a 3-cell pack's 11.55 V.
+
+
+def fit_kappa(rows, unit='Ah'):
+    """Charge counter ÷ integrated current: how much the current reading
+    under-reads. A battery that counts energy: its energy counter ÷ integrated
+    power. Only steps in `unit` count."""
     counted = measured = 0.0
     for run in runs(rows):
         for a, b in zip(run, run[1:]):
-            if a.get('charge') and b.get('charge') and b.get('volts') and a.get('unit') != 'uWh':
+            if not (a.get('charge') and b.get('charge')) or unit_of(a) != unit or unit_of(b) != unit:
+                continue
+            if unit == 'Wh':
+                counted += (a['charge'] - b['charge']) / 1e6           # Wh
+                measured += b['bat'] * b['dt'] / 3600                 # Wh
+            elif b.get('volts'):
                 counted += (a['charge'] - b['charge']) / 1e6           # Ah
                 measured += b['bat'] / b['volts'] * b['dt'] / 3600    # Ah
-    return min(1.3, max(0.8, counted / measured)) if measured > 0.5 else 1.0
+    return min(1.3, max(0.8, counted / measured)) if measured > KAPPA_MIN[unit] else 1.0
 
 
-def fit_charging(minutes):
-    """Percent per minute by state of charge, and spread of 10-minute log rate ratios."""
+def fit_charging(minutes, unit='Ah'):
+    """Percent per minute by state of charge, and spread of 10-minute log rate
+    ratios (from the minutes whose charge is in `unit`)."""
+    minutes = [m for m in minutes if m.get('charge') is None or unit_of(m) == unit]
     rates = collections.defaultdict(list)
     # Full charge from the coulomb counter (capacity is its rounded ratio).
     estimates = [m['charge'] / (m['pct'] / 100) for m in minutes if m.get('charge') and (m.get('pct') or 0) >= 30]
@@ -415,7 +475,8 @@ def deaths_in(minutes, running=None, endings=None, skip=()):
     rebooted, shut down or died asleep) comes back with its ending and no cut, so
     deaths.json remembers it isn't one. Without the journal every such boot counts;
     when the journal is there but can't say just now, the death counts
-    `unconfirmed`, and the next refit asks again (confirm).
+    `unconfirmed`, and the next refit asks again (confirm). A cut is in the
+    minutes' own unit (Ah, or Wh for a battery that counts energy: `unit`).
     """
     by_boot = collections.defaultdict(list)
     for m in minutes:
@@ -434,9 +495,10 @@ def deaths_in(minutes, running=None, endings=None, skip=()):
             continue
         before = [m for m in ms if m['st'] == 'D' and m['t'] >= last['t'] - 180]
         span = last['t'] - before[0]['t']
-        rate = (before[0]['charge'] - last['charge']) / 1e6 / span if span > 0 else 0.0  # Ah/s
+        rate = (before[0]['charge'] - last['charge']) / 1e6 / span if span > 0 else 0.0  # Ah/s (Wh/s)
         deaths.append({'boot': boot, 't': last['t'] + 60, 'cut': last['charge'] / 1e6 - 5 * max(rate, 0.0),
-                       'source': 'records', **({'ending': 'cut'} if how and how[0] == 'cut' else {}),
+                       'unit': unit_of(last), 'source': 'records',
+                       **({'ending': 'cut'} if how and how[0] == 'cut' else {}),
                        **({'unconfirmed': True} if endings and how is None else {})})
     return deaths
 
@@ -447,21 +509,24 @@ def number(value):
     return float(value) if ok else None
 
 
-def fit_cutoff(minutes, known=(), running=None, endings=None):
-    """The charge (Ah) at which the battery cuts out, its spread, and how many
+def fit_cutoff(minutes, known=(), running=None, endings=None, unit='Ah', volts=None):
+    """The charge (Ah, or Wh: `unit`) at which the battery cuts out, its spread, and how many
     deaths say so: `known` deaths (deaths.json: black-box gasps, timed within
     2 s, and the ones remembered from records) and those the minutes show.
     A boot wattif eta powered off itself (`poweroff`) didn't die, nor did one
-    remembered with another ending (no `cut`)."""
+    remembered with another ending (no `cut`). In `unit`: a battery that counts
+    energy learns its cutoff in Wh, only from deaths in Wh (another unit's were
+    another battery's); `volts` scale the Ah floors (ah_size)."""
     known = {d['boot']: d for d in known}
     deaths = [d for d in known.values() if not d.get('poweroff')]
     deaths += deaths_in(minutes, running, endings, skip=known)
-    cuts = [c for d in deaths if (c := number(d.get('cut'))) is not None]
+    cuts = [c for d in deaths if (c := number(d.get('cut'))) is not None and entry_unit(d) == unit]
     if not cuts:
-        return {k: DEFAULTS[k] for k in ('cutoff', 'cutoff_spread', 'deaths')}
+        return no_cutoff(unit, volts)
     middle = float(np.median(cuts))
     spread = 1.4826 * float(np.median(np.abs(np.array(cuts) - middle)))  # The MAD, as a standard deviation.
-    return {'cutoff': middle, 'cutoff_spread': max(spread, 0.001), 'deaths': len(cuts)}
+    return {'cutoff': middle, 'cutoff_spread': max(spread, 0.001 * ah_size(unit, volts)), 'deaths': len(cuts),
+            'cutoff_unit': unit}
 
 
 def load_gasps(path=None):
@@ -513,8 +578,9 @@ def judge(gasp, how, end):
     charge, full = number(gasp.get('charge')), number(gasp.get('full')) or 0.0
     if charge is None:
         return None
-    volts = number(gasp.get('volts')) or 15.4
-    rate = number(gasp.get('rate')) or (number(gasp.get('watts')) or 0.0) / volts / 3600  # Ah/s
+    unit = entry_unit(gasp)  # Charge, full and rate are in it.
+    volts = 1.0 if unit == 'Wh' else number(gasp.get('volts')) or batteries.DEFAULT_VOLTS
+    rate = number(gasp.get('rate')) or (number(gasp.get('watts')) or 0.0) / volts / 3600  # Ah/s (Wh/s)
     left, t = number(gasp.get('seconds')), number(gasp.get('t'))
     near = (left is not None and left <= 120) or charge <= 0.025 * full
     if how in ('cut', 'shutdown cut short') or (how in (None, 'unknown') and not gasp.get('poweroff') and near):
@@ -525,7 +591,7 @@ def judge(gasp, how, end):
         return dict(gasp, cut=cut, source='black box', poweroff=False,
                     **({'ending': how} if how in ('cut', 'shutdown cut short') else {}))
     if gasp.get('poweroff') and how in (None, 'unknown', 'shutdown'):
-        return {'boot': gasp['boot'], 't': t, 'poweroff': True, 'charge': charge}
+        return {'boot': gasp['boot'], 't': t, 'poweroff': True, 'charge': charge, 'unit': unit}
     return None
 
 
@@ -583,10 +649,13 @@ def harvest_gasp(boot, gasp_path=None, deaths_path=None, endings=None):
     return entry
 
 
-def fit(minutes, known=None, previous=None, running=None, endings=None):
+def fit(minutes, known=None, previous=None, running=None, endings=None, unit=None, nominal=None):
     """Every wattif eta model from `minutes`; `known` deaths default to deaths.json
     (read only). With under MIN_ROWS battery minutes (a month on AC, a store
-    migration underway) the draw models stay as `previous` had them."""
+    migration underway) the draw models stay as `previous` had them. `unit` is
+    the battery's ('Ah' or 'Wh'; by default the latest minutes'), `nominal` its
+    voltage_min_design: a battery that counts energy needs no voltage curve."""
+    unit = unit or minutes_unit(minutes)
     params = dict(DEFAULTS)
     battery = [m for m in minutes if m['st'] == 'D' and m.get('bat', 0) > 0 and m['dt'] >= 40]
     if previous and len(battery) < MIN_ROWS:
@@ -595,13 +664,15 @@ def fit(minutes, known=None, previous=None, running=None, endings=None):
         if (ou := fit_ou(battery)) is not None:
             params.update(ou)
             params['scale'] = fit_scale(battery, params)
-        params['volts'] = fit_voltage(battery)
-        params['kappa'] = fit_kappa(battery)
-    params['charge_curve'], params['charge_sigma'] = fit_charging(minutes)
+        params['volts'] = fit_voltage(battery) if unit == 'Ah' else None
+        params['kappa'] = fit_kappa(battery, unit)
+        logged = [m['volts'] for m in battery if m.get('volts')]
+        params['median_volts'] = float(np.median(logged)) if logged else None
+    params['charge_curve'], params['charge_sigma'] = fit_charging(minutes, unit)
     if params['charge_curve'] is None and previous and previous.get('charge_curve'):
         params['charge_curve'], params['charge_sigma'] = previous['charge_curve'], previous['charge_sigma']
     params.update(fit_cutoff(minutes, load_gasps() if known is None else known,
-                             running or power.boot_id(), endings))
+                             running or power.boot_id(), endings, unit, pack_volts(params, nominal)))
     params['fitted'] = time.time()
     return params
 
@@ -613,7 +684,8 @@ MODELS_VERSION = 5
 WINDOW_DAYS = 30
 
 
-def train(minutes, events, now=None, known=None, previous=None, running=None, endings=None):
+def train(minutes, events, now=None, known=None, previous=None, running=None, endings=None, unit=None,
+          nominal=None):
     """Every model, from one window of history. This is the only place models
     are trained: the collector's battery-use breakdown and the battery panel
     read the result from models.json instead of fitting their own. The
@@ -623,9 +695,10 @@ def train(minutes, events, now=None, known=None, previous=None, running=None, en
     is the mean battery draw now (typical_draw: the ETA's local level), and
     'typical_power' the window's mean draw at your settings, the one every gain
     per full charge is figured at (here, in recommend.json and in the panel).
-    `minutes` load without apps: nothing here reads them."""
+    `minutes` load without apps: nothing here reads them. `unit` and `nominal`:
+    the battery's, as fit takes them."""
     rows = report.battery_rows(minutes)
-    params = fit(minutes, known, previous, running, endings)
+    params = fit(minutes, known, previous, running, endings, unit, nominal)
     params['sleep'] = report.sleep_model(report.sleep_drain(events, minutes))
     last = (previous or {}).get('attribution')
     if not isinstance(last, dict) or previous.get('version', MODELS_VERSION) != MODELS_VERSION:
@@ -670,18 +743,28 @@ def db_ready(db=None):
 
 # --- Forecasts --------------------------------------------------------------------
 
-def usable_energy(charge_ah, full_ah, params):
-    """Wh left above the cutoff (0 at or below it, or with no full charge known)."""
-    if not full_ah or full_ah <= 0:
+def usable_energy(charge, full, params, unit='Ah', nominal=None):
+    """Wh left above the cutoff (0 at or below it, or with nothing known). A
+    battery that counts energy (`unit` Wh) says it: its charge less the cutoff.
+    In Ah it is the loaded-voltage curve's ∫ V(q) dq, which needs the full charge
+    (without a curve, at pack_volts: `nominal` is voltage_min_design)."""
+    if charge is None:
         return 0.0
-    floor = remaining_energy(min(params.get('cutoff') or 0.0, charge_ah) / full_ah, full_ah, params['volts'])
-    return max(0.0, remaining_energy(charge_ah / full_ah, full_ah, params['volts']) - floor)
+    cutoff = params.get('cutoff') or 0.0
+    if unit == 'Wh':
+        return max(0.0, charge - cutoff)
+    if not full or full <= 0:
+        return 0.0
+    volts, flat = params['volts'], pack_volts(params, nominal)
+    floor = remaining_energy(min(cutoff, charge) / full, full, volts, flat)
+    return max(0.0, remaining_energy(charge / full, full, volts, flat) - floor)
 
 
-def remaining_energy(fraction, full_ah, volts):
-    """Wh left above empty: ∫ V(q) dq from 0 to the current charge fraction."""
+def remaining_energy(fraction, full_ah, volts, flat=None):
+    """Wh left above empty: ∫ V(q) dq from 0 to the current charge fraction
+    (with no curve, at `flat` volts: pack_volts, a 3-cell pack's by default)."""
     if not volts:
-        return fraction * full_ah * 15.4
+        return fraction * full_ah * (flat or batteries.DEFAULT_VOLTS)
     pct = max(0.0, fraction * 100)
     whole = int(min(pct, 100))
     energy = sum(volts[:whole]) / 100 * full_ah
@@ -902,24 +985,28 @@ def unrecommended():
 def reserve_wh(params=None, sys_root=Path('/sys')):
     """Wh below the learned cutoff, which no charge ever delivers (0.0 until a
     death has taught it): ∫ V(q) dq up to the cutoff on the loaded-voltage curve,
-    as usable_energy leaves it out. Cheap (the panel asks): `params` default to
-    models.json's (any version or age), the cutoff to deaths.json's without one;
-    the full charge only places the cutoff on the curve (taken as 2% without it)."""
+    as usable_energy leaves it out (a cutoff in Wh is that already). Cheap (the
+    panel asks): `params` default to models.json's (any version or age), the
+    cutoff to deaths.json's without one (in the battery's unit); the full charge
+    only places the cutoff on the curve (taken as 2% without it)."""
     if params is None:
         params = load_models(max_age=float('inf'), version=None) or {}
-    cutoff = number(params.get('cutoff'))
+    reading = batteries.read(sys_root / 'class/power_supply')
+    cutoff, unit = number(params.get('cutoff')), entry_unit({'unit': params.get('cutoff_unit')})
     if not cutoff or not params.get('deaths'):
-        cutoff = fit_cutoff([], load_gasps())['cutoff']
+        unit = reading['unit'] if reading else 'Ah'
+        cutoff = fit_cutoff([], load_gasps(), unit=unit)['cutoff']
     if not cutoff or cutoff <= 0:
         return 0.0
+    if unit == 'Wh':
+        return cutoff
     volts = params.get('volts')
     if not (isinstance(volts, list) and len(volts) == 101 and all(number(v) for v in volts)):
         volts = None
-    battery = find_battery(sys_root / 'class/power_supply')
-    full = (report_number(battery / 'charge_full') or 0.0) / 1e6 if battery else 0.0
+    full = (reading['full'] or 0.0) if reading and reading['unit'] == 'Ah' else 0.0
     if full <= cutoff:
         full = 50 * cutoff
-    return remaining_energy(cutoff / full, full, volts)
+    return remaining_energy(cutoff / full, full, volts, pack_volts(params, reading and reading['nominal']))
 
 
 def write_recommendations(minutes, events, path=None, params=None, exclude=None):
@@ -948,22 +1035,16 @@ def write_recommendations(minutes, events, path=None, params=None, exclude=None)
     return written
 
 
-def read(path):
-    try:
-        return path.read_text().strip()
-    except OSError:
-        return None
-
-
 class Live:
     """The 2 s loop. Paths and clocks are injectable (tests never touch the real ones):
     `clock` stamps what is stored, `monotonic` (boot time: no jumps, counts suspend)
-    times trends and windows."""
+    times trends and windows. Every battery the system has counts, combined
+    (batteries.read); with none (`absent`: a desktop) it shows so and trains nothing."""
 
     def __init__(self, sys_root=Path('/sys'), proc=Path('/proc'), gasp=None, notify=None, poweroff=None,
                  deaths=None, models=None, db=None, runtime=None, endings=None, clock=time.time, monotonic=boottime):
         self.supplies = sys_root / 'class/power_supply'
-        self.battery = find_battery(self.supplies)
+        self.absent, self.unit, self.nominal = False, None, None  # The battery's unit and voltage_min_design, once read.
         self.samples = collections.deque()
         self.boot, self.gasp, self.deaths = power.boot_id(proc), gasp or GASP, deaths or DEATHS
         self.models, self.db, self.runtime, self.endings = models or MODELS, db, runtime or RUNTIME, endings
@@ -979,13 +1060,18 @@ class Live:
     def load_cutoff(self):
         """The cutoff from deaths.json, whatever models.json says (missing, old, or a
         refit failing): without it the power-off would be disarmed. A deaths.json
-        that can't be read leaves the cutoff as it was; it never stops the loop."""
+        that can't be read leaves the cutoff as it was; it never stops the loop.
+        In the battery's unit (Ah until one is read): a cutoff in another unit is
+        dropped, never used (it was another battery's, and would mistime the power-off)."""
+        unit = self.unit or 'Ah'
         try:
-            cutoff = fit_cutoff([], load_gasps(self.deaths))
+            cutoff = fit_cutoff([], load_gasps(self.deaths), unit=unit, volts=pack_volts(self.params, self.nominal))
         except Exception as error:  # noqa: BLE001 - the warnings and power-off must run regardless
             self.complain('cutoff from deaths.json', error)
-            return
-        if cutoff['deaths']:
+            if self.params.get('cutoff_unit', 'Ah') == unit:
+                return
+            cutoff = no_cutoff(unit, pack_volts(self.params, self.nominal))
+        if cutoff['deaths'] or self.params.get('cutoff_unit', 'Ah') != unit:
             self.params = {**self.params, **cutoff}
 
     def complain(self, what, error):
@@ -999,7 +1085,7 @@ class Live:
     def maybe_refit(self):
         """Start a refit when one is due, unless one is running or the battery is low
         (known only once an estimate has read it)."""
-        if self.last is None or self.low:
+        if self.last is None or self.low or self.absent:
             return
         if (self.fitting is None or not self.fitting.is_alive()) and self.monotonic() >= self.next_fit:
             self.fitting = threading.Thread(target=self.refit, name='refit', daemon=True)
@@ -1019,7 +1105,7 @@ class Live:
             # Deaths in these minutes join deaths.json, so the cutoff outlives the window.
             known = remember_deaths(minutes, self.boot, self.deaths, self.endings)
             params = train(minutes, events, now=now, known=known, previous=self.params, running=self.boot,
-                           endings=self.endings)
+                           endings=self.endings, unit=self.unit, nominal=self.nominal)
             save_models(params, self.models)
         except Exception as error:  # noqa: BLE001 - try again soon; the estimate goes on with the last models
             print(f'wattif eta: refit failed: {error!r}', file=sys.stderr)
@@ -1033,12 +1119,14 @@ class Live:
         return True
 
     def seed(self, minutes):
-        """The last minutes on battery from the power log, so a restart isn't blind."""
+        """The last minutes on battery from the power log, so a restart isn't blind
+        (their charges only if in the battery's unit)."""
         now, mono = self.clock(), self.monotonic()
+        unit = self.unit or ((batteries.read(self.supplies) or {}).get('unit')) or 'Ah'
         for m in minutes:
             t = m['t'] + 60
             if m['st'] == 'D' and m.get('bat') and 0 <= now - t < 900:
-                charge = m['charge'] / 1e6 if m.get('charge') is not None and m.get('unit') != 'uWh' else None
+                charge = m['charge'] / 1e6 if m.get('charge') is not None and unit_of(m) == unit else None
                 self.samples.append((mono - (now - t), m['bat'], 'Discharging', charge))
 
     # Readings.
@@ -1051,35 +1139,38 @@ class Live:
         return 'plugged' if status in PLUGGED or mains else 'discharging'
 
     def sample(self, mono):
-        self.battery = b = self.battery or find_battery(self.supplies)
-        if b is None:
+        """The batteries now (looked up afresh: one can come and go), combined, in
+        their unit (`unit`: charge, full and the gauge's trends are in Ah or Wh).
+        None with no battery (`absent`) or none readable."""
+        reading = batteries.read(self.supplies)
+        self.absent = reading is None
+        if reading is None or reading['now'] is None:
             return None
-        status = read(b / 'status') or 'Unknown'
-        try:
-            current, volts = int(read(b / 'current_now')) / 1e6, int(read(b / 'voltage_now')) / 1e6
-            charge, full = int(read(b / 'charge_now')) / 1e6, int(read(b / 'charge_full')) / 1e6
-        except (TypeError, ValueError):
-            if not b.exists():
-                self.battery = None  # Gone: look again next time.
+        status = reading['status'] or 'Unknown'
+        # The draw: the batteries' flow in their status's direction, and in any other (Unknown on battery) all of it.
+        watts = (abs(reading['watts']) if status in ('Discharging', 'Charging') and reading['watts'] is not None
+                 else reading['power'])
+        if watts is None:
             return None
-        mains = bool(power.mains_online(self.supplies))
+        self.unit, self.nominal = reading['unit'], reading['nominal']
+        mains = bool(reading['mains'])
         kind = self.kind(status, mains)
         if kind == 'discharging' and mains:
             self.mains_since = mono if self.mains_since is None else self.mains_since
         else:
             self.mains_since = None
-        capacity = report_number(b / 'capacity')
-        if full <= 0:  # No full charge to divide by: the gauge's own percent.
+        charge, full, capacity = reading['now'], reading['full'], reading['capacity']
+        if not full or full <= 0:  # No full charge to divide by: the gauge's own percent.
             full, pct = None, capacity if capacity is not None else 0.0
         else:
             pct = 100 * charge / full
         if kind != 'plugged':
-            self.samples.append((mono, current * volts, 'Discharging' if kind == 'discharging' else status, charge))
+            self.samples.append((mono, watts, 'Discharging' if kind == 'discharging' else status, charge))
         while self.samples and self.samples[0][0] < mono - 900:
             self.samples.popleft()
-        return {'status': status, 'kind': kind, 'watts': current * volts, 'charge': charge, 'full': full,
-                'volts': volts, 'pct': pct, 'limit': report_number(b / 'charge_control_end_threshold'),
-                'capacity': capacity, 'mains': mains}
+        return {'status': status, 'kind': kind, 'watts': watts, 'charge': charge, 'full': full,
+                'volts': reading['volts'], 'pct': pct, 'limit': reading['limit'], 'capacity': capacity,
+                'mains': mains, 'unit': reading['unit'], 'nominal': reading['nominal']}
 
     def weak_charger(self, mono):
         """Mains online for WEAK_SECONDS and the battery still discharging: the charger can't keep up."""
@@ -1091,17 +1182,17 @@ class Live:
         hasn't been for WEAK_SECONDS (a plug-in the status hasn't caught up with).
         Mains online longer with the battery still discharging is a charger too
         weak to keep up, and doesn't stop the power-off."""
-        status = read(self.battery / 'status') if self.battery else None
-        if status in ('Charging', *PLUGGED):
+        reading = batteries.read(self.supplies)
+        if reading is not None and reading['status'] in ('Charging', *PLUGGED):
             return True
-        return bool(power.mains_online(self.supplies)) and not self.weak_charger(mono)
+        return bool(batteries.mains_online(self.supplies)) and not self.weak_charger(mono)
 
     def recent(self, status, seconds, mono):
         values = [w for t, w, s, _ in self.samples if s == status and t >= mono - seconds]
         return sum(values) / len(values) if values else None
 
     def gauge_trend(self, mono, seconds=FINAL_SECONDS, span=60, after=None):
-        """(charge now, Ah per second falling) from the gauge's own readings over
+        """(charge now, Ah (Wh) per second falling) from the gauge's own readings over
         the last `seconds` on battery (and since `after`): it lowers its estimate
         faster under heavy draw, which the current alone misses. None with under
         `span` s of them."""
@@ -1127,8 +1218,9 @@ class Live:
         """The black box: below LOW_BATTERY, the last reading on disk every 2 s, atomically
         (marked once wattif eta has started powering the laptop off: that isn't a death)."""
         gasp = {'t': self.clock(), 'boot': self.boot, 'charge': state['charge'], 'full': state['full'],
-                'volts': state['volts'], 'watts': state['watts'], 'rate': timing['rate'] if timing else None,
-                'seconds': timing['seconds'] if timing else None, 'poweroff': self.powering_off}
+                'unit': state.get('unit', 'Ah'), 'volts': state['volts'], 'watts': state['watts'],
+                'rate': timing['rate'] if timing else None, 'seconds': timing['seconds'] if timing else None,
+                'poweroff': self.powering_off}
         try:
             write_atomic(self.gasp, json.dumps(gasp))
         except OSError as error:
@@ -1176,11 +1268,14 @@ class Live:
         as it accepts, and stopping waybar.service (last night 0.1 s later) kills this
         process, so a mark written after could be lost, and the power-off then taken
         for a death without the journal. A failed call unmarks it."""
-        params = self.params
-        rate = timing['rate'] or state['watts'] * params['kappa'] / max(state['volts'], 1.0) / 3600
+        params, unit = self.params, state.get('unit', 'Ah')
+        flat = pack_volts(params, state.get('nominal'))
+        volts = 1.0 if unit == 'Wh' else max(state['volts'] or flat, 1.0)  # Watts to Ah/s; to Wh/s as they are.
+        rate = timing['rate'] or state['watts'] * params['kappa'] / volts / 3600
         margin = timing['seconds'] - timing['early']
         if not (self.warns_off() and state['pct'] < LOW_BATTERY and timing['early'] <= POWEROFF_SECONDS
-                and state['charge'] - params['cutoff'] <= max(0.010, 1.5 * rate * (POWEROFF_SECONDS + margin))
+                and state['charge'] - params['cutoff'] <= max(0.010 * ah_size(unit, flat),
+                                                              1.5 * rate * (POWEROFF_SECONDS + margin))
                 and (timing['source'] == 'gauge' or not state.get('mains'))):
             return
         self.due = mono
@@ -1200,7 +1295,7 @@ class Live:
 
     def timing(self, params, forecast, final, steady):
         """When the battery cuts out, as {'seconds', 'early', 'late', 'rate', 'source'}
-        (s from now; Ah/s falling, if the gauge says; 'gauge' or 'forecast'), or
+        (s from now; Ah/s (Wh/s) falling, if the gauge says; 'gauge' or 'forecast'), or
         None: the forecast's interval; below LOW_BATTERY the gauge's slope over the
         last STEADY_SECONDS; and once either says FINAL_MINUTES, its slope over
         FINAL_SECONDS (the longer slope lags a draw that just rose: af7f85d1 went
@@ -1227,7 +1322,7 @@ class Live:
 
     def forecast(self, state, params, mono):
         """The draw forecast's time to empty (hours) and its distribution."""
-        energy = usable_energy(state['charge'], state['full'], params)
+        energy = usable_energy(state['charge'], state['full'], params, state.get('unit', 'Ah'), state.get('nominal'))
         # A short session borrows from the local level instead of trusting a few seconds.
         recent = self.recent('Discharging', 600, mono)
         n = sum(1 for t, _, s, _ in self.samples if s == 'Discharging' and t >= mono - 600)
@@ -1248,12 +1343,18 @@ class Live:
         state = self.sample(mono)
         if state is None:
             self.low = False
+            if self.absent:  # A desktop: said plainly, and published so `wattif waybar battery` says it too.
+                return {'text': 'no battery', 'class': ['no-battery'],
+                        'detail': {'status': 'no battery', 'updated': now, 'text': 'no battery',
+                                   'classes': ['no-battery']}}
             return {'text': '--', 'class': ['unknown']}
+        if state['unit'] != self.params.get('cutoff_unit', 'Ah'):
+            self.load_cutoff()  # A battery in another unit than the cutoff (the first reading, a new battery).
         params = self.params
         result = {'status': state['status'], 'pct': state['pct'], 'watts': state['watts'], 'updated': now}
         try:
-            energy_full = usable_energy(state['full'], state['full'], params)
-            energy = usable_energy(state['charge'], state['full'], params)
+            energy_full = usable_energy(state['full'], state['full'], params, state['unit'], state['nominal'])
+            energy = usable_energy(state['charge'], state['full'], params, state['unit'], state['nominal'])
             fill = round(100 * energy / energy_full) if energy_full else round(state['pct'])
             result.update(energy_pct=fill, energy_wh=energy)
             if (asleep := report.sleep_runtime([], energy, model=params.get('sleep'))) is not None:
@@ -1358,8 +1459,10 @@ class Live:
             times, pdf, _ = full_distribution(median / 60, params['charge_sigma'], low / 60, high / 60)
             result['distribution'] = {'kind': 'full', 't': [round(t, 4) for t in times],
                                       'p': [round(v, 5) for v in pdf]}
-        # Into the battery, in true watts: the counter's rate, else the calibrated reading.
-        charge_watts = (rate / 100 * state['full'] * 60 * state['volts'] if rate
+        # Into the battery, in true watts: the counter's rate (a charge's at the voltage now), else the
+        # calibrated reading.
+        volts = 1.0 if state.get('unit') == 'Wh' else state['volts']
+        charge_watts = (rate / 100 * state['full'] * 60 * volts if rate and volts
                         else abs(state['watts']) * params['kappa'])
         ratio, ratio_low, ratio_high = use_per_charge(params, charge_watts, energy_full)
         result.update(ratio=ratio, ratio_low=ratio_low, ratio_high=ratio_high, charge_watts=charge_watts)
@@ -1391,13 +1494,6 @@ def send_notification(title, body):
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError as error:
         print(f'wattif eta: notify-send: {error}', file=sys.stderr)
-
-
-def report_number(path):
-    try:
-        return float(path.read_text())
-    except (OSError, ValueError):
-        return None
 
 
 def single_instance(path):
@@ -1432,9 +1528,9 @@ def main(argv=()):
     try:  # A damaged black box or deaths.json must never keep the loop below from running.
         last = harvest_gasp(live.boot, endings=endings)
         if last is not None and (last.get('cut') is not None or last.get('poweroff')):
+            left = f"{last['charge']:.2f} Wh" if entry_unit(last) == 'Wh' else f"{last['charge'] * 1000:.0f} mAh"
             print(f"wattif eta: the last boot {'powered off' if last.get('poweroff') else 'died'} at "
-                  f"{last['charge'] * 1000:.0f} mAh, {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last['t']))}",
-                  file=sys.stderr)
+                  f"{left}, {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last['t']))}", file=sys.stderr)
     except Exception as error:  # noqa: BLE001
         live.complain('last gasp', error)
     # Start from the last trained models (any version) so the label appears at once;
@@ -1457,8 +1553,8 @@ def main(argv=()):
             print(json.dumps(output), flush=True)
         if detail:
             live.publish(detail, output)
-        live.maybe_refit()  # After the estimate: it knows whether the battery is low.
-        time.sleep(2)
+        live.maybe_refit()  # After the estimate: it knows whether the battery is low (or absent).
+        time.sleep(IDLE_SECONDS if live.absent else 2)
 
 
 if __name__ == '__main__':

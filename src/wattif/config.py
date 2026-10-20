@@ -76,6 +76,13 @@ DEFAULTS = {
         'poweroff': False,
         'notify': True,  # Desktop notifications as the cutoff nears.
     },
+    'chip': {
+        # Where the chip's (package) power comes from: 'auto' takes amdgpu's PPT on
+        # an AMD APU, else RAPL's package energy counter if you may read it (root
+        # only unless you allow it: see power.Rapl), else none; or 'amdgpu' (the
+        # first amdgpu sensor, whatever GPU it is), 'rapl', 'none'.
+        'sensor': 'auto',
+    },
     # What a setting goes back to when experiments end, where it isn't simply
     # the boot-time value. These copy common udev rules; set them to yours.
     'stock': {

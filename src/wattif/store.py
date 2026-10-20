@@ -44,7 +44,7 @@ from . import config
 
 STATE = config.STATE
 DB = config.DB
-VERSION = 10  # PRAGMA user_version; MIGRATIONS below. Migrate, never drop: this is primary data.
+VERSION = 11  # PRAGMA user_version; MIGRATIONS below. Migrate, never drop: this is primary data.
 NUMERIC = ('bat', 'soc', 'load', 'busy', 'gpu', 'video', 'bl', 'kbd', 'wifi', 'disk', 'usb', 'audio', 'ghz',
            'ghz_active', 'vdd', 'fabric')
 # Averaged over the minute's majority status only (signed watts don't mix; the
@@ -101,7 +101,7 @@ COLUMNS = (
     ('charge', 'REAL', lambda r: part(r, 'bat').get('charge')),
     ('unit', 'TEXT', lambda r: part(r, 'bat').get('unit')),
     ('volts', 'REAL', lambda r: part(r, 'bat').get('volts')),
-    # Chip package power (amdgpu PPT, W), ~4 Hz samples
+    # Chip package power (W: an APU's amdgpu PPT, or RAPL's package power; soc_src says which), ~4 Hz samples
     ('soc_w', 'REAL', lambda r: part(r, 'soc').get('w')),
     ('soc_min', 'REAL', lambda r: part(r, 'soc').get('min')),
     ('soc_max', 'REAL', lambda r: part(r, 'soc').get('max')),
@@ -200,6 +200,10 @@ COLUMNS = (
     # and video engines, I/O hub)
     ('vdd_w', 'REAL', lambda r: part(r, 'vdd').get('w')),
     ('fabric_w', 'REAL', lambda r: part(r, 'fabric').get('w')),
+    # Where soc_w came from (power.find_chip): 'amdgpu' (an APU's PPT) or 'rapl'
+    # (RAPL's package counter), which measure different things; NULL before layout 11
+    # (amdgpu's PPT then)
+    ('soc_src', 'TEXT', lambda r: part(r, 'soc').get('src')),
 )
 NAMES = [name for name, _, _ in COLUMNS]
 APP_FIELDS = (('cpu_s', 'cpu'), ('gpu_s', 'gpu'), ('video_s', 'video'), ('io_read', 'io_r'), ('io_write', 'io_w'))
@@ -412,6 +416,10 @@ def add_rails(conn):
         add_column(conn, 'minutes', column, 'REAL')
 
 
+def add_chip_source(conn):
+    add_column(conn, 'records', 'soc_src', 'TEXT')
+
+
 # MIGRATIONS[n] takes layout n to n + 1: (schema change or None, whether Minute
 # changed). Schema changes run at once, in connect(). Minutes are derived, so a
 # Minute change only marks them stale, once, after the whole chain (against the
@@ -431,6 +439,7 @@ MIGRATIONS = {
     8: (add_active_clock, True),
     # Records and minutes gained the chip's two measured rails (older records have none to recompute).
     9: (add_rails, False),
+    10: (add_chip_source, False),  # Records gained where the chip's power came from (amdgpu or RAPL).
 }
 
 

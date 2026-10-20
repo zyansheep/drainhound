@@ -20,6 +20,7 @@ import time
 import traceback
 from pathlib import Path
 
+from . import battery as batteries
 from . import config
 from . import eta  # First: it limits BLAS threads before numpy loads.
 from . import experiment
@@ -686,29 +687,18 @@ def read_estimate(path, now=None):
 
 
 def read_battery(root=Path('/sys/class/power_supply')):
-    """The battery's own readings ({'pct', 'status', 'watts', 'charge_wh'});
-    one that can't be read is left out."""
-    battery = next(iter(sorted(Path(root).glob('BAT*'))), None)
-    if battery is None:
+    """The batteries' own readings, combined (batteries.read: {'pct', 'status',
+    'watts', 'charge_wh'}, watts unsigned); one that can't be read is left out."""
+    reading = batteries.read(root)
+    if reading is None:
         return {}
-
-    def number(name):
-        try:
-            return int((battery / name).read_text())
-        except (OSError, ValueError):
-            return None
-    out = {}
-    try:
-        out['status'] = (battery / 'status').read_text().strip()
-    except OSError:
-        pass
-    pct, current, volts, charge = (number(n) for n in ('capacity', 'current_now', 'voltage_now', 'charge_now'))
-    if pct is not None:
-        out['pct'] = pct
-    if current is not None and volts is not None:
-        out['watts'] = current * volts / 1e12
-    if charge is not None and volts is not None:
-        out['charge_wh'] = charge * volts / 1e12
+    out = {'status': reading['status']} if reading['status'] else {}
+    if reading['capacity'] is not None:
+        out['pct'] = round(reading['capacity'])  # Whole percent, as the gauge says it (two: their weighted mean).
+    if reading['power'] is not None:
+        out['watts'] = reading['power']
+    if (wh := batteries.energy_wh(reading)) is not None:
+        out['charge_wh'] = wh
     return out
 
 

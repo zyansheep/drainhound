@@ -15,6 +15,7 @@ from unittest import mock
 
 import numpy as np
 
+from wattif import battery as batteries
 from wattif import eta
 from wattif import store
 
@@ -51,8 +52,8 @@ class Clock:
         self.m += seconds
 
 
-def battery(root, **values):
-    b = root / 'class/power_supply/BAT1'
+def battery(root, name='BAT1', **values):
+    b = root / 'class/power_supply' / name
     b.mkdir(parents=True, exist_ok=True)
     for name, value in {'type': 'Battery', **values}.items():
         (b / name).write_text(str(value))
@@ -78,6 +79,9 @@ def make_live(root, clock=None, **options):
 
 
 LOW = {'status': 'Discharging', 'current_now': 820000, 'voltage_now': 13800000, 'charge_full': 3125000, 'capacity': 2}
+# A battery that counts energy (most Intel laptops): µWh and µW, a 3-cell pack.
+ENERGY = {'status': 'Discharging', 'power_now': 10000000, 'voltage_now': 11800000, 'voltage_min_design': 11550000,
+          'energy_full': 50000000, 'capacity': 60, 'energy_now': 30000000}
 
 
 class EtaTests(unittest.TestCase):
@@ -94,7 +98,8 @@ class EtaTests(unittest.TestCase):
         full = eta.remaining_energy(1.0, 3.0, volts)
         half = eta.remaining_energy(0.5, 3.0, volts)
         self.assertLess(half / full, 0.5)   # The lower half holds less energy than the upper half.
-        self.assertAlmostEqual(eta.remaining_energy(0.5, 3.0, None), 0.5 * 3.0 * 15.4)
+        self.assertAlmostEqual(eta.remaining_energy(0.5, 3.0, None, 15.4), 0.5 * 3.0 * 15.4)   # No curve: flat,
+        self.assertAlmostEqual(eta.remaining_energy(0.5, 3.0, None), 0.5 * 3.0 * batteries.DEFAULT_VOLTS)  # a 3-cell's.
 
     def test_horizon_draw_moves_from_recent_to_the_mean_draw(self):
         short = eta.horizon_draw(self.params, 30.0, 0.1)
@@ -398,7 +403,9 @@ class EtaTests(unittest.TestCase):
                 mock.patch.object(eta, 'MODELS', self.root / 'models.json'):
             self.assertEqual(eta.reserve_wh(sys_root=empty), 0.0)        # Nothing learned yet.
             eta.remember([{'boot': 'a', 't': 1, 'cut': 0.056}], eta.DEATHS)
-            self.assertAlmostEqual(eta.reserve_wh(sys_root=empty), 0.056 * 15.4)   # deaths.json's, no curve.
+            self.assertAlmostEqual(eta.reserve_wh(sys_root=empty), 0.056 * batteries.DEFAULT_VOLTS)  # deaths.json's,
+            battery(self.root, charge_full=3000000, voltage_min_design=15400000)             # no curve: the pack's
+            self.assertAlmostEqual(eta.reserve_wh(sys_root=self.root), 0.056 * 15.4)        # nominal voltage.
             eta.save_models(dict(params, fitted=1.0), eta.MODELS)
             self.assertAlmostEqual(eta.reserve_wh(sys_root=self.root), eta.reserve_wh(params, sys_root=self.root))
 
@@ -644,7 +651,7 @@ class EtaTests(unittest.TestCase):
     def test_odd_batteries_never_crash_the_estimate(self):
         clock = Clock()
         live = make_live(self.root, clock)                               # No battery yet.
-        self.assertEqual(live.estimate()['text'], '--')
+        self.assertEqual(live.estimate()['text'], 'no battery')
         b = battery(self.root, **dict(LOW, charge_now=500000, charge_full=0, capacity=17))
         out = live.estimate()                                            # It appeared; charge_full reads 0.
         self.assertIn('discharging', out['class'])
@@ -984,6 +991,160 @@ class EtaTests(unittest.TestCase):
         live.next_fit = 0
         live.maybe_refit()
         self.assertEqual(started, [1])
+
+    def test_a_battery_that_counts_energy_needs_no_voltage(self):
+        battery(self.root, **ENERGY)
+        live = make_live(self.root)
+        live.params = dict(self.params, volts=[14.0 + 3.0 * p / 100 for p in range(101)])   # Not for Wh.
+        out = live.estimate()
+        detail = out['detail']
+        self.assertIn('discharging', out['class'])
+        self.assertAlmostEqual(detail['energy_wh'], 30.0)                  # energy_now, as it is.
+        self.assertEqual(detail['energy_pct'], 60)
+        self.assertEqual(detail['watts'], 10.0)
+        self.assertAlmostEqual(detail['hours'], eta.time_to_empty(live.params, 30.0, eta.typical_draw(live.params))[0],
+                               delta=0.01)                                 # No samples yet: the typical draw.
+        self.assertRegex(out['text'], r'</span> \d+:\d\d <span[^>]*>±\d+:\d\d</span> <span[^>]*>10\.0W</span>$')
+        self.assertEqual((live.unit, live.params['cutoff_unit']), ('Wh', 'Wh'))
+        self.assertAlmostEqual(live.params['cutoff_spread'], 0.003 * 11.55)  # The Ah default, at its voltage.
+        self.assertAlmostEqual(eta.usable_energy(30.0, None, dict(self.params, cutoff=0.8), 'Wh'), 29.2)
+        self.assertEqual(eta.usable_energy(0.5, 50.0, dict(self.params, cutoff=0.8), 'Wh'), 0.0)
+
+    def test_two_batteries_last_as_long_as_both(self):
+        one = dict(LOW, charge_now=1500000, charge_full=3000000, current_now=1000000, voltage_now=15000000,
+                   capacity=50)
+        battery(self.root, 'BAT0', **one)
+        live = make_live(self.root)
+        live.params = dict(self.params)
+        single = live.estimate()['detail']
+        battery(self.root, 'BAT1', **dict(one, status='Unknown', current_now=0))   # The idle second one.
+        both = live.estimate()['detail']
+        self.assertEqual((both['pct'], both['watts']), (50.0, 15.0))
+        self.assertAlmostEqual(both['energy_wh'], 2 * single['energy_wh'])
+        self.assertGreater(both['hours'], 1.8 * single['hours'])
+
+    def test_without_a_battery_it_says_so_and_trains_nothing(self):
+        live = make_live(self.root)
+        started = []
+        live.refit = lambda: started.append(1)
+        out = live.estimate()
+        self.assertEqual((out['text'], out['class']), ('no battery', ['no-battery']))
+        self.assertTrue(live.absent)
+        live.maybe_refit()
+        self.assertEqual(started, [])                                        # Nothing to train for.
+        live.publish(out.pop('detail'), out)                                 # `wattif waybar battery` says it too.
+        self.assertEqual(json.loads((self.root / 'run/eta.json').read_text())['waybar']['text'], 'no battery')
+        battery(self.root, **dict(LOW, charge_now=1000000))                  # Hot-plugged.
+        self.assertIn('discharging', live.estimate()['class'])
+        self.assertFalse(live.absent)
+
+    def test_the_cutoff_of_a_battery_that_counts_energy_is_in_wh(self):
+        minutes = [{'t': 60 * i, 'dt': 60, 'st': 'D', 'boot': 'died', 'charge': q * 1e6, 'unit': 'uWh',
+                    'pct': q / 0.5} for i, q in enumerate([1.2, 1.1, 1.0, 0.9])] + \
+                  [{'t': 9000 + 60 * i, 'dt': 60, 'st': 'D', 'boot': 'running', 'charge': q * 1e6, 'unit': 'uWh',
+                    'pct': 40.0} for i, q in enumerate([20.0, 19.9])]
+        (death,) = eta.deaths_in(minutes)
+        self.assertEqual(death['unit'], 'Wh')
+        self.assertAlmostEqual(death['cut'], 0.9 - 5 * 0.3 / 180)            # Less 5 s of its fall, in Wh/s.
+        old = {'boot': 'framework', 't': 1, 'cut': 0.056}                    # deaths.json from before: Ah.
+        fitted = eta.fit_cutoff(minutes, [old], unit='Wh', volts=11.55)
+        self.assertEqual((fitted['deaths'], fitted['cutoff_unit']), (1, 'Wh'))
+        self.assertAlmostEqual(fitted['cutoff'], death['cut'])
+        self.assertAlmostEqual(fitted['cutoff_spread'], 0.001 * 11.55)       # The floor, in Wh.
+        self.assertEqual(eta.fit_cutoff(minutes, [old])['deaths'], 1)        # In Ah, only the Ah one.
+        self.assertEqual(eta.fit_cutoff(minutes, [old])['cutoff'], 0.056)
+        # Trained on these minutes, the models are in their unit; the gauge needs no voltage curve.
+        params = eta.fit(minutes, known=[old], running='running')
+        self.assertEqual((params['cutoff_unit'], params['deaths'], params['volts']), ('Wh', 1, None))
+        # An Ah cutoff never arms the power-off for a battery in Wh, nor the other way round.
+        eta.remember([old], self.root / 'deaths.json')
+        battery(self.root, **dict(ENERGY, energy_now=2000000, capacity=4))
+        live = make_live(self.root)
+        self.assertTrue(live.warns_off())                                    # Until it reads the battery:
+        live.estimate()
+        self.assertFalse(live.warns_off())
+        self.assertEqual(live.params['cutoff'], 0.0)
+        eta.remember([dict(death, boot='wh')], self.root / 'deaths.json')
+        live.load_cutoff()
+        self.assertTrue(live.warns_off())
+        self.assertAlmostEqual(live.params['cutoff'], death['cut'])
+
+    def test_the_black_box_of_a_battery_that_counts_energy(self):
+        battery(self.root, **dict(ENERGY, energy_now=1000000, capacity=2))
+        live = make_live(self.root)
+        live.params = dict(self.params)
+        with mock.patch('os.fsync'):
+            live.estimate()
+        gasp = json.loads((self.root / 'lastgasp.json').read_text())
+        self.assertEqual((gasp['unit'], gasp['charge'], gasp['full'], gasp['watts']), ('Wh', 1.0, 50.0, 10.0))
+        gasp.update(boot='old', seconds=20.0, rate=None)
+        (self.root / 'lastgasp.json').write_text(json.dumps(gasp))
+        death = eta.harvest_gasp('now', self.root / 'lastgasp.json', self.root / 'deaths.json',
+                                 endings=lambda boot: ('cut', gasp['t'] + 1))
+        self.assertAlmostEqual(death['cut'], 1.0 - 10.0 / 3600)            # Its watts are Wh/s: no voltage.
+        self.assertEqual(eta.fit_cutoff([], eta.load_gasps(self.root / 'deaths.json'), unit='Wh')['deaths'], 1)
+        self.assertEqual(eta.fit_cutoff([], eta.load_gasps(self.root / 'deaths.json'))['deaths'], 0)
+        off = eta.judge(dict(gasp, poweroff=True), 'shutdown', None)
+        self.assertEqual((off['poweroff'], off['unit']), (True, 'Wh'))
+        self.assertAlmostEqual(eta.reserve_wh({'cutoff': 0.9, 'deaths': 1, 'cutoff_unit': 'Wh'}, self.root), 0.9)
+
+    def power_off_lead_wh(self, rate, offset, cutoff=0.86, spread=0.017):
+        """power_off_lead for a battery counting energy: energy_now falls `rate` Wh/s in 10 mWh steps."""
+        root = self.root / f'wh-{rate}-{offset}'
+        b = battery(root, **dict(ENERGY, power_now=int(rate * 3600 * 1e6), capacity=2))
+        offs, clock = [], Clock()
+        live = make_live(root, clock, poweroff=lambda: offs.append(clock.m) or True)
+        live.params = dict(eta.DEFAULTS, cutoff=cutoff, cutoff_spread=spread, deaths=5, cutoff_unit='Wh')
+        live.forecast = lambda *args: None
+        cut_at = clock.m + 300
+        with mock.patch('os.fsync'):
+            while clock.m < cut_at and not offs:
+                energy = cutoff + offset + rate * (cut_at - clock.m)
+                (b / 'energy_now').write_text(str(int(energy * 100) * 10000))
+                live.estimate()
+                clock.tick()
+        return cut_at - offs[0] if offs else None
+
+    def test_a_battery_that_counts_energy_powers_off_well_before_the_cut(self):
+        for rate in (0.0015, 0.003, 0.008):                                   # ~5 to ~30 W.
+            for offset in (-0.025, 0.0, 0.025):                               # ±1.5 spreads.
+                lead = self.power_off_lead_wh(rate, offset)
+                self.assertIsNotNone(lead, (rate, offset))
+                self.assertGreater(lead, 40, (rate, offset))
+                self.assertLess(lead, 110, (rate, offset))
+
+    def test_charging_a_battery_that_counts_energy(self):
+        battery(self.root, **dict(ENERGY, status='Charging', power_now=30000000, charge_control_end_threshold=80))
+        clock = Clock()
+        live = make_live(self.root, clock)
+        live.params = dict(self.params)
+        for i in range(60, 0, -1):                                           # 1%/min of 50 Wh: 30 W in.
+            live.samples.append((clock.m - 5 * i, 30.0, 'Charging', 30.0 - 0.5 * 5 * i / 60))
+        detail = live.estimate()['detail']
+        self.assertAlmostEqual(detail['charge_watts'], 30.0, delta=0.5)
+        self.assertEqual(detail['target'], 80)
+
+    def test_kappa_and_seeding_in_either_unit(self):
+        rows = [{'t': 60 * i, 'dt': 60, 'st': 'D', 'bat': 10.0, 'charge': (40.0 - i * 10.5 / 60) * 1e6,
+                 'unit': 'uWh', 'volts': 12.0} for i in range(120)]
+        self.assertAlmostEqual(eta.fit_kappa(rows, 'Wh'), 1.05, places=3)   # The counter fell 5% faster.
+        self.assertEqual(eta.fit_kappa(rows), 1.0)                          # No Ah steps.
+        self.assertEqual(eta.fit_kappa(rows[:20], 'Wh'), 1.0)              # Too little discharge to say.
+        battery(self.root, **ENERGY)
+        clock = Clock()
+        live = make_live(self.root, clock)
+        live.seed([dict(m, t=clock.t - 60 * (k + 2)) for k, m in enumerate(rows[:3])]
+                  + [{'t': clock.t - 60, 'st': 'D', 'bat': 9.0, 'charge': 2e6, 'unit': 'uAh'}])
+        self.assertEqual([q for _, _, _, q in live.samples],                # Charges in its unit only.
+                         [rows[0]['charge'] / 1e6, rows[1]['charge'] / 1e6, rows[2]['charge'] / 1e6, None])
+
+    def test_volts_per_ah_without_a_curve(self):
+        self.assertEqual(eta.pack_volts({'median_volts': 16.1}, 15.4), 15.4)      # voltage_min_design,
+        self.assertEqual(eta.pack_volts({'median_volts': 16.1}, None), 16.1)      # else the log's,
+        self.assertEqual(eta.pack_volts({}, None), batteries.DEFAULT_VOLTS)       # else a 3-cell pack's.
+        params = dict(self.params, volts=None, cutoff=0.0)
+        self.assertAlmostEqual(eta.usable_energy(1.0, 3.0, params, 'Ah', 15.4), 15.4)
+        self.assertAlmostEqual(eta.usable_energy(1.0, 3.0, dict(params, median_volts=16.0)), 16.0)
 
     def test_countdown_format(self):
         self.assertEqual((eta.countdown(247.4), eta.countdown(41), eta.countdown(-2)), ('4m 07s', '41s', '0s'))

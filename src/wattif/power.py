@@ -20,6 +20,7 @@ from compression import zstd
 from sys import stderr
 from pathlib import Path
 
+from . import battery as batteries
 from . import config
 from . import qol
 from . import store
@@ -75,37 +76,16 @@ def fraction(directory):
 # --- Sub-second power readings -------------------------------------------------
 
 def find_battery(root):
-    try:
-        entries = sorted(root.iterdir())
-    except OSError:
-        return None
-    for path in entries:
-        if (read(path / 'type') == 'Battery' and read(path / 'scope') != 'Device'
-                and number(path / 'present', 1) != 0):
-            return path
-    return None
+    """The first battery (batteries.find has them all; batteries.read combines them)."""
+    return next(iter(batteries.find(root)), None)
 
 
-def mains_online(root):
-    try:
-        entries = sorted(root.iterdir())
-    except OSError:
-        return None
-    mains = [number(path / 'online') for path in entries if read(path / 'type') == 'Mains']
-    return any(value == 1 for value in mains) if mains else None
+mains_online = batteries.mains_online
 
 
 def battery_watts(path):
-    """Signed battery power: positive while discharging, negative while charging."""
-    status = read(path / 'status', 'Unknown')
-    power = number(path / 'power_now')
-    if power is None:
-        current, voltage = number(path / 'current_now'), number(path / 'voltage_now')
-        if current is None or voltage is None:
-            return status, None
-        power = current * voltage / 1e6  # µA × µV → µW
-    watts = abs(power) / 1e6
-    return status, watts if status == 'Discharging' else -watts if status == 'Charging' else 0.0
+    """One battery's signed power: positive while discharging, negative while charging."""
+    return batteries.supply_watts(path)[:2]
 
 
 def find_hwmon(root, name):
@@ -115,36 +95,188 @@ def find_hwmon(root, name):
     return None
 
 
-def find_chip(sys):
-    amdgpu = find_hwmon(sys / 'class/hwmon', 'amdgpu')
-    return next((amdgpu / name for name in ('power1_input', 'power1_average')
-                 if amdgpu and (amdgpu / name).exists()), None)
+def resolved(path):
+    try:
+        return path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
 
 
-def find_gpu_busy(sys):
-    return next(iter(sorted(sys.glob('class/drm/card*/device/gpu_busy_percent'))), None)
+APU_FORMATS = (2, 3)  # gpu_metrics format revisions of APUs' tables (a discrete GPU's is 1).
 
 
-def find_metrics(sys):
-    return next(iter(sorted(sys.glob('class/drm/card*/device/gpu_metrics'))), None)
+def integrated(device, known=None):
+    """Whether an amdgpu PCI device is an APU's integrated GPU, whose PPT is the
+    whole chip's power, rather than a discrete GPU (a dGPU's PPT is its own
+    board's): its gpu_metrics table is an APU's (format revision 2 or 3).
+
+    A device asleep (runtime-suspended) is taken for a dGPU, as amdgpu doesn't
+    suspend an APU's GPU at runtime (one that did would be asked again awake),
+    and is never read: reading any amdgpu attribute wakes a sleeping dGPU (older
+    kernels), and on an awake one restarts its autosuspend timer, so polling one
+    would keep a hybrid laptop's dGPU powered for good. Each device is read at
+    most once: answers go into `known` (by device)."""
+    key = str(device)
+    if known is not None and key in known:
+        return known[key]
+    if read(device / 'power/runtime_status') == 'suspended':
+        return False  # Asking costs nothing: not kept, so a device is never judged by it alone.
+    try:
+        with open(device / 'gpu_metrics', 'rb') as source:
+            header = source.read(4)
+        answer = len(header) == 4 and header[2] in APU_FORMATS
+    except OSError:  # No table (an Intel GPU, an old kernel), or it won't say.
+        answer = False
+    if known is not None:
+        known[key] = answer
+    return answer
 
 
-RAIL_OFFSET = 44  # gpu_metrics v2.x: average_soc_power, then average_gfx_power (uint16 mW each).
+def integrated_cards(sys, known=None):
+    """The PCI devices of the DRM cards that are APUs' integrated GPUs, in card order."""
+    devices = []
+    for card in sorted((sys / 'class/drm').glob('card*')):
+        if '-' in card.name:
+            continue  # A connector (card1-eDP-1).
+        device = resolved(card / 'device')
+        if device is not None and device not in devices and integrated(device, known):
+            devices.append(device)
+    return devices
+
+
+class Hwmon:
+    """amdgpu's PPT (package power tracking) on an APU: the whole chip's power, µW."""
+    source, counter = 'amdgpu', False
+
+    def __init__(self, path):
+        self.path = path
+
+    def read(self):
+        value = number(self.path)
+        return value / 1e6 if value is not None else None
+
+
+RAPL_GAP = 5.0          # s: a longer pause between readings (a suspend) starts the counter over.
+RAPL_MAX_WATTS = 1000   # More from a counter delta is a counter reset, not power.
+
+
+class Rapl:
+    """Package power from RAPL's energy counters (powercap: Intel, and AMD since
+    Zen): µJ, cumulative, wrapping at max_energy_range_uj. read() gives W since
+    the reading before (None for the first, and after a gap or a reset); `span`
+    is the seconds that covered, so a record can weigh by time.
+
+    The counters are root-only since Linux 5.10 (and the stable kernels it went
+    back to): PLATYPUS (CVE-2020-8694) showed that unprivileged energy readings
+    leak secrets through power side channels (which instructions and data run,
+    keys, KASLR). wattif reads them only where an administrator has opted in,
+    for instance with a group the user is in:
+        /etc/tmpfiles.d/wattif-rapl.conf:
+            z /sys/class/powercap/intel-rapl:*/energy_uj 0440 root wheel -
+    or a udev rule, which also covers the driver loading later:
+        ACTION=="add", SUBSYSTEM=="powercap", KERNEL=="intel-rapl:*", \\
+            RUN+="/bin/chgrp wheel /sys%p/energy_uj", RUN+="/bin/chmod g+r /sys%p/energy_uj"
+    That gives every process of that group the side channel back; mode 0444 gives
+    it to every local user. On an AMD APU wattif uses amdgpu's PPT instead."""
+    source, counter = 'rapl', True
+
+    def __init__(self, zones, clock=None):
+        self.zones, self.clock = zones, clock or uptime
+        self.ranges = [number(zone / 'max_energy_range_uj') for zone in zones]
+        self.last, self.span = None, 0.0
+
+    def read(self):
+        now, values = self.clock(), [number(zone / 'energy_uj') for zone in self.zones]
+        last, self.last = self.last, ((now, values) if None not in values else None)
+        if last is None or self.last is None or not 0 < now - last[0] <= RAPL_GAP:
+            return None
+        joules = 0.0
+        for value, before, top in zip(values, last[1], self.ranges):
+            if value < before:  # Wrapped: it counts on from zero past its range.
+                if not top:
+                    return None
+                value += top
+            joules += (value - before) / 1e6
+        watts = joules / (now - last[0])
+        if watts > RAPL_MAX_WATTS:
+            return None
+        self.span = now - last[0]
+        return watts
+
+
+def rapl_packages(sys):
+    """RAPL's package domains (intel-rapl:N named package-N, not their core or
+    uncore subzones, nor the MMIO interface that double-counts them) whose energy
+    counter this user may read."""
+    zones = []
+    for zone in sorted((sys / 'class/powercap').glob('intel-rapl:*')):
+        if zone.name.count(':') != 1 or not (read(zone / 'name') or '').startswith('package'):
+            continue
+        if os.access(zone / 'energy_uj', os.R_OK) and number(zone / 'energy_uj') is not None:
+            zones.append(zone)
+    return zones
+
+
+def find_chip(sys, known=None, sensor=None, clock=None):
+    """Where chip (package) power comes from (config chip.sensor, 'auto' by
+    default): amdgpu's PPT on an AMD APU's integrated GPU, never a discrete GPU's
+    (an Intel laptop with an AMD dGPU); else RAPL's package counters if this user
+    can read them (Rapl); else None. 'amdgpu' takes the first amdgpu hwmon
+    whatever it is (an APU with no gpu_metrics), 'rapl' only RAPL, 'none' none."""
+    sensor = sensor or config.get('chip', 'sensor')
+    sensor = sensor if sensor in ('amdgpu', 'rapl', 'none') else 'auto'
+    if sensor in ('auto', 'amdgpu'):
+        for hwmon in sorted((sys / 'class/hwmon').glob('hwmon*')):
+            if read(hwmon / 'name') != 'amdgpu':
+                continue
+            device = resolved(hwmon / 'device')
+            if sensor == 'amdgpu' or (device is not None and integrated(device, known)):
+                for name in ('power1_input', 'power1_average'):
+                    if (hwmon / name).exists():
+                        return Hwmon(hwmon / name)
+    if sensor in ('auto', 'rapl') and (zones := rapl_packages(sys)):
+        return Rapl(zones, clock)
+    return None
+
+
+def find_gpu_busy(sys, known=None):
+    """The integrated GPU's busy percent (a dGPU's isn't the chip's, and polling it keeps it awake)."""
+    return next((path for device in integrated_cards(sys, known)
+                 if (path := device / 'gpu_busy_percent').exists()), None)
+
+
+def find_metrics(sys, known=None):
+    return next((path for device in integrated_cards(sys, known) if (path := device / 'gpu_metrics').exists()), None)
+
+
+RAIL_OFFSET = 44  # gpu_metrics v2.1–v2.4: average_soc_power, then average_gfx_power (uint16 mW each).
+# Content revisions whose layout puts the rails at RAIL_OFFSET. v2.0 (Renoir's)
+# has its timestamp earlier: socket and CPU power there. v3 (Strix Point's) is
+# another table altogether.
+RAIL_CONTENT = (1, 2, 3, 4)
 
 
 def chip_rails(path):
     """(VDD rail W, SoC rail W) from amdgpu's gpu_metrics (format 2, the APUs'),
-    or None. On this chip (SMU 13.0.4) the table's soc and gfx power fields are
-    its two measured rails: VDDCR_VDD, which feeds the CPU cores and graphics,
-    and VDDCR_SOC, the data fabric, memory controller, display and video engines
-    and I/O hub. Package power (PPT) less both is the rest: memory and I/O
-    interfaces, mostly (it rises with memory traffic)."""
+    or None. Measured on a Framework 13 (Ryzen 7040, SMU 13.0.4), the table's soc
+    and gfx power fields are its two measured rails: VDDCR_VDD, which feeds the
+    CPU cores and graphics, and VDDCR_SOC, the data fabric, memory controller,
+    display and video engines and I/O hub. Package power (PPT) less both is the
+    rest: memory and I/O interfaces, mostly (it rises with memory traffic).
+
+    Only a table laid out that way is read: format 2, content RAIL_CONTENT, as
+    long as its header says. Its socket power can't check the rails: it is
+    filtered over seconds, they over a fraction of one (on a Framework 13 a
+    load step puts them well above it for a while). Other APUs' rails may split
+    the chip differently: they are logged as they are."""
     try:
         data = Path(path).read_bytes()
     except OSError:
         return None
-    if len(data) < RAIL_OFFSET + 4 or data[2] != 2:
+    if len(data) < RAIL_OFFSET + 4 or data[2] != 2 or data[3] not in RAIL_CONTENT:
         return None
+    if not RAIL_OFFSET + 4 <= int.from_bytes(data[0:2], 'little') <= len(data):
+        return None  # Its header's size: a torn read, or not this table.
     soc = int.from_bytes(data[RAIL_OFFSET:RAIL_OFFSET + 2], 'little')
     vdd = int.from_bytes(data[RAIL_OFFSET + 2:RAIL_OFFSET + 4], 'little')
     if 0xFFFF in (soc, vdd):  # Not reported.
@@ -157,12 +289,17 @@ class FastSampler:
 
     Device paths are looked up again after MISSES failed reads in a row (or while
     missing): hwmon and power-supply directories can be re-created and renumbered.
+    `battery` is every battery (batteries.find), their watts summed. The chip's
+    source (find_chip) goes into the record as soc.src; one that counts energy
+    (RAPL) gives the record's mean by time.
     """
 
-    def __init__(self, sys=Path('/sys')):
+    def __init__(self, sys=Path('/sys'), sensor=None):
         self.supplies = sys / 'class/power_supply'
-        self.find = {'battery': lambda: find_battery(self.supplies), 'chip': lambda: find_chip(sys),
-                     'gpu_busy': lambda: find_gpu_busy(sys), 'metrics': lambda: find_metrics(sys)}
+        self.known = {}  # Which GPUs are integrated (integrated()): each is asked once.
+        self.find = {'battery': lambda: batteries.find(self.supplies) or None,
+                     'chip': lambda: find_chip(sys, self.known, sensor),
+                     'gpu_busy': lambda: find_gpu_busy(sys, self.known), 'metrics': lambda: find_metrics(sys, self.known)}
         self.misses = collections.Counter()
         self.battery, self.chip, self.gpu_busy, self.metrics = (
             self.find[name]() for name in ('battery', 'chip', 'gpu_busy', 'metrics'))
@@ -171,6 +308,7 @@ class FastSampler:
     def reset(self):
         self.values = collections.defaultdict(list)
         self.status = None
+        self.joules, self.source = [0.0, 0.0], None  # A counting chip source's J and s this record.
 
     def path(self, name):
         """The device path, looked up again after MISSES failed reads (or, while
@@ -187,12 +325,16 @@ class FastSampler:
         return value
 
     def sample(self):
-        if (battery := self.path('battery')) is not None:
-            self.status, watts = battery_watts(battery)
+        if (paths := self.path('battery')) is not None:
+            self.status, watts = batteries.watts(paths)
             if self.got('battery', watts) is not None:
                 self.values['bat'].append(watts)
-        if (chip := self.path('chip')) is not None and self.got('chip', value := number(chip)) is not None:
-            self.values['soc'].append(value / 1e6)
+        if (chip := self.path('chip')) is not None and self.got('chip', value := chip.read()) is not None:
+            self.values['soc'].append(value)
+            self.source = chip.source
+            if chip.counter:
+                self.joules[0] += value * chip.span
+                self.joules[1] += chip.span
         if (busy := self.path('gpu_busy')) is not None and self.got('gpu_busy', value := number(busy)) is not None:
             self.values['gpu_busy'].append(value)
         if (metrics := self.path('metrics')) is not None and self.got('metrics', rails := chip_rails(metrics)):
@@ -203,6 +345,10 @@ class FastSampler:
         result = {name: {'w': round(sum(v) / len(v), 3), 'min': round(min(v), 3),
                          'max': round(max(v), 3), 'n': len(v)}
                   for name, v in self.values.items() if v}
+        if 'soc' in result:
+            if self.joules[1] > 0:
+                result['soc']['w'] = round(self.joules[0] / self.joules[1], 3)
+            result['soc']['src'] = self.source
         status = self.status
         self.reset()
         return result, status
@@ -443,9 +589,8 @@ def settings(sys=Path('/sys')):
     # amdgpu DPM: 'low' pins the GPU, memory and fabric clocks at their lowest.
     values['gpu_dpm'] = next((read(path) for path in sorted(sys.glob('class/drm/card*/device/power_dpm_force_performance_level'))),
                              None)
-    battery = find_battery(sys / 'class/power_supply')
-    if battery is not None:
-        values['charge_limit'] = number(battery / 'charge_control_end_threshold')
+    if (reading := batteries.read(sys / 'class/power_supply')) is not None:
+        values['charge_limit'] = reading['limit']  # Several batteries: where the whole stops.
     for switch in sorted((sys / 'class/rfkill').glob('rfkill*')):
         values[f"rfkill_{read(switch / 'type')}"] = 'on' if read(switch / 'soft') == read(switch / 'hard') == '0' else 'off'
     return {key: value for key, value in values.items() if value is not None}
@@ -1117,16 +1262,16 @@ class Monitor:
                 'irq': interrupts(self.proc), 'net': network(self.sys), 'disk': disks(self.sys)}
 
     def battery_state(self):
-        battery = self.fast.battery
-        if battery is None:
+        """The record's battery fields: the gauge's percent, the charge in µ of the
+        battery's unit ('uAh' or 'uWh'), volts. Several batteries: combined
+        (batteries.read). None at all: nothing (a desktop's records have no battery)."""
+        if not self.fast.battery or (reading := batteries.read(self.fast.supplies, self.fast.battery)) is None:
             return {}
-        result = {'pct': number(battery / 'capacity')}
-        for name, unit in (('energy_now', 'uWh'), ('charge_now', 'uAh')):
-            if (value := number(battery / name)) is not None:
-                result.update(charge=value, unit=unit)
-                break
-        if (voltage := number(battery / 'voltage_now')) is not None:
-            result['volts'] = round(voltage / 1e6, 3)
+        result = {'pct': reading['capacity']}
+        if reading['now'] is not None:
+            result.update(charge=round(reading['now'] * 1e6, 1), unit='u' + reading['unit'])
+        if reading['volts'] is not None:
+            result['volts'] = round(reading['volts'], 3)
         return result
 
     def update(self, boot, wall, processes):
