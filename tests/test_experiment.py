@@ -622,15 +622,36 @@ class ExperimentTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.run_experiment(cap, 8)
 
+    def test_corrected_pcie_errors_count_only_after_a_link_change_on_a_quiet_boot(self):
+        message = 'pcieport 0000:00:1c.0: AER: Correctable error message received from 0000:01:00.0'
+        legacy = 'pcieport 0000:00:08.1: AER: Corrected error received: 0000:c1:00.0'
+        now = [1000.0]
+        ledger = Ledger(clock=lambda: now[0])
+        ledger.start('auto')
+        ledger.change('cpu-cap', '2000', False, 'auto')  # Not a link setting.
+        entry = lambda t, m=message: {'t': t, 'boot': 'b0', 'message': m}
+        quiet = lambda _boot: [entry(1200)]
+        self.assertEqual(experiment_module.corrected([entry(1200)], quiet, ledger), [])
+        now[0] = 1100.0
+        ledger.change('aspm', 'powersupersave', False, 'auto')
+        found = experiment_module.corrected([entry(1200), entry(1201, legacy)], quiet, ledger)
+        self.assertEqual([f['what'] for f in found], [experiment_module.CORRECTED_WHAT] * 2)
+        # A boot that logged them before any change has them anyway: background, not a sign.
+        noisy = lambda _boot: [entry(500), entry(1200)]
+        self.assertEqual(experiment_module.corrected([entry(1200)], noisy, ledger), [])
+        self.assertIsNone(experiment_module.classify(entry(1200)))  # Never an incident by itself.
+
     def test_kernel_messages_that_trip_the_watchdog(self):
         trips = ['xhci_hcd 0000:c1:00.3: HC died; cleaning up', 'Bluetooth: hci0: command tx timeout',
                  'Bluetooth: hci0: command 0x0405 tx timeout',
-                 'pcieport 0000:00:08.1: AER: Corrected error received: 0000:c1:00.0',
                  'pcieport 0000:00:08.1: PCIe Bus Error: severity=Uncorrected (Non-Fatal)',
+                 'pcieport 0000:00:1c.0: AER: Uncorrectable (Fatal) error message received from 0000:01:00.0',
                  'amdgpu 0000:c1:00.0: amdgpu: ring gfx_0.0.0 timeout, signaled seq=2718238, emitted seq=2718240',
                  'nvme nvme0: I/O tag 12 (100c) opcode 0x2 (Read) QID 3 timeout, aborting',
                  'nvme nvme0: controller is down; will reset: CSTS=0xffffffff']
-        harmless = ['pcieport 0000:00:03.1: AER: enabled with IRQ 39', 'acpi PNP0A08:00: _OSC: platform does not '
+        harmless = ['pcieport 0000:00:03.1: AER: enabled with IRQ 39',
+                    'pcieport 0000:00:08.1: AER: Corrected error received: 0000:c1:00.0',  # See corrected().
+                    'acpi PNP0A08:00: _OSC: platform does not '
                     'support [AER]', 'nvme nvme0: 16/0/0 default/read/poll queues', 'xhci_hcd 0000:c1:00.3: xHCI '
                     'Host Controller']
         self.assertTrue(all(experiment_module.classify({'message': m}) for m in trips))

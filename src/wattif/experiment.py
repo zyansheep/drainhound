@@ -1102,7 +1102,8 @@ def leftovers(ledger, exclude=()):
 INCIDENTS = (
     ('xHCI controller died', re.compile(r'xhci_hcd .*HC died')),
     ('Bluetooth command timeout', re.compile(r'Bluetooth: hci\d+: command (?:0x[0-9a-f]+ )?tx timeout')),
-    ('PCIe AER error', re.compile(r'AER: (?:Corrected|Uncorrected|Multiple)|PCIe Bus Error')),
+    # Kernels before 6.x say "Uncorrected", later ones "Uncorrectable".
+    ('PCIe uncorrected error', re.compile(r'AER: (?:Multiple )?Uncorrect(?:ed|able)|PCIe Bus Error: severity=Uncorrect')),
     ('amdgpu ring timeout', re.compile(r'amdgpu.*ring \S+ timeout')),
     ('NVMe timeout', re.compile(r'nvme nvme\d+: .*(?:timeout|controller is down)')),
 )
@@ -1178,6 +1179,34 @@ def classify(entry):
     return next((what for what, pattern in INCIDENTS if pattern.search(entry['message'])), None)
 
 
+# Corrected PCIe errors are a steady trickle on some machines with nothing
+# wrong, and on others the first sign that a link power setting doesn't suit a
+# device. So they count only when they follow a change of a link setting
+# (changed in the quarantine window, or off stock) and the boot logged none
+# before experiments first changed anything in it.
+CORRECTED = re.compile(r'AER: (?:Multiple )?Correct(?:ed|able)|PCIe Bus Error: severity=Correct')
+CORRECTED_WHAT = 'PCIe corrected errors after a link power change'
+LINK_SETTINGS = frozenset({'aspm', 'apst'})
+
+
+def corrected(entries, background, ledger):
+    """The corrected-error entries in `entries` that count (see CORRECTED), given
+    `background(boot)`: that boot's kernel entries to look for earlier ones in."""
+    found, quiet = [], {}
+    for entry in entries:
+        if not CORRECTED.search(entry['message']) or not LINK_SETTINGS & ledger.suspects(entry['t'], entry['boot']):
+            continue
+        boot = entry['boot']
+        if boot not in quiet:
+            first = min((c['t'] for c in ledger.changes() if c.get('boot') == boot), default=None)
+            earlier = [e for e in background(boot) or [] if CORRECTED.search(e['message'])
+                       and (first is None or e['t'] < first)]
+            quiet[boot] = first is not None and not earlier
+        if quiet[boot]:
+            found.append(dict(entry, what=CORRECTED_WHAT))
+    return found
+
+
 def ending(current, previous, shutdown_logged):
     """How the boot before this one ended, from this boot's reset reason and that
     boot's kernel log: (what, message, quarantine), or None for a clean shutdown.
@@ -1231,12 +1260,16 @@ class Watchdog:
             what = classify(entry)
             if what and entry['t'] > seen and self.ledger.active(entry['t'], entry['boot']):
                 found.append(dict(entry, what=what))
+        boots = {e['boot']: entries for entries in (previous, current) for e in entries[:1]}
+        found += corrected([e for e in previous + current if e['t'] > seen and self.ledger.active(e['t'], e['boot'])],
+                           boots.get, self.ledger)
         return found
 
     def poll(self, since, seen):
         """While running: this boot's incidents since `since`."""
-        entries = self.journal.kernel('0', since) or []
-        return [dict(e, what=w) for e in entries if (w := classify(e)) and e['t'] > seen]
+        entries = [e for e in self.journal.kernel('0', since) or [] if e['t'] > seen]
+        return ([dict(e, what=w) for e in entries if (w := classify(e))]
+                + corrected(entries, lambda _boot: self.journal.kernel('0'), self.ledger))
 
 
 def seen():
