@@ -703,12 +703,14 @@ def idle_parts(params, chip, scale):
 def load_attribution(path):
     """Trained attribution parameters from wattif eta's models.json, or None:
     PRIOR's keys, the idle clocks report.fit_rows learned (each profile's
-    'idle_ghz:<profile>[:ac]', and 'idle_ghz_active') and the idle chip's
-    rail shares ('rail:<rail>')."""
+    'idle_ghz:<profile>[:ac]', and 'idle_ghz_active'), the idle chip's
+    rail shares ('rail:<rail>') and 'stages' (1: the one-stage model of a
+    laptop without chip power; absent, as in every file before models.json
+    version 6: the chip and battery models)."""
     try:
         data = json.loads(Path(path).read_text())
         return {**PRIOR, **{k: float(v) for k, v in data['attribution'].items()
-                            if k in PRIOR or k.startswith(('idle_ghz', 'rail:'))}}
+                            if k in PRIOR or k == 'stages' or k.startswith(('idle_ghz', 'rail:'))}}
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return None
 
@@ -761,15 +763,19 @@ def attribute(record, params):
     as idle_parts once its rails are learned: 'Idle chip/<part>' rows); above
     it, apps share it by CPU time (theirs is what raised the clock).
     report.attribute splits a minute the same way, by load.
+
+    Without a chip power reading, and on battery for a one-stage model
+    ('stages' 1: its chip terms are battery W, k is 1), the chip's part is
+    the model's estimate (its floor, the clock and every app's terms), and
+    the modelled parts are scaled down together if they come to more than the
+    battery delivered. On AC without a chip reading nothing is measured: no rows.
     """
     dt, rows = record['dt'], collections.defaultdict(float)
     soc = record.get('soc', {}).get('w')
-    if soc is None:
-        return rows
     on_battery = discharging(record)
-    scale = params['chip'] if on_battery else 1.0
-    if on_battery and soc > 0:
-        scale = max(0.0, min(scale, record['bat']['w'] / soc))  # Never more than the battery delivered.
+    measured = soc is not None and not (on_battery and params.get('stages') == 1)
+    if not (measured or on_battery):
+        return rows
     mhz, active = record.get('cpu', {}).get('mhz'), record.get('cpu', {}).get('mhz_active')
     ghz = mhz / 1000 if mhz else None
     ghz2 = ghz * ghz if ghz else 0
@@ -781,7 +787,6 @@ def attribute(record, params):
     busy = sum(cpu.values())
     if busy <= 0:
         idle += raised  # Nothing ran to raise it.
-    floor = min(soc, params['floor'] + idle)
     weights = {}
     for name, seconds in cpu.items():
         app = apps.get(name, {})
@@ -789,6 +794,19 @@ def attribute(record, params):
                           + params['video'] * app.get('video', 0)) / dt
                          + (raised * seconds / busy if busy > 0 else 0))
     total = sum(weights.values())
+    if not measured:
+        soc = params['floor'] + idle + total  # The chip model's estimate (one-stage: in battery W).
+    parts = {}
+    if on_battery:
+        x = platform_features(record)
+        parts = {name: params[term] * x[index] for name, term, index in DEVICE_TERMS}
+    modelled = sum(parts.values())
+    scale = params['chip'] if on_battery else 1.0
+    if on_battery and measured and soc > 0:
+        scale = max(0.0, min(scale, record['bat']['w'] / soc))  # Never more than the battery delivered.
+    elif on_battery and scale * soc + modelled > 0:  # Estimated: every modelled part scaled down to the draw.
+        scale *= max(0.0, min(1.0, record['bat']['w'] / (scale * soc + modelled)))
+    floor = min(soc, params['floor'] + idle)
     if total > 0:
         for name, weight in weights.items():
             if weight > 0:
@@ -799,9 +817,6 @@ def attribute(record, params):
         rows[name if name == IDLE else f'{IDLE}/{name}'] += joules
     if on_battery:
         rest = record['bat']['w'] - scale * soc
-        x = platform_features(record)
-        parts = {name: params[term] * x[index] for name, term, index in DEVICE_TERMS}
-        modelled = sum(parts.values())
         shrink = min(1.0, max(0.0, rest) / modelled) if modelled > 0 else 0
         for name, watts in parts.items():
             if watts > 0:
@@ -847,8 +862,10 @@ def summarize(window, now, log_totals, limit=6):
         title = 'Battery use: measuring…'
     elif battery:
         title = f'Battery use · last {minutes} min on battery · {energy / seconds:.1f} W'
-    else:
+    elif energy > 0:
         title = f'On AC · chip power by app, last {minutes} min · {energy / seconds:.1f} W'
+    else:  # On AC only the chip's draw is measured (attribute): without a reading of it, nothing is.
+        title = 'On AC · no chip power reading, so nothing to split by app'
     rows = []
     if seconds > 0 and energy > 0:
         ranked = sorted(totals.items(), key=lambda r: (-r[1], r[0]))

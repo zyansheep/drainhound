@@ -322,6 +322,27 @@ class EtaTests(unittest.TestCase):
         self.assertEqual(fit_rows.call_args.kwargs['previous'], params['attribution'])
         self.assertIs(fit_rows.call_args.kwargs['minutes'], minutes)
 
+    def test_without_chip_power_the_one_stage_model_is_trained_and_said_so(self):
+        rng = np.random.default_rng(8)
+        minutes = []
+        for i in range(200):
+            load, bl = rng.uniform(1, 20), rng.uniform(.2, 1)
+            minutes.append({'t': i * 60, 'dt': 60, 'st': 'D', 'load': load, 'ghz': 1.5, 'bl': bl, 'pct': 80 - i * .2,
+                            'volts': 16 - i * .005, 'charge': 2.5e6 - i * 1000, 'unit': 'uAh',
+                            'bat': 9 + .28 * load + 3 * bl + rng.normal(0, .2), 'set': {}})
+        params = eta.train(minutes, [], now=1000.0, known=[])
+        attribution = params['attribution']
+        self.assertEqual((attribution['stages'], attribution['chip'], attribution['chip_rows']), (1.0, 1.0, 0.0))
+        self.assertAlmostEqual(attribution['load'], .28, delta=.03)
+        self.assertAlmostEqual(attribution['bl'], 3, delta=.2)
+        self.assertTrue(all(isinstance(v, float) for v in attribution.values()))
+        self.assertEqual(params['battery_minutes'], 200)
+        self.assertAlmostEqual(params['typical_power'], np.mean([m['bat'] for m in minutes]))
+        path = self.root / 'models.json'
+        eta.save_models(dict(params, fitted=time.time()), path)
+        self.assertEqual(eta.load_models(path)['attribution']['stages'], 1.0)
+        self.assertEqual(eta.power.load_attribution(path)['stages'], 1.0)  # The collector's reading of it
+
     def test_recommendations_for_the_battery_menu(self):
         from tests.test_report import factorial_minutes
         minutes = factorial_minutes(blocks=120)

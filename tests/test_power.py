@@ -430,6 +430,37 @@ class PowerTests(unittest.TestCase):
             self.assertEqual(log.index['days']['2000-01-01']['records'], 0)
 
 
+    def test_a_laptop_without_chip_power_gets_its_battery_split_by_the_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'models.json'
+            path.write_text(json.dumps({'version': 6, 'attribution': {'chip': 1.0, 'floor': 4.0, 'stages': 1.0}}))
+            self.assertEqual(load_attribution(path)['stages'], 1.0)  # The collector knows which kind it got
+            path.write_text(json.dumps({'version': 5, 'attribution': {'chip': 1.4, 'floor': 3.0}}))
+            self.assertNotIn('stages', load_attribution(path))  # Before version 6: two-stage
+        record = {'dt': 10, 'status': 'Discharging', 'bat': {'w': 20.0}, 'soc': {}, 'cpu': {'busy_s': 10.0, 'mhz': 2000},
+                  'apps': {'Browser': {'cpu': 6.0}, 'Game': {'cpu': 2.0, 'gpu': 2.0}},
+                  'display': {'bl': .5}, 'net': {'wlan0': {'rx': 0, 'tx': 0}}}
+        one = dict(PRIOR, chip=1.0, base=0.0, stages=1.0, floor=4.0, clock=4.0)
+        rows = attribute(record, one)
+        # The chip's estimate: 4 W + 4 W/GHz × 1 GHz idle clock, then the apps' terms; k is 1.
+        self.assertAlmostEqual(rows['Idle chip'], 80.0)
+        self.assertAlmostEqual(rows['Display'], 15.0)
+        self.assertAlmostEqual(sum(rows.values()), 200.0)
+        self.assertAlmostEqual(rows['Kernel'] / rows['Browser'], 1 / 3)
+        record['soc'] = {'w': 10.0}  # A reading, but the one-stage model's terms are battery W: its estimate.
+        self.assertEqual(attribute(record, one), rows)
+        record['bat']['w'] = 9.0  # Less than modelled: every part scaled down together.
+        low = attribute(record, one)
+        self.assertAlmostEqual(sum(low.values()), 90.0)
+        self.assertAlmostEqual(low['Display'] / rows['Display'], low['Idle chip'] / rows['Idle chip'])
+        self.assertNotIn('Rest of system', {k for k, v in low.items() if v > 1e-9})
+        record.update(status='Charging', soc={})
+        self.assertEqual(dict(attribute(record, one)), {})  # On AC nothing measured: nothing to split.
+        self.assertEqual(dict(attribute(record, PRIOR)), {})
+        menu = summarize([(1, 60, False, {}), (2, 60, False, {})], 3, (2, 120, None))
+        self.assertEqual(menu['title'], 'On AC · no chip power reading, so nothing to split by app')
+        self.assertEqual(menu['rows'], [])
+
 def fake_machine(root, cpus=4):
     """A /sys and /proc with what the collector reads: a battery, amdgpu power,
     cpufreq, /proc/stat."""
@@ -565,6 +596,26 @@ class MonitorTests(unittest.TestCase):
         (kept,) = report.sleep_drain(gaps)
         self.assertEqual(kept['end'], gaps[0]['t1'])
         self.assertAlmostEqual(kept['watts'], 0.05 * 15.5 / 0.5, places=3)
+
+    def test_without_a_chip_power_reading_the_menu_still_splits_the_battery(self):
+        for path in self.sys.glob('class/hwmon/hwmon3/*'):
+            path.unlink()
+        put(self.sys / 'class/power_supply/BAT1/status', 'Charging')
+        put(self.sys / 'class/power_supply/ACAD/online', '1')
+        monitor = self.monitor()
+        for i in range(6):
+            menu = self.tick(monitor, busy=i * TICKS)
+        self.assertEqual(menu['title'], 'On AC · no chip power reading, so nothing to split by app')
+        self.assertEqual(menu['rows'], [])
+        put(self.sys / 'class/power_supply/BAT1/status', 'Discharging')
+        put(self.sys / 'class/power_supply/ACAD/online', '0')
+        for i in range(6, 12):
+            menu = self.tick(monitor, busy=i * TICKS)
+        monitor.close()
+        self.assertTrue(menu['title'].startswith('Battery use · last') and menu['title'].endswith('· 10.0 W'), menu)
+        self.assertAlmostEqual(sum(float(r['value'].split()[0]) for r in menu['rows']), 10.0, delta=.3)
+        self.assertIn('Idle chip', [r['name'] for r in menu['rows']])
+        self.assertEqual(self.rows('SELECT soc_w FROM records'), [(None,), (None,)])
 
     def test_without_cpufreq_records_have_no_clock(self):
         for path in self.sys.glob('devices/system/cpu/cpu*/cpufreq/scaling_cur_freq'):

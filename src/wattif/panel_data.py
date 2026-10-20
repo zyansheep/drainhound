@@ -350,7 +350,7 @@ def collect(start, end, history, on_period, part, errors, timings, began):
                             first=rows_all[0]['t'] if rows_all else None,
                             last=rows_all[-1]['t'] if rows_all else None, used=len(rows),
                             model={k: (model or {}).get(k) for k in ('rows', 'experiment_rows', 't0', 't1', 'kept',
-                                                                     'prior')},
+                                                                     'prior', 'stages')},
                             used_first=rows[0]['t'] if rows else None, used_last=rows[-1]['t'] if rows else None,
                             trained=result['trained'], models_age=models_age(), blocks=levers.get('blocks'),
                             models_outdated=part('models version', models_outdated, False) if not shared else False,
@@ -418,19 +418,22 @@ def scope_text(scope, rows):
 
 def model_text(model, same=None):
     """The battery model's data health (report.fit_rows' keys), if it has any;
-    `same`: (minutes, in experiments) the line already gave."""
+    `same`: (minutes, in experiments) the line already gave. A one-stage model
+    (report.stages) says it is fitted on battery power alone."""
     model = model or {}
     if model.get('prior'):
         return f'prior values (under {report.MIN_ROWS} battery minutes to fit)'
     if not finite(model.get('rows')) or not model['rows']:
         return ''
+    alone = ', from battery power alone (no chip power reading)' if model.get('stages') == 1 else ''
     if same == (model['rows'], model.get('experiment_rows') or 0) and not model.get('kept'):
-        return 'on those minutes'
+        return 'on those minutes' + alone
     text = f"{int(model['rows']):,} minutes"
     if finite(model.get('t0'), model.get('t1')):
         text += f" ({days(model['t0'], model['t1'])})"
     if finite(model.get('experiment_rows')) and model['experiment_rows']:
         text += f", {int(model['experiment_rows']):,} in experiments"
+    text += alone
     return f'its last fit, kept: {text} (too few new battery minutes)' if model.get('kept') else text
 
 

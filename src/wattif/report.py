@@ -59,6 +59,16 @@ DEVICES = (('Display', 'bl'), ('Wi-Fi', 'wifi'), ('Storage', 'disk'), ('USB devi
 CHIP_TERMS = ('floor', 'load', 'clock', 'gpu', 'video', 'clock_active')
 BATTERY_TERMS = ('base', 'chip', 'bl', 'wifi', 'disk', 'usb', 'audio', 'kbd')
 PRIOR = power.PRIOR  # Shared with the collector's attribution.
+# The one-stage model, for laptops without a chip power reading (most Intel ones:
+# RAPL is root-only): battery W fitted directly on the chip model's columns and
+# the devices', so the chip terms come out in battery W, the cost per chip watt
+# (k) folded in, and the board's idle draw in the floor (without the chip's own
+# draw the two can't be told apart). Its 'chip' is 1 and 'base' 0, so whatever
+# reads k (setting_watts, candidates, attribute) reads it unchanged.
+ONE_STAGE_TERMS = CHIP_TERMS + BATTERY_TERMS[2:]
+ONE_STAGE_PRIOR = {'floor': PRIOR['base'] + PRIOR['chip'] * PRIOR['floor'],
+                   **{term: PRIOR['chip'] * PRIOR[term] for term in CHIP_TERMS[1:]},
+                   **{term: PRIOR[term] for term in BATTERY_TERMS[2:]}}
 IDLE_PERCENTILE = 5  # The idle clock: minutes rarely run slower (~1.0 GHz, where ~1 core is busy).
 
 
@@ -126,18 +136,21 @@ def add_clean_parts(minutes, db):
 # --- Models -------------------------------------------------------------------
 
 def battery_rows(minutes, include_experiments=True):
-    """Minutes the battery models can use: on battery, with chip power, load and
-    clock measured. Experiment minutes count except their washout: the models
+    """Minutes the battery models can use: on battery, with load and clock
+    measured, and chip power where the laptop reads it (fit_rows: with enough
+    of it, the two-stage models, else the one-stage one; a minute whose chip
+    drew 2 W more than the battery delivered is a bad reading, left out).
+    Experiment minutes count except their washout: the models
     adjust for settings (fit_rows), and since 2026-10-12 nearly every battery
     minute has been an experiment's, so leaving them out froze every model on
     the days before. `include_experiments=False`: only minutes outside them.
     A minute that was partly on AC (`purity`, the share of it in its majority
     status, under PURE) is left out; one without purity (not yet recomputed) stays."""
-    return [m for m in minutes if m['st'] == 'D' and m.get('bat', 0) > 0 and m.get('soc') is not None
+    return [m for m in minutes if m['st'] == 'D' and m.get('bat', 0) > 0
             and m.get('load') is not None and m.get('ghz') is not None and m['dt'] >= 40
             and (m.get('purity') is None or m['purity'] >= PURE)
             and not (m.get('exp') and (m['exp'][4] or not include_experiments))
-            and m['bat'] - m['soc'] > -2]
+            and (m.get('soc') is None or m['bat'] - m['soc'] > -2)]
 
 
 PURE = 0.9
@@ -148,6 +161,32 @@ IDLE_MINUTES = 30  # Minutes of a profile (on battery, or on AC) to learn its ow
 STATE_MINUTES = 30  # Battery minutes in each state for a setting to get its own model column.
 ACTIVE_MINUTES = 120  # Battery minutes with the active cores' clock (store layout 9) before the model uses it.
 RAIL_MINUTES = 30  # Battery minutes with the chip's rails (store layout 10) before the idle chip is split by them.
+CHIP_MINUTES = 120  # Battery minutes with chip power the two-stage models need when some lack it (chip_measured).
+
+
+def stages(model):
+    """The kind of attribution model: 2, the chip and battery models (models.json
+    from before version 6 too: they have no 'stages'), or 1, the one-stage model
+    of a laptop without chip power (ONE_STAGE_TERMS)."""
+    return 1 if (model or {}).get('stages') == 1 else 2
+
+
+def chip_measured(rows):
+    """Whether battery_rows carry enough chip power for the two-stage models:
+    most of the latest CHIP_MINUTES have it, and CHIP_MINUTES of them all do
+    (half of them while there are fewer than twice that; MIN_ROWS at least).
+    A sensor that appears after an update, or goes away, so moves the switch
+    within about two hours on battery. Else the one-stage model."""
+    measured = [m.get('soc') is not None for m in rows]
+    latest = measured[-CHIP_MINUTES:]
+    return (sum(measured) >= max(MIN_ROWS, min(CHIP_MINUTES, len(rows) // 2))
+            and 2 * sum(latest) > len(latest))
+
+
+def usable_rows(rows, model):
+    """The rows `model` can be evaluated on: the two-stage models need the
+    minute's chip power, the one-stage one doesn't."""
+    return rows if stages(model) == 1 else [m for m in rows if m.get('soc') is not None]
 
 
 def profile_of(m):
@@ -222,7 +261,9 @@ def design(rows, model=None):
     (fit_rows' idle clocks and settings) the clocks are clock_columns', and
     both get a column per setting it has: saving state minus yours, so the
     intercepts are at your settings and a setting's effect (an experiment's)
-    stays out of the parts' coefficients."""
+    stays out of the parts' coefficients. For a one-stage `model` (stages)
+    the chip target is None and the battery matrix is ONE_STAGE_TERMS': the
+    chip's columns, then the devices'."""
     model, n = model or {}, len(rows)
     levers, top = model_levers(model), model_top(model)
     own = np.array([model[f'own:{name}'] for name in levers])
@@ -230,6 +271,11 @@ def design(rows, model=None):
                       if levers else []).reshape(n, len(levers)) - own
     chip = np.array([[1.0, m['load'], clock, m.get('gpu', 0), m.get('video', 0), active]
                      for m in rows for clock, active in (clock_columns(m, model),)]).reshape(n, len(CHIP_TERMS))
+    if stages(model) == 1:
+        devices = np.array([[m.get('bl') or 0, m.get('wifi', 0), m.get('disk', 0), m.get('usb', 0),
+                             m.get('audio', 0), m.get('kbd') or 0] for m in rows]).reshape(n, len(BATTERY_TERMS) - 2)
+        return (np.hstack([chip, states]), None, np.hstack([chip, devices, states]),
+                np.array([m['bat'] for m in rows], float))
     battery = np.array([[1.0, m['soc'], m.get('bl') or 0, m.get('wifi', 0), m.get('disk', 0), m.get('usb', 0),
                          m.get('audio', 0), m.get('kbd') or 0] for m in rows]).reshape(n, len(BATTERY_TERMS))
     return (np.hstack([chip, states]), np.array([m['soc'] for m in rows]),
@@ -250,14 +296,14 @@ def gram(x, y, w=None):
     return xw.T @ x, xw.T @ y
 
 
-def solve_gram(g, gy, names, levers=(), ridge=5.0):
+def solve_gram(g, gy, names, levers=(), ridge=5.0, prior=None):
     """fit's least squares from its sums (gram): coefficients of `names`, and of
     the `levers` columns after them, either sign (each the difference of two
-    non-negative parts)."""
+    non-negative parts). Shrunk toward `prior` (PRIOR by default)."""
     k, n = len(names), len(levers)
     index = np.r_[np.arange(k + n), np.arange(k, k + n)].astype(int)
     sign = np.r_[np.ones(k + n), -np.ones(n)]
-    prior = np.array([PRIOR[name] for name in names] + [0.0] * (2 * n))
+    prior = np.array([(prior or PRIOR)[name] for name in names] + [0.0] * (2 * n))
     penalty = np.full(len(prior), float(ridge))
     penalty[0] = 0.01  # Intercepts: barely shrunk.
     coef = nnls_normal(g[np.ix_(index, index)] * np.outer(sign, sign) + np.diag(penalty),
@@ -270,8 +316,23 @@ def fit(chip_x, chip_y, battery_x, battery_y, ridge=5.0, levers=(), weights=None
     features that never varied stay at their prior instead of drifting. Columns
     past the named terms are `levers`' settings (design): either sign, shrunk
     toward 0, as 'soc:<setting>' and 'bat:<setting>'. `weights`: how often each
-    row counts; `sums`: both models' gram() sums instead (a resample)."""
+    row counts; `sums`: both models' gram() sums instead (a resample).
+    Without a chip target (`chip_y` None: design's one-stage matrices) only
+    the battery is fitted, on ONE_STAGE_TERMS toward ONE_STAGE_PRIOR, with
+    'chip' 1, 'base' 0, 'stages' 1 and a setting's whole battery W in
+    'bat:<setting>' (`sums`: (None, the battery's sums))."""
     w = None if weights is None else np.asarray(weights, float)
+    if chip_y is None:
+        battery = sums[1] if sums else gram(battery_x, battery_y, w)
+        model = {'base': 0.0, 'chip': 1.0, 'stages': 1.0}
+        if len(battery_y) >= MIN_ROWS:
+            terms, bat = solve_gram(*battery, ONE_STAGE_TERMS, levers, ridge, prior=ONE_STAGE_PRIOR)
+            model.update(terms)
+            model.update({f'bat:{n}': float(v) for n, v in zip(levers, bat)})
+            model['idle_ghz'] = float(np.percentile(chip_x[:, 2], IDLE_PERCENTILE))
+        else:
+            model = {**PRIOR, **ONE_STAGE_PRIOR, **model}
+        return model
     chip, battery = sums or (gram(chip_x, chip_y, w), gram(battery_x, battery_y, w))
     model = {}
     if len(chip_y) >= MIN_ROWS:
@@ -299,17 +360,23 @@ def fit_rows(rows, previous=None, minutes=None):
       the chip and the other battery W of its saving state, 'own:<s>' yours (1
       or 0; the share of minutes when no minute outside experiments says), and
       'top:hz|mhz|cpu_mhz', what lever_states compares with;
-    * data health: 'rows' used, 'experiment_rows' and 'active_rows' (with the
-      active clock) of them, 't0' and 't1' (their first and last minute),
-      'kept' 1 when too few rows kept `previous` (the last good model, whose
-      health it keeps), 'prior' 1 when there was no previous model either and
-      the values are PRIOR's.
+    * data health: 'rows' used, 'experiment_rows', 'active_rows' (with the
+      active clock) and 'chip_rows' (with chip power) of them, 't0' and 't1'
+      (their first and last minute), 'kept' 1 when too few rows kept
+      `previous` (the last good model, whose health it keeps), 'prior' 1 when
+      there was no previous model either and the values are PRIOR's;
+    * 'stages': 2 for the chip and battery models, fitted on the rows with
+      chip power, while chip_measured(rows); else 1, the one-stage model on
+      all of them (ONE_STAGE_TERMS: the same names, the chip's in battery W).
 
     `minutes` (all, AC too) give your settings and the AC idle clocks; else `rows` do."""
     if len(rows) < MIN_ROWS:
         if previous and 'chip' in previous and not previous.get('prior'):
             return {**PRIOR, **previous, 'kept': 1.0}
         return dict(PRIOR, rows=float(len(rows)), experiment_rows=0.0, active_rows=0.0, kept=0.0, prior=1.0)
+    two = chip_measured(rows)
+    if two:
+        rows = [m for m in rows if m.get('soc') is not None]
     source = rows if minutes is None else minutes
     top = tops(source)
     active = [m['ghz_active'] for m in rows if m.get('ghz_active') is not None]
@@ -323,10 +390,12 @@ def fit_rows(rows, previous=None, minutes=None):
     levers = [n for n in SETTING if min(on[n], len(rows) - on[n]) >= STATE_MINUTES]
     yours = own_settings(source, top) if any(not m.get('exp') for m in source if m.get('set')) else None
     spec.update({f'own:{n}': float(yours[n]) if yours else on[n] / len(rows) for n in levers})
+    spec['stages'] = 2.0 if two else 1.0
     model = dict(fit(*design(rows, spec), levers=levers), **spec)
     model.update(rail_shares(rows, model))
     model.update(rows=float(len(rows)), experiment_rows=float(sum(1 for m in rows if m.get('exp'))),
-                 active_rows=float(len(active)), t0=float(rows[0]['t']), t1=float(rows[-1]['t']), kept=0.0, prior=0.0)
+                 active_rows=float(len(active)), chip_rows=float(sum(1 for m in rows if m.get('soc') is not None)),
+                 t0=float(rows[0]['t']), t1=float(rows[-1]['t']), kept=0.0, prior=0.0)
     return model
 
 
@@ -338,9 +407,10 @@ def rail_shares(rows, model):
     chip's baseline is: no load, GPU or video, the idle clock, your settings.
     The rails add up to the chip, so their fits add up to the chip's fit.
     Settings that never changed within these rows are left out (their
-    columns would be the intercept's)."""
-    rows = [m for m in rows if m.get('vdd') is not None and m.get('fabric') is not None]
-    if len(rows) < RAIL_MINUTES:
+    columns would be the intercept's). Nothing for a one-stage model: its
+    idle chip has the board's idle draw in it, which no rail measures."""
+    rows = [m for m in rows if m.get('vdd') is not None and m.get('fabric') is not None and m.get('soc') is not None]
+    if len(rows) < RAIL_MINUTES or stages(model) == 1:
         return {}
     x = design(rows, model)[0]
     y = np.array([[m['vdd'], m['soc'] - m['vdd'] - m['fabric'], m['fabric']] for m in rows])
@@ -368,7 +438,8 @@ def setting_watts(m, model):
 
 def typical_power(rows, model):
     """Mean battery W of `rows` (battery_rows) at your settings: each minute's
-    draw less what its settings (an experiment's) added against yours."""
+    draw less what its settings (an experiment's) added against yours. Needs
+    no chip power, so either kind of model gives it."""
     if not rows:
         return None
     return float(np.average([m['bat'] - setting_watts(m, model) for m in rows], weights=[m['dt'] for m in rows]))
@@ -377,15 +448,20 @@ def typical_power(rows, model):
 def attribute(m, model):
     """Watts for one minute: {'groups': {category: W}, 'apps': {app: W},
     'devices': {device: W}, 'idle': {part: W}} ('idle': the IDLE group's
-    parts, power.idle_parts)."""
+    parts, power.idle_parts).
+
+    The chip's measured draw is split, on battery at k per chip watt. Without
+    it (no chip power reading), and on battery for a one-stage model (whose
+    chip terms are battery W), the chip's part is the model's estimate — its
+    floor, the clock and every app's terms — and if the modelled parts come to
+    more than the battery delivered they are all scaled down to it. On AC
+    without the chip's draw nothing is measured, so nothing is split."""
     soc = m.get('soc')
     groups, apps, devices = collections.defaultdict(float), collections.defaultdict(float), {}
-    if soc is None:
-        return {'groups': groups, 'apps': apps, 'devices': devices, 'idle': {}}
     on_battery = m['st'] == 'D' and m.get('bat') is not None
-    k = model['chip'] if on_battery else 1.0
-    if on_battery and soc > 0:
-        k = max(0.0, min(k, m['bat'] / soc))  # Less battery draw than k·chip: the stack must not overshoot it.
+    measured = soc is not None and not (on_battery and stages(model) == 1)
+    if not (measured or on_battery):
+        return {'groups': groups, 'apps': apps, 'devices': devices, 'idle': {}}
     idle, raised = power.clock_split(model, m.get('ghz'), profile_of(m), not on_battery, m.get('ghz_active'))
     loads = {name: load for name, (load, _, _) in m.get('apps', {}).items()}
     if m.get('load') is not None:
@@ -393,13 +469,22 @@ def attribute(m, model):
     busy = sum(loads.values())
     if busy <= 0:
         idle += raised  # Nothing ran to raise it.
-    floor = min(soc, model['floor'] + idle)
     weights = {}
     for name, load in loads.items():
         _, gpu, video = m.get('apps', {}).get(name, (0, 0, 0))
         weights[name] = (model['load'] * load + model['gpu'] * gpu + model['video'] * video
                          + (raised * load / busy if busy > 0 else 0))
     total = sum(weights.values())
+    if not measured:
+        soc = model['floor'] + idle + total  # The chip model's estimate (one-stage: in battery W).
+    parts = {name: model[term] * (m.get(term) or 0) for name, term in DEVICES} if on_battery else {}
+    modelled = sum(parts.values())
+    k = model['chip'] if on_battery else 1.0
+    if on_battery and measured and soc > 0:
+        k = max(0.0, min(k, m['bat'] / soc))  # Less battery draw than k·chip: the stack must not overshoot it.
+    elif on_battery and k * soc + modelled > 0:  # Estimated: every modelled part scaled down to the draw.
+        k *= max(0.0, min(1.0, m['bat'] / (k * soc + modelled)))
+    floor = min(soc, model['floor'] + idle)
     if total <= 0:
         floor = soc
     for name, weight in weights.items():
@@ -411,8 +496,6 @@ def attribute(m, model):
     idle = power.idle_parts(model, floor, k)
     if on_battery:
         rest = m['bat'] - k * soc
-        parts = {name: model[term] * (m.get(term) or 0) for name, term in DEVICES}
-        modelled = sum(parts.values())
         shrink = min(1.0, max(0.0, rest) / modelled) if modelled > 0 else 0.0
         devices = {name: watts * shrink for name, watts in parts.items() if watts * shrink > 0.005}
         groups['Display'] += devices.get('Display', 0)
@@ -534,17 +617,24 @@ def what_if(rows, energy, replicates=200, block=60, seed=0, model=None, train_ro
     before, 78% with hour blocks and 87% with whole days (and Student's t over
     them: few days spread too little); for closing an app 87%, 100% and 100%.
     Training groups don't overlap, so a resample just adds up each one's sums.
+    A two-stage model is evaluated and refitted on the minutes with chip power
+    (usable_rows), a one-stage one on all of them.
     """
     train_rows = train_rows or rows
     if len(rows) < 30 or len(train_rows) < 30 or not energy:
         return [], None
     model = model or fit_rows(train_rows)
+    rows, train_rows = usable_rows(rows, model), usable_rows(train_rows, model)
+    if len(rows) < 30 or len(train_rows) < 30:
+        return [], None
+    one = stages(model) == 1
     train = design(train_rows, model)
     levers = model_levers(model)
     # Each minute's settings against yours (design's columns), at their W each.
     effect = np.array([model.get(f'bat:{n}', 0.0) + model['chip'] * model.get(f'soc:{n}', 0.0) for n in levers])
     period = design(rows, model)
-    adjust = period[2][:, len(BATTERY_TERMS):] @ effect if levers else np.zeros(len(rows))
+    adjust = (period[2][:, len(ONE_STAGE_TERMS if one else BATTERY_TERMS):] @ effect if levers
+              else np.zeros(len(rows)))
     battery_y = period[3] - adjust
     items = candidates(rows, model)
     dt = np.array([m['dt'] for m in rows])
@@ -559,14 +649,15 @@ def what_if(rows, energy, replicates=200, block=60, seed=0, model=None, train_ro
     samples = collections.defaultdict(list)
     idle = {key: value for key, value in model.items() if key.startswith('idle_ghz')}  # Not refitted: clocks only.
     bounds, _ = resample_groups(train_rows, block, days)
-    sums = [np.array(part) for part in zip(*(gram(train[0][a:b], train[1][a:b]) + gram(train[2][a:b], train[3][a:b])
+    stage_pairs = ((2, 3),) if one else ((0, 1), (2, 3))  # (x, y) of each model design gave.
+    sums = [np.array(part) for part in zip(*(sum((gram(train[x][a:b], train[y][a:b]) for x, y in stage_pairs), ())
                                              for a, b in zip(bounds, bounds[1:])))]
     parts, by_day = resample_groups(rows, block, days)
     parts = [np.arange(a, b) for a, b in zip(parts, parts[1:])] if by_day else None  # Else moving blocks.
     for _ in range(replicates):
         counts = np.bincount(rng.integers(0, len(bounds) - 1, len(bounds) - 1), minlength=len(bounds) - 1).astype(float)
         total = [np.tensordot(counts, part, 1) for part in sums]
-        coef = dict(fit(*train, levers=levers, sums=(total[:2], total[2:])), **idle)
+        coef = dict(fit(*train, levers=levers, sums=(None, total) if one else (total[:2], total[2:])), **idle)
         index = (np.concatenate([parts[i] for i in rng.integers(0, len(parts), len(parts))]) if parts
                  else block_indices(len(rows), block, rng))
         for name, gain in evaluate(index, coef)[1].items():
@@ -583,7 +674,7 @@ def what_if(rows, energy, replicates=200, block=60, seed=0, model=None, train_ro
     return (sorted(estimates, key=lambda e: -e['minutes']),
             {'power': power, 'energy': energy, 'model': model, 'runtime_h': energy / power, 'rows': len(rows),
              'experiment_rows': sum(1 for m in rows if m.get('exp')), 'train_rows': len(train_rows),
-             'settings_w': float(np.average(adjust, weights=dt))})
+             'settings_w': float(np.average(adjust, weights=dt)), 'stages': stages(model)})
 
 
 # --- Experiments ------------------------------------------------------------------
@@ -1644,7 +1735,9 @@ def sleep_runtime(sleeps, energy_wh, z=1.2816, model=None):
 # --- Timeline --------------------------------------------------------------------
 
 def timeline(minutes, model):
-    """Per-minute stacks: [{'t', 'st', 'groups', 'apps', 'devices', 'idle', 'bat', 'pct'}]."""
+    """Per-minute stacks: [{'t', 'st', 'groups', 'apps', 'devices', 'idle', 'bat', 'pct'}] (attribute's:
+    on battery they add up to its draw, with either kind of model; on AC
+    without chip power they are empty, nothing being measured)."""
     out = []
     for m in minutes:
         parts = attribute(m, model)

@@ -709,6 +709,38 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(len(result['units']), 20)
 
 
+class NoChipPowerTests(unittest.TestCase):
+    """Days from a laptop without a chip power reading (no 'soc': most Intel
+    ones, RAPL being root-only): every part still shows, from the one-stage
+    model, and on AC there is nothing to split."""
+
+    def setUp(self):
+        for patch in hermetic() + quick() + [mock.patch.object(report, 'full_energy', lambda _minutes, **_: 50.0)]:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def test_every_part_loads_and_the_battery_is_split_by_the_one_stage_model(self):
+        now = time.time()
+        minutes, events = month(days=10, now=now)
+        minutes = [{k: v for k, v in m.items() if k != 'soc'} for m in minutes]
+        history = history_of(minutes, events)
+        for name, length in panel_data.PERIODS.items():
+            result = panel_data.gather(now - length, now, history)
+            self.assertEqual(result['errors'], {}, name)
+        self.assertEqual(report.stages(result['model']), 1)
+        battery = [p for p in result['points'] if p['st'] == 'D']
+        self.assertTrue(battery)
+        for p in battery:
+            self.assertAlmostEqual(sum(p['groups'].values()), p['bat'], delta=.05)
+        self.assertEqual([p['groups'] for p in result['points'] if p['st'] != 'D'],
+                         [{} for p in result['points'] if p['st'] != 'D'])
+        self.assertTrue(any(e['name'].startswith('Close ') for e in result['estimates']))
+        self.assertEqual(result['info']['stages'], 1)
+        self.assertTrue(panel_data.finite(result['typical']) and result['typical'] > 0)
+        self.assertIn('from battery power alone (no chip power reading)', panel_data.health_text(result['health']))
+        self.assertTrue(result['recs']['battery']['apply'])
+        self.assertTrue(all('minutes' in e for e in result['levers']['effects']))
+
 class ExperimentEffectsTests(unittest.TestCase):
     def test_combined_runs_are_left_to_the_setting_model(self):
         minutes, _ = month(days=5)
