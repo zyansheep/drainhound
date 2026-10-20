@@ -597,6 +597,23 @@ def abm_get():
     return read(paths[0]) if paths else None
 
 
+def wifi_stock(on_battery, interface):
+    """config [stock] wifi_ps for this power source; where that is None, the value
+    found before wattif experiment changed it, else 'on' (most drivers' default)."""
+    configured = stock_value('wifi_ps', on_battery)
+    if configured is not None:
+        if configured not in ('on', 'off'):
+            raise ValueError(f'config [stock] wifi_ps: {configured!r} is not on or off')
+        return configured
+
+    def read_now():
+        try:
+            return run(['iw', 'dev', interface, 'get', 'power_save']).split(':')[-1].strip() or None
+        except (OSError, RuntimeError, subprocess.SubprocessError):  # The interface is gone, iw missing.
+            return None
+    return found('wifi-ps', on_battery, read_now) or 'on'
+
+
 def abm_stock(on_battery):
     """config [stock] abm for this power source; where that is None, the value found
     there before wattif experiment changed it (None until seen)."""
@@ -814,7 +831,7 @@ def catalog(unit=None, units=None):
             lambda: run(['iw', 'dev', wifi, 'get', 'power_save']).split(':')[-1].strip(),  # Raises while gone.
             lambda v: lab('wifips', v),
             lambda cur: 'off' if cur == 'on' else 'on', root=True, visible='Network latency changes.',
-            levels=lambda: ('on', 'off'), baseline=lambda on: 'on'))
+            levels=lambda: ('on', 'off'), baseline=lambda on: wifi_stock(on, wifi)))
     if unit:
         specs.append(Setting(
             'freeze', f'Close {unit_label(unit)}', 'Freezes the app (cgroup freezer) to measure its cost.',

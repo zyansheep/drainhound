@@ -622,6 +622,22 @@ class ExperimentTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.run_experiment(cap, 8)
 
+    def test_wifi_power_saving_goes_back_to_what_was_found(self):
+        stock = experiment_module.config.SETTINGS['stock']
+        with mock.patch.object(experiment_module, 'run', return_value='\tPower save: off'), \
+                mock.patch.object(experiment_module, 'on_battery', return_value=True), \
+                mock.patch.object(experiment_module, 'held', return_value=False):
+            self.assertEqual(experiment_module.wifi_stock(True, 'wlan0'), 'off')  # Read before any change, kept.
+            with mock.patch.object(experiment_module, 'run', return_value='\tPower save: on'):
+                self.assertEqual(experiment_module.wifi_stock(True, 'wlan0'), 'off')
+            with mock.patch.dict(stock, {'wifi_ps': {'battery': 'on', 'ac': None}}):
+                self.assertEqual(experiment_module.wifi_stock(True, 'wlan0'), 'on')  # Configured wins.
+            with mock.patch.dict(stock, {'wifi_ps': 'maybe'}), self.assertRaises(ValueError):
+                experiment_module.wifi_stock(True, 'wlan0')
+        with mock.patch.object(experiment_module, 'on_battery', return_value=True), \
+                mock.patch.object(experiment_module, 'held', return_value=True):
+            self.assertEqual(experiment_module.wifi_stock(False, 'wlan0'), 'on')  # Never seen on AC: the default.
+
     def test_corrected_pcie_errors_count_only_after_a_link_change_on_a_quiet_boot(self):
         message = 'pcieport 0000:00:1c.0: AER: Correctable error message received from 0000:01:00.0'
         legacy = 'pcieport 0000:00:08.1: AER: Corrected error received: 0000:c1:00.0'
@@ -816,7 +832,8 @@ class ExperimentTests(unittest.TestCase):
     def test_stock_values_come_from_the_command_line(self):
         self.enterContext(self.authors_stock())  # Its udev rule: ABM 3 on battery, 0 on AC.
         catalog = self.real_catalog()
-        stock = {name: spec.stock_or_none(True) for name, spec in catalog.items() if name != 'refresh'}
+        with mock.patch.object(experiment_module, 'run', return_value='\tPower save: on'):  # iw, for Wi-Fi's stock.
+            stock = {name: spec.stock_or_none(True) for name, spec in catalog.items() if name != 'refresh'}
         self.assertEqual(stock, {'aspm': 'performance', 'apst': '0', 'boost': '0', 'abm': '3',
                                  'profile': 'power-saver', 'gpu-dpm': 'auto', 'cpu-cap': 'none',
                                  'throttle-apps': 'off', 'wifi-ps': 'on'})

@@ -102,6 +102,9 @@ DEFAULTS = {
         # CPU boost 0/1. None: as the profile leaves it (power-profiles-daemon on
         # amd-pstate turns it off under power-saver), else on.
         'boost': {'battery': None, 'ac': None},
+        # Wi-Fi power saving 'on'/'off'. None: as found before the first change
+        # (drivers and NetworkManager differ), else on.
+        'wifi_ps': {'battery': None, 'ac': None},
         'cpu_cap_mhz': 2000,  # The CPU frequency cap's power-saving value.
     },
     'experiments': {
