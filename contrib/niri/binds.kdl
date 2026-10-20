@@ -1,0 +1,5 @@
+// wattif in niri: add inside your `binds { }` block.
+Mod+Shift+B { spawn "wattif" "panel"; }
+// Votes from the keyboard, if you like them there too.
+// Mod+Shift+Equal { spawn "wattif" "vote" "up"; }
+// Mod+Shift+Minus { spawn "wattif" "vote" "down"; }

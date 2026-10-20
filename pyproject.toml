@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wattif"
+dynamic = ["version"]
+description = "Where a Linux laptop's battery goes, how long it will last, and what would make it last longer, measured on your machine by experiment"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.14"  # compression.zstd
+authors = [{ name = "zyansheep" }]
+keywords = ["battery", "power", "laptop", "linux", "waybar", "experiments"]
+classifiers = [
+  "Environment :: Console",
+  "Environment :: X11 Applications :: GTK",
+  "Intended Audience :: End Users/Desktop",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Topic :: System :: Hardware",
+  "Topic :: System :: Monitoring",
+  "Topic :: System :: Power (UPS)",
+]
+# The collector, votes, throttle and freeze need only the standard library;
+# the estimator, experiments and panel fit their models with NumPy and SciPy.
+dependencies = ["numpy>=1.26", "scipy>=1.11"]
+
+[project.optional-dependencies]
+# The panel: GTK 4, libadwaita and gtk4-layer-shell come from the system.
+panel = ["PyGObject>=3.48", "pycairo>=1.25"]
+
+[project.scripts]
+wattif = "wattif.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/zyansheep/wattif"
+
+[tool.setuptools.dynamic]
+version = { attr = "wattif.__version__" }
+
+[tool.setuptools.package-data]
+wattif = ["menu-theme.css"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py314"
+
+[tool.ruff.format]
+quote-style = "single"

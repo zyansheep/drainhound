@@ -8,6 +8,7 @@ wins). WATTIF_CONFIG names the one file to read instead (empty: none).
 """
 import copy
 import os
+import shlex
 import shutil
 import sys
 import tomllib
@@ -146,7 +147,7 @@ def self_command():
     """The command that runs this wattif: its entry point, or `python -m wattif`
     when run that way (children inherit it through WATTIF_SELF)."""
     if found := os.environ.get('WATTIF_SELF'):
-        return found.split('\0')
+        return shlex.split(found)
     if found := shutil.which(NAME):
         return [found]
     return [sys.executable, '-m', NAME]

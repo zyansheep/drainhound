@@ -6,6 +6,7 @@ Waybar reader start in a few milliseconds without loading numpy or GTK.
 import importlib
 import json
 import os
+import shlex
 import sys
 
 from . import __version__, config
@@ -45,7 +46,7 @@ def remember_self():
         return
     first = sys.argv[0]
     if first.endswith('__main__.py'):
-        os.environ['WATTIF_SELF'] = '\0'.join([sys.executable, '-m', config.NAME])
+        os.environ['WATTIF_SELF'] = shlex.join([sys.executable, '-m', config.NAME])
     elif os.path.isfile(first) and os.access(first, os.X_OK):
         os.environ['WATTIF_SELF'] = os.path.abspath(first)
 

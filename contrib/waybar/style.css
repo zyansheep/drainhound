@@ -1,0 +1,17 @@
+/* wattif's Waybar modules: append to your style.css. */
+#custom-wattif { padding: 0 8px; }
+#custom-wattif.charging { color: #8fdf8f; }
+#custom-wattif.low { color: #ef8585; }
+/* The last minutes before the battery cuts out: blink. */
+#custom-wattif.critical {
+  color: #ffffff;
+  background: #c0392b;
+  animation: wattif-blink 1s steps(2) infinite;
+}
+@keyframes wattif-blink { to { background: transparent; } }
+
+#custom-vote-up, #custom-vote-down { padding: 0 4px; }
+#custom-vote-up { color: #8fdf8f; }
+#custom-vote-down { color: #e5484d; }
+#custom-vote-up.recent { background: rgba(143, 223, 143, 0.22); }
+#custom-vote-down.recent, #custom-vote-down.resting { background: rgba(229, 72, 77, 0.22); }

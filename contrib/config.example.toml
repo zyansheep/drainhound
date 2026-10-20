@@ -1,0 +1,41 @@
+# ~/.config/wattif/config.toml (or /etc/wattif/config.toml). Every key is
+# optional; `wattif config` prints what is in effect.
+
+[battery]
+# Power off cleanly just before the battery cuts out, once one cut-out has
+# taught wattif where that is. Off by default (UPower may already act on low battery).
+poweroff = false
+notify = true
+
+[freeze]
+# Apps frozen (no CPU at all) after 30 minutes without focus, on battery.
+# Patterns match their systemd scopes (app-*-<name>-*.scope). Chat apps drop
+# their connections when frozen; pick apps that don't mind.
+apps = []
+
+[throttle]
+quota = 10     # % of one core for each unfocused app, on battery
+keep = []      # never throttled, besides terminals, editors and input methods
+
+[stock]
+# What settings go back to when experiments end, if not their boot-time value:
+# your power profile per power source, and amdgpu's panel power savings (ABM).
+profile = { battery = "power-saver", ac = "balanced" }
+# abm = { battery = 3, ac = 0 }
+
+[experiments]
+# Settings that can upset some hardware stay out of automatic runs unless
+# added with `wattif experiment pool add NAME --risky`.
+risky = ["aspm", "apst", "gpu-dpm"]
+
+[apps]
+# Your own names for executables in the breakdown, and timeline groups.
+# names = { "nm-sidebar-gui" = "Wi-Fi panel" }
+# groups = { "Browsers" = ["firefox", "chromium"], "Builds" = ["cc1", "rustc", "cargo"] }
+
+[panel]
+margin = 32    # px from the top of the screen (your bar's height)
+
+[waybar]
+glyphs = "fontawesome"   # or "text" if your bar has no Font Awesome
+signal = 12
