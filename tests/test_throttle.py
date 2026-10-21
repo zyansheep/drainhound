@@ -417,7 +417,8 @@ throttle.run(agent, pw_command=(sys.executable, '-c', 'import time; print("[]", 
                                          env={**os.environ, 'PYTHONPATH': os.pathsep.join(sys.path)})
                 try:
                     deadline = time.monotonic() + 20
-                    while capped.read_text().strip() == UNLIMITED and time.monotonic() < deadline:
+                    # Until capped: a read between the child's truncate and write sees ''.
+                    while capped.read_text().strip() != '5000 100000' and time.monotonic() < deadline:
                         time.sleep(0.05)
                     self.assertEqual(capped.read_text().strip(), '5000 100000')
                     child.send_signal(number)
