@@ -14,6 +14,8 @@
 # refuse (exit 75), so nothing undoes what sleep-safe restored on the way into
 # suspend. ./test-helper.sh checks this script against a fake /sys, /run and
 # /proc/cmdline.
+# `[ check ] && [[ check ]] || usage` is meant: usage exits.
+# shellcheck disable=SC2015
 set -euo pipefail
 shopt -s nullglob
 umask 077
