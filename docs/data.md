@@ -27,22 +27,22 @@ atomically.
 **`eta.json`** (the estimator, every 2 s; stale after 15 s): `updated`,
 `status`, `pct`, `energy_pct` (remaining *energy*, the fill), `energy_wh`,
 `watts`, `draw`, `hours`/`low`/`high` (time left and its 80% interval),
-`target` and `banked`* while charging, `cutout`/`poweroff` (epoch seconds,
-near the end), `sleep {hours, low, high, watts, suspends}`, `distribution
-{kind, t, p}`, and `waybar` (the label: `text`, `class`, `percentage`).
+`target` while charging, `banked`* plugged in or charging (time left if
+unplugged now), `cutout`/`poweroff` (epoch seconds, near the end), `sleep
+{hours, low, high, watts, suspends}`, `distribution {kind, t, p}`, and
+`waybar` (the label: `text`, `class`, `percentage`).
 
 **`futures.json`** (the estimator, at most every 30 s, and at once when the status
 changes): sampled futures of the battery level, for drawing the forecast. `updated`,
 `now` (when the runs start), `status`, `pct`, `cutoff_pct` (the charge % where
 the battery cuts out), `target` while charging, and up to two scenarios:
-`empty` (to the cutoff: on battery the forecast, while charging what unplugging
-now would do) and `full` (to `target`, while charging). Each has `n` (40),
+`empty` (to the cutoff: on battery the forecast, plugged in or charging what
+unplugging now would do) and `full` (to `target`, while charging). Each has `n` (40),
 `hours`/`low`/`high` (the median and 80% interval eta.json shows for it),
 `runs` (sorted by `end`, in minutes from `now`; `pts`: `[minutes, pct]` every
 ~2 minutes and where the run ends) and `median` (a run ending at `hours`). Run *k*
 ends exactly at the distribution's (*k* + ½)/`n` quantile, so counting the runs
-that have ended by a time gives the chance of that. Plugged in and not charging
-there are no scenarios.
+that have ended by a time gives the chance of that.
 
 **`snapshot.json`** (the collector, every 2 s): `timestamp`; `battery {title,
 rows: [{name, value, parts?}], footer}`, the battery use of the last 30

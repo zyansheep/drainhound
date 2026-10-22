@@ -1369,10 +1369,11 @@ class EtaTests(unittest.TestCase):
         self.assertAlmostEqual(futures['full']['median']['end'], 60 * estimate['hours'], delta=0.01)
         self.assertAlmostEqual(futures['empty']['median']['end'], 60 * estimate['banked'], delta=0.01)  # unplugged.
         (b / 'status').write_text('Not charging')
-        futures, _ = step()
+        futures, estimate = step()
         self.assertEqual(futures['status'], 'Not charging')
-        self.assertNotIn('empty', futures)                                   # Plugged in: no futures.
-        self.assertNotIn('full', futures)
+        self.assertAlmostEqual(futures['empty']['median']['end'], 60 * estimate['banked'], delta=0.01)  # Plugged in:
+        self.assertNotIn('full', futures)                                    # unplugged now, and nothing to charge.
+        self.assertNotIn('hours', estimate)
         live.runtime = self.root / 'run/futures.json' / 'run'                # One that can't be written
         (b / 'status').write_text('Discharging')
         out = live.estimate()                                                # is only reported.

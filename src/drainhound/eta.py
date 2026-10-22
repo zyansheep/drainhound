@@ -1633,6 +1633,13 @@ class Live:
             limit = state['limit'] or 100
             held = state['pct'] >= limit - 1.5
             text = f"{icon(PLUG)} " + ('held at limit' if held else 'on AC')
+            if energy is not None:
+                try:  # As while charging: what unplugging now would do, at the typical battery draw.
+                    banked, banked_low, banked_high = time_to_empty(params, energy, typical_draw(params))
+                    result.update(banked=banked, banked_low=banked_low, banked_high=banked_high)
+                    self.future['empty'] = (energy, typical_draw(params))
+                except Exception as error:  # noqa: BLE001
+                    self.complain('time if unplugged', error)
         result['text'], result['classes'] = text, classes
         return {'text': text, 'class': classes, 'percentage': fill, 'detail': result}
 
@@ -1654,12 +1661,12 @@ class Live:
 
     def publish_futures(self):
         """futures.json for the battery panel and menu: FUTURES sampled runs of the
-        draw model to the cutoff (`empty`: on battery the forecast, while charging
-        what unplugging now would do) and, while charging, of the charge curve to the
-        target (`full`), each landing at its quantile of the distribution eta.json
-        reports (empty_future, full_future). Rewritten at most every FUTURES_SECONDS,
-        and at once when the status kind changes; plugged in and not charging, or
-        with no estimate, it holds neither. A failure is reported, never raised."""
+        draw model to the cutoff (`empty`: on battery the forecast, plugged in or
+        charging what unplugging now would do) and, while charging, of the charge
+        curve to the target (`full`), each landing at its quantile of the
+        distribution eta.json reports (empty_future, full_future). Rewritten at most
+        every FUTURES_SECONDS, and at once when the status kind changes; with no
+        estimate it holds neither. A failure is reported, never raised."""
         future = self.future or {'kind': None, 'now': self.clock()}
         mono = self.monotonic()
         if future['kind'] == self.futures_kind and mono - self.futures_at < FUTURES_SECONDS:
