@@ -159,10 +159,11 @@ def polyline(cr, pts):
         cr.line_to(*p)
 
 
-def here_callout(cr, x, y, label, taken=(), bounds=None):
-    """You are here: a red dot with a soft halo on the line, and right above it a red callout pointing down
-    at it ("Here, 82%"); shifted aside, or below and pointing up, where that spot is taken (the boxes in
-    `taken`, x0, y0, x1, y1) or outside `bounds`. Returns the callout's box."""
+def here_callout(cr, x, y, label, taken=(), bounds=None, line=()):
+    """You are here: a red dot with a soft halo on the line, and a red callout pointing at it ("Here, 82%"):
+    right above it, unless that covers the trail behind (`line`, its points), something in `taken` (boxes
+    x0, y0, x1, y1: captions, landing dots) or leaves `bounds`; then aside, higher up on a longer tail, or
+    below pointing up, wherever covers least (never a caption or a dot, if it can help it). Returns its box."""
     cr.arc(x, y, 12, 0, 2 * math.pi)
     cr.set_source_rgba(*rgb(HERE, .16))
     cr.fill()
@@ -178,25 +179,31 @@ def here_callout(cr, x, y, label, taken=(), bounds=None):
     cr.stroke()
     w, h = measure(cr, label, 8.5, bold=True)
     bw, bh = w + 16, h + 6
-    spots = []  # (left, top, pointing up?, the tail's tip): above, centred first; then aside; then below.
+    spots = []  # (left, top, below?): right above first, then aside, then higher up, then below.
     for below in (False, True):
-        tip = y + CALLOUT_GAP if below else y - CALLOUT_GAP
-        top = tip + CALLOUT_TAIL if below else tip - CALLOUT_TAIL - bh
-        spots += [(left, top, below, tip) for left in (x - bw / 2, x - bw + 14, x - 14)]
+        for lift in (0, 16, 32):
+            near = y + CALLOUT_GAP + CALLOUT_TAIL + lift if below else y - CALLOUT_GAP - CALLOUT_TAIL - lift - bh
+            spots += [(left, near, below) for left in (x - bw / 2, x - 12, x - bw + 12)]
+    points = [(px, py) for px, py in line if math.hypot(px - x, py - y) > 13]
 
-    def clear(spot):
-        box = (spot[0], spot[1], spot[0] + bw, spot[1] + bh)
-        inside = not bounds or (bounds[0] <= box[0] and box[2] <= bounds[2] and bounds[1] <= box[1]
-                                and box[3] <= bounds[3])
-        return inside and not any(box[0] < t[2] and t[0] < box[2] and box[1] < t[3] and t[1] < box[3] for t in taken)
+    def cost(spot):
+        left, top, _ = spot
+        box = (left - 2, top - 2, left + bw + 2, top + bh + 2)
+        if bounds and not (bounds[0] <= box[0] and box[2] <= bounds[2] and bounds[1] <= box[1] and box[3] <= bounds[3]):
+            return math.inf
+        return (100 * sum(box[0] < t[2] and t[0] < box[2] and box[1] < t[3] and t[1] < box[3] for t in taken)
+                + sum(box[0] <= px <= box[2] and box[1] <= py <= box[3] for px, py in points))
 
-    left, top, below, tip = next((spot for spot in spots if clear(spot)), spots[0])
-    # The box and its tail as one red shape, rimmed in the ground's colour to stand off the lines behind.
+    left, top, below = min(spots, key=lambda spot: (cost(spot), spots.index(spot)))
+    # The box and its tail as one red shape, rimmed in the surface's colour to stand off the lines behind;
+    # the tail leaves the box's edge nearest the dot and ends just short of it.
+    base_y = top if below else top + bh
+    base_x = min(max(x, left + bh / 2 + 4), left + bw - bh / 2 - 4)
+    tip_y = y + CALLOUT_GAP if below else y - CALLOUT_GAP
     rounded(cr, left, top, bw, bh, bh / 2)
-    base = top if below else top + bh
-    cr.move_to(x - 5, base)
-    cr.line_to(x, tip)
-    cr.line_to(x + 5, base)
+    cr.move_to(base_x - 5, base_y)
+    cr.line_to(x, tip_y)
+    cr.line_to(base_x + 5, base_y)
     cr.close_path()
     cr.set_source_rgba(*rgb(SURFACE))
     cr.set_line_width(3)
@@ -476,8 +483,11 @@ class HeroChart(Chart):
         if not self.points:
             text(cr, 'No power-log data in this period', width / 2, Y(55), 10, MUTED, align='center')
         if now and finite(pct):
+            line = [(a[0] + (b[0] - a[0]) * k / n, a[1] + (b[1] - a[1]) * k / n)
+                    for points in trail for a, b in itertools.pairwise(points)
+                    for n in [max(1, math.ceil(math.dist(a, b) / 3))] for k in range(n)]
             here_callout(cr, xn, Y(pct), f'Here, {pct:.0f}%', [t for t in taken if t != here] + zones,
-                         (self.PL, 26, width - self.PR, ground - 4))
+                         (self.PL, 26, width - self.PR, ground - 4), line)
         self.draw_hover(cr, X, Y, width, height, futures)  # Last: over everything.
         # The header row.
         behind = {'6 h': 'BEHIND · LAST 6 H', 'Day': 'BEHIND · TODAY', 'Week': 'BEHIND · THIS WEEK'}.get(
