@@ -63,6 +63,14 @@ def text(cr, string, x, y, size=9.5, color=MUTED, bold=False, align='left', halo
     return w, h
 
 
+def measure(cr, string, size=9.5, bold=False):
+    """The (w, h) text() would draw `string` at, without drawing it."""
+    layout = PangoCairo.create_layout(cr)
+    layout.set_font_description(Pango.FontDescription.from_string(f"{FONT}{' Bold' if bold else ''} {size}"))
+    layout.set_text(string, -1)
+    return layout.get_pixel_size()
+
+
 def rounded(cr, x, y, w, h, r):
     r = min(r, w / 2, h / 2)
     cr.new_sub_path()
@@ -735,8 +743,9 @@ class PullChart(Chart):
                     cr.line_to(xs[0] + k + height, Y(0) - height)
                 cr.stroke()
                 cr.restore()
-                if xs[-1] - xs[0] > 90:
-                    text(cr, 'plugged in · chip only', (xs[0] + xs[-1]) / 2, Y(3.6), 7.5, MUTED, align='center')
+                label = 'plugged in · chip only'
+                if xs[-1] - xs[0] > measure(cr, label, 7.5)[0] + 16:  # Inside the stretch, clear of its neighbours.
+                    text(cr, label, (xs[0] + xs[-1]) / 2, Y(3.6), 7.5, MUTED, align='center')
                 continue
             cum = [0.0] * len(xs)
             for name in STACK:
