@@ -11,6 +11,7 @@ import time
 import types
 import unittest
 from pathlib import Path
+from statistics import NormalDist
 from unittest import mock
 
 import numpy as np
@@ -1289,11 +1290,100 @@ class EtaTests(unittest.TestCase):
         self.assertAlmostEqual(eta.usable_energy(1.0, 3.0, params, 'Ah', 15.4), 15.4)
         self.assertAlmostEqual(eta.usable_energy(1.0, 3.0, dict(params, median_volts=16.0)), 16.0)
 
+    def test_futures_land_at_the_quantiles_of_the_forecast(self):
+        params = dict(self.params, volts=[14.0 + 3.0 * p / 100 for p in range(101)], cutoff=0.06, level_var=0.004)
+        state = {'status': 'Discharging', 'pct': 40.0, 'charge': 1.2, 'full': 3.0, 'unit': 'Ah', 'nominal': None}
+        energy = eta.usable_energy(1.2, 3.0, params)
+        future = eta.empty_future(params, state, energy, 18.0)
+        self.assertEqual(future, eta.empty_future(params, state, energy, 18.0))      # The same runs every time.
+        runs = future['runs']
+        self.assertEqual((future['n'], len(runs)), (eta.FUTURES, eta.FUTURES))
+        for k, run in enumerate(runs):                                             # Run k lands at quantile (k + ½)/n,
+            q = (k + 0.5) / eta.FUTURES
+            self.assertAlmostEqual(run['end'], 60 * eta.empty_time(params, energy, 18.0, -NormalDist().inv_cdf(q)),
+                                   delta=0.01)
+            self.assertEqual(run['pts'][0], [0.0, 40.0])                           # from the charge now
+            self.assertEqual(run['pts'][-1][1], 2.0)                               # to the cutoff's 2%,
+            self.assertAlmostEqual(run['pts'][-1][0], run['end'], delta=0.051)     # where it lands,
+            pct = [p for _, p in run['pts']]
+            self.assertEqual(pct, sorted(pct, reverse=True))                       # never rising.
+        hours, low, high = eta.time_to_empty(params, energy, 18.0)
+        self.assertEqual((future['hours'], future['low'], future['high']), (hours, low, high))
+        self.assertAlmostEqual(future['median']['end'], 60 * hours, delta=0.01)   # The median is eta.json's hours,
+        self.assertLess(runs[3]['end'], 60 * low)                                  # and 4 of 40 land before its
+        self.assertLess(60 * low, runs[4]['end'])                                  # early end, 4 after its late one.
+        self.assertLess(runs[35]['end'], 60 * high)
+        self.assertLess(60 * high, runs[36]['end'])
+        self.assertIsNone(eta.empty_future(params, dict(state, charge=0.06), 0.0, 18.0))   # Nothing left.
+
+    def test_charging_futures_land_at_the_quantiles_of_the_curve(self):
+        params = dict(self.params, charge_sigma=0.3)
+        future = eta.full_future(params, 50.0, 90, None)
+        median, low, high = eta.time_to_full(params, 50.0, 90, None)
+        self.assertEqual((future['hours'], future['low'], future['high']), (median / 60, low / 60, high / 60))
+        self.assertAlmostEqual(future['median']['end'], median, delta=0.01)
+        for k, run in enumerate(future['runs']):
+            q = (k + 0.5) / eta.FUTURES
+            self.assertAlmostEqual(run['end'], median * math.exp(0.3 * NormalDist().inv_cdf(q)), delta=0.01)
+            self.assertEqual((run['pts'][0], run['pts'][-1][1]), ([0.0, 50.0], 90.0))
+            self.assertAlmostEqual(run['pts'][-1][0], run['end'], delta=0.051)
+            pct = [p for _, p in run['pts']]
+            self.assertEqual(pct, sorted(pct))                                     # Never falling.
+        self.assertIsNone(eta.full_future(params, 89.8, 90, None))                 # Already there.
+
+    def test_futures_of_a_battery_that_counts_energy(self):
+        params = dict(self.params, cutoff=0.8)
+        state = {'status': 'Discharging', 'pct': 60.0, 'charge': 30.0, 'full': 50.0, 'unit': 'Wh', 'nominal': None}
+        future = eta.empty_future(params, state, eta.usable_energy(30.0, 50.0, params, 'Wh'), 10.0)
+        for run in future['runs']:
+            self.assertEqual((run['pts'][0][1], run['pts'][-1][1]), (60.0, 1.6))   # 0.8 of 50 Wh: the cutoff at 1.6%.
+            # Energy and charge are one here: each point's percent is the Wh it has left.
+            self.assertTrue(all(1.6 <= p <= 60.0 for _, p in run['pts']))
+        self.assertAlmostEqual(future['hours'], eta.time_to_empty(params, 29.2, 10.0)[0])
+
+    def test_futures_json_follows_the_status(self):
+        b = battery(self.root, status='Discharging', current_now=1000000, voltage_now=15000000, charge_now=1500000,
+                    charge_full=3000000, charge_control_end_threshold=90, capacity=50)
+        clock = Clock()
+        live = make_live(self.root, clock)
+        live.params = dict(self.params, cutoff=0.06)
+        path = self.root / 'run/futures.json'
+
+        def step(seconds=2.0):
+            clock.tick(seconds)
+            out = live.estimate()
+            live.publish(out.pop('detail'), out)
+            return json.loads(path.read_text()), json.loads((self.root / 'run/eta.json').read_text())
+
+        futures, estimate = step()
+        self.assertEqual((futures['status'], futures['pct'], futures['cutoff_pct']), ('Discharging', 50.0, 2.0))
+        self.assertNotIn('full', futures)
+        self.assertAlmostEqual(futures['empty']['median']['end'], 60 * estimate['hours'], delta=0.01)
+        self.assertEqual((futures['empty']['low'], futures['empty']['high']), (estimate['low'], estimate['high']))
+        (b / 'charge_now').write_text('1450000')
+        self.assertEqual(step()[0]['updated'], futures['updated'])          # Within 30 s: not rewritten,
+        self.assertGreater(step(30)[0]['updated'], futures['updated'])      # after it, rewritten.
+        (b / 'status').write_text('Charging')
+        futures, estimate = step()                                           # A new status: rewritten at once,
+        self.assertEqual((futures['status'], futures['target']), ('Charging', 90))
+        self.assertAlmostEqual(futures['full']['median']['end'], 60 * estimate['hours'], delta=0.01)
+        self.assertAlmostEqual(futures['empty']['median']['end'], 60 * estimate['banked'], delta=0.01)  # unplugged.
+        (b / 'status').write_text('Not charging')
+        futures, _ = step()
+        self.assertEqual(futures['status'], 'Not charging')
+        self.assertNotIn('empty', futures)                                   # Plugged in: no futures.
+        self.assertNotIn('full', futures)
+        live.runtime = self.root / 'run/futures.json' / 'run'                # One that can't be written
+        (b / 'status').write_text('Discharging')
+        out = live.estimate()                                                # is only reported.
+        live.publish(out.pop('detail'), out)
+
     def test_countdown_format(self):
         self.assertEqual((eta.countdown(247.4), eta.countdown(41), eta.countdown(-2)), ('4m 07s', '41s', '0s'))
 
     def test_plus_minus_is_half_the_interval(self):
         self.assertIn('±0:15', eta.plus_minus(1.0, 1.5))
+        self.assertIn("underline='error'", eta.plus_minus(1.0, 1.5))      # The forecast's spread, wavy.
 
     def test_clock_format(self):
         self.assertEqual(eta.clock(1.5), '1:30')

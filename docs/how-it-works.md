@@ -92,6 +92,14 @@ that file, so the whole program agrees on one fit.
 - **Time to full** integrates the learned minutes-per-percent charge curve
   (constant current, then a taper), scaled by the last minutes' rate.
 
+**Futures** (`futures.json`, drawn by the panel and the menu): 40 sampled runs
+of the same models, minute by minute. Unplugged, the draw follows the
+Ornstein–Uhlenbeck process around a level drawn from its own uncertainty;
+charging, the learned curve runs at a rate drawn from its spread. The runs are
+then ranked by when they end and each is stretched in time to end at its
+quantile of the distribution above, so their ends are that distribution: one
+run in 40 is a 2.5% chance, and each run keeps a plausible shape on the way.
+
 **Empty is where the battery cuts out, which is often not 0%.** Many embedded
 controllers cut the power with charge still on the gauge; the laptop this grew
 on cut at ~1.8%, every time, with the loaded voltage still normal. drainhound

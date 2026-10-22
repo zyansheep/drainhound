@@ -31,6 +31,19 @@ atomically.
 near the end), `sleep {hours, low, high, watts, suspends}`, `distribution
 {kind, t, p}`, and `waybar` (the label: `text`, `class`, `percentage`).
 
+**`futures.json`** (the estimator, at most every 30 s, and at once when the status
+changes): sampled futures of the battery level, for drawing the forecast. `updated`,
+`now` (when the runs start), `status`, `pct`, `cutoff_pct` (the charge % where
+the battery cuts out), `target` while charging, and up to two scenarios:
+`empty` (to the cutoff: on battery the forecast, while charging what unplugging
+now would do) and `full` (to `target`, while charging). Each has `n` (40),
+`hours`/`low`/`high` (the median and 80% interval eta.json shows for it),
+`runs` (sorted by `end`, in minutes from `now`; `pts`: `[minutes, pct]` every
+~2 minutes and where the run ends) and `median` (a run ending at `hours`). Run *k*
+ends exactly at the distribution's (*k* + ½)/`n` quantile, so counting the runs
+that have ended by a time gives the chance of that. Plugged in and not charging
+there are no scenarios.
+
 **`snapshot.json`** (the collector, every 2 s): `timestamp`; `battery {title,
 rows: [{name, value, parts?}], footer}`, the battery use of the last 30
 minutes on battery, the five biggest then "Everything else (N)", so shares

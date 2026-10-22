@@ -74,6 +74,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from statistics import NormalDist
 
 # Before numpy: these are small matrices, and BLAS threads only contend for them
 # (a 226×76 least squares took 27 ms with 12 threads, 4 ms with one).
@@ -887,21 +888,25 @@ def full_distribution(median, sigma, low, high, points=96):
     return times, density(times, cdf), cdf
 
 
+def empty_time(params, energy, recent, z):
+    """Hours until empty with the horizon's average draw z standard deviations above
+    its median: solve T = energy / draw over T (z = 0 the median, +Z80 the early
+    end, −Z80 the late one; P(T ≤ hours) = Φ(−z))."""
+    hours = energy / max(recent, 1)
+    for _ in range(40):
+        mu, sigma = draw_lognormal(params, recent, hours * 60)
+        new = energy / max(math.exp(mu + z * sigma) * params['kappa'], 0.5)
+        if abs(new - hours) < 1e-4:
+            break
+        hours = new
+    return hours
+
+
 def time_to_empty(params, energy, recent):
     """Hours (median, low, high): solve T = energy / draw over T for each quantile (0 with nothing left)."""
     if energy <= 0:
         return 0.0, 0.0, 0.0
-    result = []
-    for index in (0, 2, 1):  # Median, then the high-draw (short) and low-draw (long) ends.
-        hours = energy / max(recent, 1)
-        for _ in range(40):
-            draw = horizon_draw(params, recent, hours * 60)[index] * params['kappa']
-            new = energy / max(draw, 0.5)
-            if abs(new - hours) < 1e-4:
-                break
-            hours = new
-        result.append(hours)
-    return tuple(result)
+    return tuple(empty_time(params, energy, recent, z) for z in (0.0, Z80, -Z80))  # The high draw ends early.
 
 
 def use_per_charge(params, charge_watts, energy_full):
@@ -918,13 +923,24 @@ def use_per_charge(params, charge_watts, energy_full):
     return charge_watts / median, charge_watts / high, charge_watts / low
 
 
+def charge_curve(params):
+    """Percent per minute at each whole percent: the learned curve, else a constant
+    current to 80% and then a taper."""
+    return params['charge_curve'] or [0.8 if p < 80 else max(0.2, 0.8 - (p - 80) * 0.06) for p in range(101)]
+
+
+def charge_scale(curve, pct, rate_now):
+    """How much faster than the curve the battery charges now (1 without a rate)."""
+    expected = curve[min(int(pct), 100)]
+    return min(3.0, max(0.25, rate_now / expected)) if rate_now and rate_now > 0 else 1.0
+
+
 def time_to_full(params, pct, target, rate_now):
     """Minutes (median, low, high) to reach `target` percent at the learned charge curve."""
-    curve = params['charge_curve'] or [0.8 if p < 80 else max(0.2, 0.8 - (p - 80) * 0.06) for p in range(101)]
+    curve = charge_curve(params)
     if pct >= target - 0.5:
         return 0.0, 0.0, 0.0
-    expected = curve[min(int(pct), 100)]
-    scale = min(3.0, max(0.25, rate_now / expected)) if rate_now and rate_now > 0 else 1.0
+    scale = charge_scale(curve, pct, rate_now)
     minutes = 0.0
     p = pct
     while p < target:
@@ -933,6 +949,120 @@ def time_to_full(params, pct, target, rate_now):
         p += step
     sigma = params['charge_sigma']
     return minutes, minutes * math.exp(-Z80 * sigma), minutes * math.exp(Z80 * sigma)
+
+
+# --- Futures (futures.json) ------------------------------------------------------------
+
+FUTURES = 40  # Sampled futures per scenario: run k lands at the forecast's (k + ½)/FUTURES quantile.
+FUTURES_SECONDS = 30  # futures.json is rewritten at most this often, and at once when the status changes.
+FUTURE_SEED = 1  # Fixed: runs keep their shapes from one rewrite to the next and move only with the forecast.
+FUTURE_HOURS = 48  # A run that hasn't landed by then ends there.
+WOBBLE_TAU, WOBBLE_SD = 8.0, 0.2  # The charge rate's minute-to-minute wobble: an OU in log rate (minutes, sd).
+
+
+def drain_runs(params, energy, recent, rng, n=FUTURES):
+    """n runs of the draw model from now until `energy` (usable Wh) is spent, as
+    (when each lands, in minutes; usable Wh left at each whole minute, n × minutes).
+    Minute by minute, the Ornstein–Uhlenbeck process in log watts draw_lognormal
+    describes, from log(recent) toward each run's own level (drawn from the level's
+    uncertainty), each minute spending kappa × its watts."""
+    tau, var, level = params['tau'], params['var'], params['level']
+    level_var = params.get('level_var')
+    if level_var is None:  # Models from before the level's variance was stored, as draw_lognormal.
+        level_var = var * 2 * tau / max(params.get('level_n') or 1, 1)
+    a = math.exp(-1 / tau)
+    step = math.sqrt(var * (1 - a * a))
+    levels = level + math.sqrt(max(level_var, 0.0)) * rng.standard_normal(n)
+    x = np.full(n, math.log(max(recent, 0.1)))
+    left, ends = np.full(n, float(energy)), np.full(n, np.nan)
+    path = [left]
+    for minute in range(1, FUTURE_HOURS * 60 + 1):
+        x = levels + a * (x - levels) + step * rng.standard_normal(n)
+        spend = params['kappa'] * np.exp(x) / 60
+        landing = np.isnan(ends) & (spend >= left)
+        ends[landing] = minute - 1 + left[landing] / spend[landing]
+        left = np.maximum(0.0, left - spend)
+        path.append(left)
+        if not np.isnan(ends).any():
+            break
+    ends[np.isnan(ends)] = len(path) - 1
+    return ends, np.array(path).T
+
+
+def charge_runs(params, pct, target, rate_now, rng, n=FUTURES):
+    """n runs of the charge curve from `pct` to `target`, as (when each lands, in
+    minutes; percent at each whole minute, n × minutes): the curve as time_to_full
+    scales it, each run at a rate drawn from its spread (charge_sigma), wobbling
+    minute to minute."""
+    curve = np.array(charge_curve(params), dtype=float)
+    rates = charge_scale(curve, pct, rate_now) * np.exp(params['charge_sigma'] * rng.standard_normal(n))
+    b = math.exp(-1 / WOBBLE_TAU)
+    z = rng.standard_normal(n)
+    p, ends = np.full(n, float(pct)), np.full(n, np.nan)
+    path = [p]
+    for minute in range(1, FUTURE_HOURS * 60 + 1):
+        z = b * z + math.sqrt(1 - b * b) * rng.standard_normal(n)
+        rate = curve[np.minimum(p.astype(int), 100)] * rates * np.exp(WOBBLE_SD * z)
+        landing = np.isnan(ends) & (p + rate >= target)
+        ends[landing] = minute - 1 + (target - p[landing]) / rate[landing]
+        p = np.minimum(float(target), p + rate)
+        path.append(p)
+        if not np.isnan(ends).any():
+            break
+    ends[np.isnan(ends)] = len(path) - 1
+    return ends, np.array(path).T
+
+
+def landed(ends, values, final, quantile, median, hours, low, high):
+    """futures.json's scenario: the runs ranked by when they land, run k stretched in
+    time to land at quantile((k + ½)/n) (minutes) and the middle one again at the
+    median, every 2 minutes (of its own time) and where it lands, at `final` percent."""
+    n = len(ends)
+
+    def run(i, end):
+        whole = int(ends[i])
+        minutes = list(range(0, whole + 1, 2))
+        points = [[m, values[i][m]] for m in minutes]
+        if ends[i] > minutes[-1]:
+            points.append([ends[i], final])
+        else:
+            points[-1][1] = final
+        f = end / ends[i] if ends[i] > 0 else 1.0
+        points = [[round(float(m * f), 1), round(float(v), 2)] for m, v in points]
+        points[-1][0] = round(float(end), 1)  # Exactly where it lands, whatever the rounding.
+        return {'end': round(float(end), 2), 'pts': points}
+
+    order = np.argsort(ends, kind='stable')
+    runs = [run(i, quantile((k + 0.5) / n)) for k, i in enumerate(order)]
+    return {'n': n, 'hours': hours, 'low': low, 'high': high, 'runs': runs, 'median': run(order[n // 2], median)}
+
+
+def empty_future(params, state, energy, recent, n=FUTURES):
+    """futures.json's `empty`: n runs from now to the cutoff (as charge percent, through
+    the inverse of usable_energy, so the voltage curve and the cutoff count), landing
+    at the quantiles of time_to_empty's distribution; None with nothing left."""
+    if energy <= 0 or not state.get('full'):
+        return None
+    hours, low, high = time_to_empty(params, energy, recent)
+    ends, left = drain_runs(params, energy, recent, np.random.default_rng(FUTURE_SEED), n)
+    unit, full = state.get('unit', 'Ah'), state['full']
+    charges = np.linspace(min(params.get('cutoff') or 0.0, state['charge']), state['charge'], 60)
+    usable = [usable_energy(q, full, params, unit, state.get('nominal')) for q in charges]
+    pct = np.interp(left, usable, 100 * charges / full)
+    quantile = lambda q: 60 * empty_time(params, energy, recent, -NormalDist().inv_cdf(q))
+    return landed(ends, pct, float(100 * charges[0] / full), quantile, 60 * hours, hours, low, high)
+
+
+def full_future(params, pct, target, rate_now, n=FUTURES):
+    """futures.json's `full`: n runs from `pct` to `target`, landing at the quantiles of
+    full_distribution's log-normal; None when already there."""
+    median, low, high = time_to_full(params, pct, target, rate_now)
+    if median <= 0:
+        return None
+    ends, path = charge_runs(params, pct, target, rate_now, np.random.default_rng(FUTURE_SEED + 1), n)
+    sigma = params['charge_sigma']
+    quantile = lambda q: median * math.exp(sigma * NormalDist().inv_cdf(q))
+    return landed(ends, path, float(target), quantile, median, median / 60, low / 60, high / 60)
 
 
 # --- Live loop ----------------------------------------------------------------------
@@ -965,8 +1095,10 @@ def icon(glyph):
 
 
 def plus_minus(low, high):
-    """Half the 80% interval as one ± figure (the interval is close to symmetric)."""
-    return f"<span size='small' alpha='70%'>±{clock((high - low) / 2)}</span>"
+    """Half the 80% interval as one ± figure (the interval is close to symmetric),
+    with a wavy underline: the forecast's spread. Pango draws it in the label's own
+    colour (red when low), so it carries no colour of its own."""
+    return f"<span size='small' alpha='70%' underline='error'>±{clock((high - low) / 2)}</span>"
 
 
 RECOMMEND_KEYS = ('text', 'apply', 'change', 'gain', 'interval', 'delight')
@@ -1079,6 +1211,8 @@ class Live:
         self.mains_since = None  # Boot time mains came online while the battery went on discharging.
         self.fitting, self.next_fit = None, 0.0
         self.params = dict(DEFAULTS)
+        # What the last estimate's futures start from (see publish_futures), and when futures.json was written.
+        self.future, self.futures_at, self.futures_kind = None, -math.inf, None
         self.load_cutoff()
 
     def load_cutoff(self):
@@ -1393,7 +1527,8 @@ class Live:
         draw = (recent or typical) * weight + typical * (1 - weight)
         median, low, high = time_to_empty(params, energy, draw)
         times, pdf, _ = empty_distribution(params, energy, draw, low, high)
-        return {'hours': median, 'low': low, 'high': high, 'draw': draw, 'times': times, 'pdf': pdf}
+        return {'hours': median, 'low': low, 'high': high, 'draw': draw, 'times': times, 'pdf': pdf,
+                'energy': energy}
 
     def estimate(self):
         now, mono = self.clock(), self.monotonic()
@@ -1401,6 +1536,7 @@ class Live:
             self.samples.clear()  # A suspend (or a stall): readings before it don't belong to the trend.
             self.mains_since = None
         self.last = mono
+        self.future = {'kind': None, 'now': now}
         state = self.sample(mono)
         # Only a reading that qualifies again carries it on (and one of the same batteries: repack).
         due, self.due = self.due, None
@@ -1414,6 +1550,7 @@ class Live:
         if state['unit'] != self.params.get('cutoff_unit', 'Ah') or state['unit'] != self.cutoff_read:
             self.load_cutoff()  # A battery in another unit than the cutoff (the first reading, a new battery).
         params = self.params
+        self.future = {'kind': state['kind'], 'now': now, 'state': state, 'params': params}
         result = {'status': state['status'], 'pct': state['pct'], 'watts': state['watts'], 'updated': now}
         try:
             energy_full = usable_energy(state['full'], state['full'], params, state['unit'], state['nominal'])
@@ -1467,6 +1604,7 @@ class Live:
                 result.update(hours=seconds / 3600, low=timing['early'] / 3600, high=timing['late'] / 3600)
                 if forecast:
                     result['draw'] = forecast['draw']
+                    self.future['empty'] = (forecast['energy'], forecast['draw'])
                     result['distribution'] = {'kind': 'empty', 't': [round(t, 4) for t in forecast['times']],
                                               'p': [round(v, 5) for v in forecast['pdf']]}
                 if seconds < 1800 or fill <= 10:
@@ -1512,6 +1650,41 @@ class Live:
             temporary.replace(self.runtime / 'eta.json')
         except Exception as error:  # noqa: BLE001
             self.complain('eta.json', error)
+        self.publish_futures()
+
+    def publish_futures(self):
+        """futures.json for the battery panel and menu: FUTURES sampled runs of the
+        draw model to the cutoff (`empty`: on battery the forecast, while charging
+        what unplugging now would do) and, while charging, of the charge curve to the
+        target (`full`), each landing at its quantile of the distribution eta.json
+        reports (empty_future, full_future). Rewritten at most every FUTURES_SECONDS,
+        and at once when the status kind changes; plugged in and not charging, or
+        with no estimate, it holds neither. A failure is reported, never raised."""
+        future = self.future or {'kind': None, 'now': self.clock()}
+        mono = self.monotonic()
+        if future['kind'] == self.futures_kind and mono - self.futures_at < FUTURES_SECONDS:
+            return
+        self.futures_at, self.futures_kind = mono, future['kind']
+        try:
+            data = {'updated': self.clock(), 'now': future['now']}
+            state, params = future.get('state'), future.get('params')
+            if state:
+                cutoff = min(params.get('cutoff') or 0.0, state['charge'])
+                data.update(status=state['status'], pct=state['pct'],
+                            cutoff_pct=100 * cutoff / state['full'] if state.get('full') else 0.0)
+            if future.get('full'):
+                data['target'] = future['full'][1]
+                if (full := full_future(params, *future['full'])) is not None:
+                    data['full'] = full
+            if (future.get('empty') and future['empty'][0] is not None
+                    and (empty := empty_future(params, state, *future['empty'])) is not None):
+                data['empty'] = empty
+            self.runtime.mkdir(parents=True, exist_ok=True)
+            temporary = self.runtime / 'futures.tmp'
+            temporary.write_text(json.dumps(data, separators=(',', ':')))
+            temporary.replace(self.runtime / 'futures.json')
+        except Exception as error:  # noqa: BLE001
+            self.complain('futures.json', error)
 
     def charging(self, state, params, energy, energy_full, result, mono):
         target = state['limit'] or 100
@@ -1533,6 +1706,8 @@ class Live:
         # battery draw (not the AC draw), the same number shown while discharging.
         banked, banked_low, banked_high = time_to_empty(params, energy, typical_draw(params))
         result.update(banked=banked, banked_low=banked_low, banked_high=banked_high)
+        # The futures: charging to the target, and (as banked) unplugged now at the typical draw.
+        self.future.update(empty=(energy, typical_draw(params)), full=(state['pct'], target, rate))
         # Both ranges are wide (≈±20% / ±30%), so the label shows ~ and leaves them to the menu.
         return (f"{icon(BOLT)} {APPROX}{clock(banked)} <span size='small' alpha='70%'>full ~{clock(median / 60)}</span> "
                 f"<span size='small' alpha='70%'>{abs(state['watts']):.0f}W</span>")
