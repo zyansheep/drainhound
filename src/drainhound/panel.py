@@ -32,11 +32,11 @@ from . import experiment  # noqa: E402
 from . import qol  # noqa: E402
 from . import report  # noqa: E402
 from . import trail  # noqa: E402
-from .panel_data import (GONE, NOTE_SECONDS, History, answers, apply_note, banner_text, command_note,  # noqa: E402
-                         duration, finite, gather, ghost, health_text, interaction_clear, lever_rows,
-                         long_duration, no_levers, picker, processes, pull_labels, read_battery, read_estimate,
-                         read_futures, read_snapshot, state_text, typical_text, value_text, ways, week_sleeps,
-                         what_if_note)
+from .panel_data import (AHEAD, GONE, NOTE_SECONDS, History, ahead_of, answers, apply_note,  # noqa: E402
+                         banner_text, command_note, duration, finite, gather, ghost, health_text, interaction_clear,
+                         lever_rows, long_duration, no_levers, picker, processes, pull_labels, read_battery,
+                         read_estimate, read_futures, read_snapshot, state_text, typical_text, value_text, ways,
+                         week_sleeps, what_if_note)
 from .panel_data import chart_colors  # noqa: E402
 from .report import PHRASES, gain_parts  # noqa: E402
 
@@ -91,7 +91,7 @@ def render(directory, range_name='Day', offset=0):
     hero.set_live(read_futures(RUNTIME / 'futures.json', now), (estimate or {}).get('pct'), now)
     pull.set_data(result.get('points') or [], result.get('span') or (end - length, end), at_now)
     pull.set_labels(pull_labels(read_snapshot(RUNTIME / 'snapshot.json', now)))
-    pull.set_now(now)
+    pull.set_now(now, ahead_of(read_futures(RUNTIME / 'futures.json', now)) if at_now else AHEAD)
     for name, chart, height in (('hero', hero, 304), ('pull', pull, 176)):
         surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, 840, height)
         cr = cairo.Context(surface)
@@ -1377,7 +1377,7 @@ class BatteryPanel(Adw.Application):
         snapshot = read_snapshot(RUNTIME / 'snapshot.json', now)
         labels = pull_labels(snapshot)
         self.pull.set_labels(labels if self.offset == 0 else None)
-        self.pull.set_now(now)
+        self.pull.set_now(now, ahead_of(self.futures) if self.offset == 0 else AHEAD)
         live = labels and self.offset == 0 and finite(labels.get('total'))
         self.pull_now.set_text(f"{labels['total']:.1f} W" if live else '')
         self.pull_now.set_visible(bool(live))

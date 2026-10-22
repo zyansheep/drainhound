@@ -909,6 +909,37 @@ class TrailTests(unittest.TestCase):
         self.assertTrue(all(abs(b - a) < 0.05 for a, b in itertools.pairwise(steps)))  # The scale eases: no corner.
         plain = panel_data.time_axis(start, now, 0.0, 800.0)
         self.assertEqual((plain(start), plain(now), plain.zoom, plain.now), (0.0, 800.0, 1.0, None))
+        far = panel_data.time_axis(start, now, 0.0, 800.0, now, 12 * 3600)  # Ahead narrower than behind.
+        self.assertAlmostEqual(far(now + 12 * 3600), 800.0)
+        self.assertEqual(far.end, now + 12 * 3600)
+        self.assertLess(far.zoom, 1)
+        self.assertTrue(all(b > a for a, b in itertools.pairwise(far(now + d) for d in range(-3600, 3601, 30))))
+
+    def test_ahead_reaches_the_last_future_in_half_hours(self):
+        self.assertEqual(panel_data.ahead_of(None), panel_data.AHEAD)
+        self.assertEqual(panel_data.ahead_of(self.futures()), panel_data.AHEAD)  # They land within 2¾ h.
+        late = dict(self.futures(), empty={'runs': [self.line(e) for e in (150.0, 200.0)]})
+        self.assertEqual(panel_data.ahead_of(late), 4 * 3600)  # 200 min, a tenth more and 10 min: 3 h 50 → 4 h.
+        days = dict(self.futures(), empty={'runs': [self.line(40 * 60.0)]})
+        self.assertEqual(panel_data.ahead_of(days), panel_data.AHEAD_MAX)
+        self.assertEqual([panel_data.ahead_text(s) for s in (165 * 60, 3 * 3600, 1800, 13.5 * 3600)],
+                         ['2¾ H', '3 H', '½ H', '13½ H'])
+
+    def test_landing_dots_shrink_to_fit_their_room(self):
+        xs = [100.0] * 12
+        dots, r, pitch = panel_data.fit_stack(xs, 100)
+        self.assertEqual((r, max(j for _, j in dots)), (2.2, 11))  # Room enough: as drawn before.
+        dots, r, pitch = panel_data.fit_stack(xs, 40)
+        self.assertLess(r, 2.2)
+        self.assertLessEqual((max(j for _, j in dots) + 1) * pitch, 40)
+        self.assertEqual(panel_data.fit_stack(xs, 5)[1], 1.2)  # No smaller than that, room or not.
+
+    def test_the_level_behind_breaks_where_the_laptop_was_off_but_not_asleep(self):
+        levels = [(t, 50.0) for t in (0, 300, 600)] + [(t, 40.0) for t in (4200, 4500)] + [(t, 30.0) for t in (9000,)]
+        segments, gaps = panel_data.level_segments(levels, [{'start': 4600, 'end': 8900}])
+        self.assertEqual([len(s) for s in segments], [3, 3])  # Off from 600 to 4200; asleep from 4500 to 9000.
+        self.assertEqual(gaps, [(600, 4200)])
+        self.assertEqual(panel_data.level_segments([]), ([], []))
 
     def test_landing_dots_stack_in_columns_and_this_weeks_sleeps_are_by_day(self):
         self.assertEqual(panel_data.dot_stack([10.0, 11.0, 30.0, 10.4], 5.0), [(10.0, 0), (10.0, 1), (10.0, 2),

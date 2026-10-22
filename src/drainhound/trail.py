@@ -16,7 +16,19 @@ gi.require_version("PangoCairo", "1.0")
 from gi.repository import Gtk, Pango, PangoCairo
 
 from . import report
-from .panel_data import AHEAD, chart_colors, dot_stack, finite, hhmm, readout, time_axis
+from .panel_data import (
+    AHEAD,
+    OFF_GAP,
+    ahead_of,
+    ahead_text,
+    chart_colors,
+    finite,
+    fit_stack,
+    hhmm,
+    level_segments,
+    readout,
+    time_axis,
+)
 
 # The night-trail palette: three signal colours with fixed jobs (moss: gains and charging, rust: drains
 # and the cutoff, sky: sleep and a previewed change), bone for the trail and text, red for "you are here".
@@ -69,6 +81,44 @@ def measure(cr, string, size=9.5, bold=False):
     layout.set_font_description(Pango.FontDescription.from_string(f"{FONT}{' Bold' if bold else ''} {size}"))
     layout.set_text(string, -1)
     return layout.get_pixel_size()
+
+
+def frange(a, b, step):
+    """a to b inclusive, at most `step` apart."""
+    n = max(1, math.ceil((b - a) / step))
+    return [a + (b - a) * k / n for k in range(n + 1)]
+
+
+def caption(cr, lines, spots, taken, bounds):
+    """Lines of text [(string, size, colour, bold)] at the first spot (x, y, align) whose box lies inside
+    bounds (x0, y0, x1, y1) and clear of the boxes in `taken`, else the first spot. Its box joins `taken`."""
+    sizes = [measure(cr, string, size, bold) for string, size, _, bold in lines]
+    w, h = max(sw for sw, _ in sizes), sum(sh for _, sh in sizes)
+
+    def box(spot):
+        x, y, align = spot
+        x0 = x - w if align == 'right' else x
+        return x0 - 2, y - 1, x0 + w + 2, y + h + 1
+
+    def fits(b):
+        return (bounds[0] <= b[0] and b[2] <= bounds[2] and bounds[1] <= b[1] and b[3] <= bounds[3]
+                and not any(b[0] < t[2] and t[0] < b[2] and b[1] < t[3] and t[1] < b[3] for t in taken))
+
+    x, y, align = next((spot for spot in spots if fits(box(spot))), spots[0])
+    taken.append(box((x, y, align)))
+    for (string, size, color, bold), (_, sh) in zip(lines, sizes):
+        text(cr, string, x, y, size, color, bold=bold, align=align, halo=SURFACE)
+        y += sh
+
+
+def stack_columns(dots, r, pitch, base, direction):
+    """The box (x0, y0, x1, y1) of each column of landing dots [(x, j)], stacked from `base` down
+    (direction 1) or up (-1)."""
+    rows = {}
+    for x, j in dots:
+        rows[x] = max(rows.get(x, 0), j + 1)
+    return [(x - r, min(base, base + direction * n * pitch), x + r, max(base, base + direction * n * pitch))
+            for x, n in rows.items()]
 
 
 def rounded(cr, x, y, w, h, r):
@@ -132,13 +182,15 @@ def here_marker(cr, x, y, label=None, avoid=(), bounds=None):
     w, h = layout.get_pixel_size()
     tw = w + 16
 
-    def clear(tx, ty):  # The tag's right end at tx, its middle at ty.
+    def hits(spot):  # The tag's right end at tx, its middle at ty: what it would cover; outside bounds is worst.
+        tx, ty = spot
         if bounds and not (bounds[0] <= tx - tw and tx <= bounds[2] and bounds[1] <= ty - 10 and ty + 10 <= bounds[3]):
-            return False
-        return not any(tx - tw - 6 <= px <= tx + 6 and ty - 16 <= py <= ty + 16 for px, py in avoid)
+            return len(avoid) + 1
+        return sum(tx - tw - 6 <= px <= tx + 6 and ty - 16 <= py <= ty + 16 for px, py in avoid)
 
-    tx, ty = next(((x + dx, y + dy) for dx, dy in ((-12, -54), (-12, 54), (-40, -88), (-40, 88), (-90, -30),
-                                                   (-90, 34), (-12, -120)) if clear(x + dx, y + dy)), (x - 12, y - 54))
+    spots = [(x + dx, y + dy) for dx, dy in ((-12, -54), (-12, 54), (-40, -88), (-40, 88), (-90, -30), (-90, 34),
+                                             (-12, -120), (-150, -24), (-150, 28))]
+    tx, ty = min(spots, key=lambda spot: (hits(spot), spots.index(spot)))  # The first clear one, else the least covered.
     cr.move_to(x - 2.5, y + (5.5 if ty > y else -5.5))
     cr.line_to(tx - 8, ty + (-9 if ty > y else 9))
     cr.set_source_rgba(*rgb(HERE))
@@ -182,8 +234,9 @@ def paw(cr, x, y, scale, color):
     cr.restore()
 
 
-def ticks(start, end, now):
-    """The time axis: hours behind (every 4 h in a day, days in a week), half hours ahead."""
+def ticks(start, end, now, ahead=AHEAD):
+    """The time axis: hours behind (every 4 h in a day, days in a week); ahead half hours, or hours (2 h,
+    4 h) when it looks further."""
     span = (now or end) - start
     step = 3600 if span <= 8 * 3600 else 4 * 3600 if span <= 30 * 3600 else 86400
     day = time.localtime(start)
@@ -196,10 +249,13 @@ def ticks(start, end, now):
         if t > start:
             out.append((t, time.strftime('%a %-d' if step == 86400 else '%H:%M', time.localtime(t)), True))
     if now:
-        t = math.ceil((now + 60) / 1800) * 1800
-        while t <= now + AHEAD:
-            out.append((t, hhmm(t), time.localtime(t).tm_min == 0))
-            t += 1800
+        step = 1800 if ahead <= 3.5 * 3600 else 3600 if ahead <= 8 * 3600 else 7200 if ahead <= 16 * 3600 else 14400
+        today = time.localtime(now)
+        midnight = time.mktime((today.tm_year, today.tm_mon, today.tm_mday, 0, 0, 0, 0, 0, -1))
+        t = midnight + math.ceil((now + 60 - midnight) / step) * step
+        while t <= now + ahead:
+            out.append((t, hhmm(t), step > 1800 or time.localtime(t).tm_min == 0))
+            t += step
     return out
 
 
@@ -282,7 +338,7 @@ class HeroChart(Chart):
     def axis(self, width):
         start, end = self.span
         now = (self.now or time.time()) if self.at_now else None
-        return time_axis(start, end, self.PL, width - self.PR, now)
+        return time_axis(start, end, self.PL, width - self.PR, now, ahead_of(self.futures))
 
     def render(self, cr, width, height):
         X = self.axis(width)
@@ -334,36 +390,58 @@ class HeroChart(Chart):
             cr.set_source_rgba(*rgb(RULE))
             cr.stroke()
             text(cr, f'{p}%', self.PL - 6, Y(p) - 7, 7.5, FAINT, align='right')
-        for t, label, major in ticks(start, behind_end, now):
+        for t, label, major in ticks(start, behind_end, now, X.end - now if now else 0):
             x = round(X(t)) + .5
             cr.move_to(x, Y(100))
             cr.line_to(x, Y(0))
             cr.set_source_rgba(*rgb(RULE, .55 if major else .3))
             cr.stroke()
             text(cr, label, x, height - 17, 7.5 if major else 7, FAINT if major else DIM, align='center')
-        past = [(X(t), Y(p)) for t, p in past_levels(self.points, start, behind_end)]
+        levels = past_levels(self.points, start, behind_end)
+        segments, gaps = level_segments(levels, self.sleeps)
         futures = self.futures if now else None
         pct = (futures or {}).get('pct') if finite((futures or {}).get('pct')) else self.level
         if now and finite(pct):
-            past.append((xn, Y(pct)))
+            if segments and now - levels[-1][0] <= OFF_GAP:
+                segments[-1].append((now, pct))
+            else:
+                gaps += [(levels[-1][0], now)] if levels else []
+                segments.append([(now, pct)])
+        trail = [[(X(t), Y(p)) for t, p in segment] for segment in segments]
+        taken = []
         if now:
-            text(cr, f'ahead drawn ×{X.zoom:.1f} wider' if X.zoom > 1.05 else '', width - self.PR - 4, ground - 17, 7,
-                 FAINT, italic=True, align='right')
-            self.draw_ahead(cr, X, Y, width, ground, futures)
-        if past:
-            cr.set_line_cap(cairo.LINE_CAP_ROUND)
-            cr.set_line_join(cairo.LINE_JOIN_ROUND)
+            zoom = (f'ahead drawn ×{X.zoom:.1f} wider' if X.zoom > 1.05 else
+                    f'ahead drawn {1 / X.zoom:.1f}× narrower' if X.zoom < .95 else '')
+            text(cr, zoom, width - self.PR - 4, ground - 17, 7, FAINT, italic=True, align='right')
+            taken = self.draw_ahead(cr, X, Y, width, ground, futures, (xn, Y(pct)) if finite(pct) else None)
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.set_line_join(cairo.LINE_JOIN_ROUND)
+        # Off (no readings outside a suspend): dotted across, since the level changed unseen.
+        for (a, b), before, after in zip(gaps, trail, trail[1:]):
+            cr.set_dash([1, 4])
+            cr.move_to(*before[-1])
+            cr.line_to(*after[0])
+            cr.set_source_rgba(*rgb(BONE, .45))
+            cr.set_line_width(1.6)
+            cr.stroke()
+            cr.set_dash([])
+            if X(b) - X(a) > 30 and len(gaps) <= 3:  # A week of nights: the dotted lines say it.
+                text(cr, 'off', (X(a) + X(b)) / 2, Y(100) + 4, 8, MUTED, align='center')
+        for line in trail:
             for w, a in ((6, .09), (2.2, 1)):
-                smooth(cr, past)
+                smooth(cr, line)
+                if len(line) == 1:
+                    cr.line_to(*line[0])  # A lone reading: a round dot.
                 cr.set_source_rgba(*rgb(BONE, a))
                 cr.set_line_width(w)
                 cr.stroke()
-        elif not self.points:
+        if not self.points:
             text(cr, 'No power-log data in this period', width / 2, Y(55), 10, MUTED, align='center')
         if now and finite(pct):
             dense = [(a[0] + (b[0] - a[0]) * k / 4, a[1] + (b[1] - a[1]) * k / 4)
-                     for a, b in itertools.pairwise(past) for k in range(4)]
-            here_marker(cr, xn, Y(pct), f'You are here · {pct:.0f}%', dense, (self.PL, Y(100), xn, Y(0)))
+                     for line in trail for a, b in itertools.pairwise(line) for k in range(4)]
+            dense += [(x, y) for x0, y0, x1, y1 in taken for x in frange(x0, x1, 6) for y in frange(y0, y1, 6)]
+            here_marker(cr, xn, Y(pct), f'You are here · {pct:.0f}%', dense, (self.PL, 26, xn, Y(0)))
         self.draw_hover(cr, X, Y, width, height, futures)  # Last: over everything.
         # The header row.
         behind = {'6 h': 'BEHIND · LAST 6 H', 'Day': 'BEHIND · TODAY', 'Week': 'BEHIND · THIS WEEK'}.get(
@@ -371,7 +449,7 @@ class HeroChart(Chart):
         text(cr, behind if now else self.range_name.upper(), self.PL + 4, 9, 7.5, MUTED, bold=True, spacing=1.2)
         if now:
             text(cr, f'NOW {hhmm(now)}', xn - 7, 9, 7.5, BONE, bold=True, align='right', spacing=1)
-            text(cr, 'AHEAD · 2¾ H', xn + 7, 9, 7.5, MUTED, bold=True, spacing=1.2)
+            text(cr, f'AHEAD · {ahead_text(X.end - now)}', xn + 7, 9, 7.5, MUTED, bold=True, spacing=1.2)
             kx = width - self.PR - 170
             cr.move_to(kx, 14)
             for dx, dy in ((9, -4), (9, 3), (8, -5)):
@@ -390,17 +468,22 @@ class HeroChart(Chart):
             cr.stroke()
             cr.set_dash([])
 
-    def draw_ahead(self, cr, X, Y, width, ground, futures):
-        """The futures, their landing dots, brackets around the middle 8 in 10, and what each fan is."""
+    def draw_ahead(self, cr, X, Y, width, ground, futures, here=None):
+        """The futures, their landing dots, brackets around the middle 8 in 10, and what each fan is, its
+        caption placed clear of the dots, the labels, the header and `here` (x, y). Returns the boxes it
+        took (x0, y0, x1, y1), for the you-are-here tag to keep clear of."""
         xn = X(X.now)
         now = futures.get('now') if finite((futures or {}).get('now')) else X.now
         xm = lambda m: X(now + m * 60)
         if not futures or not (futures.get('empty') or futures.get('full')):
             text(cr, "Waiting for drainhound eta's forecast…" if futures is None else "", xn + 14, Y(55), 9, MUTED)
-            return
+            return []
         full, empty = futures.get('full'), futures.get('empty')
         cutoff, target = futures.get('cutoff_pct') or 0.0, futures.get('target') or 100
         charging = full is not None
+        taken = [(0, 0, width, 24)]  # The header row.
+        if here:
+            taken.append((here[0] - 13, here[1] - 13, here[0] + 13, here[1] + 13))
         cr.set_line_width(1)
         # Limits: the charge target (charging) and the cutoff.
         # Labelled at the right end, unless the dots land that far (then where ahead begins).
@@ -415,8 +498,9 @@ class HeroChart(Chart):
             cr.set_dash([])
             last = max((xm(run['end']) for run in (scenario or {}).get('runs') or []), default=xn)
             right = last < width - self.PR - 90
-            text(cr, label, width - self.PR - 3 if right else xn + 8, Y(p) + (3 if p == target else -15), 7.5, color,
-                 align='right' if right else 'left', halo=SURFACE)
+            lx, ly = width - self.PR - 3 if right else xn + 8, Y(p) + (3 if p == target else -15)
+            w, h = text(cr, label, lx, ly, 7.5, color, align='right' if right else 'left', halo=SURFACE)
+            taken.append((lx - w if right else lx, ly, lx if right else lx + w, ly + h))
         cr.save()
         cr.rectangle(xn, 0, width - self.PR - xn, ground)
         cr.clip()
@@ -472,29 +556,37 @@ class HeroChart(Chart):
                 cr.paint_with_alpha(a)
         cr.restore()
         cr.set_line_width(1)
-        r, step = 2.2, 5.2
         hours = lambda scenario, key: scenario[key] * 60 if finite(scenario.get(key)) else None
+        between = lambda low, high: (f'8 in 10 futures between {hhmm(now + low * 60)} and {hhmm(now + high * 60)}'
+                                     if low is not None and high is not None else '')
+        bounds = (self.PL, 24, width - self.PR, ground - 4)
+        captions = []  # (lines, spots), placed once every dot is down.
         if empty:
             low, high, median = hours(empty, 'low'), hours(empty, 'high'), hours(empty, 'hours')
-            for x, j in dot_stack([xm(run['end']) for run in empty['runs']], step):
-                cr.arc(x, Y(cutoff) + r + 2 + j * (2 * r + .6), r, 0, 2 * math.pi)
+            ends = [xm(run['end']) for run in empty['runs']]
+            dots, r, pitch = fit_stack(ends, ground - 6 - (Y(cutoff) + 2))
+            for x, j in dots:
+                cr.arc(x, Y(cutoff) + r + 2 + j * pitch, r, 0, 2 * math.pi)
                 cr.set_source_rgba(*rgb(RUST))
                 cr.fill()
+            columns = stack_columns(dots, r, pitch, Y(cutoff) + 2, 1)
+            taken += columns
             if ghost:  # The change's futures land above the line, hollow, today's below it.
-                for x, j in dot_stack([xm(run['end']) for run in ghost['runs']], step):
-                    cr.arc(x, Y(cutoff) - r - 2 - j * (2 * r + .6), r, 0, 2 * math.pi)
+                g_dots, g_r, g_pitch = fit_stack([xm(run['end']) for run in ghost['runs']], Y(cutoff) - 2 - 30)
+                for x, j in g_dots:
+                    cr.arc(x, Y(cutoff) - g_r - 2 - j * g_pitch, g_r, 0, 2 * math.pi)
                     cr.set_source_rgba(*rgb(SURFACE))
                     cr.fill_preserve()
                     cr.set_source_rgba(*rgb(SKY))
                     cr.set_line_width(1.2)
                     cr.stroke()
             if median is not None:
+                depth = max((c[3] for c in columns), default=Y(cutoff) + 8)
                 cr.set_source_rgba(*rgb(BONE))
                 cr.set_line_width(1.3)
                 cr.move_to(round(xm(median)) + .5, Y(cutoff) - (0 if ghost else 8))
-                cr.line_to(round(xm(median)) + .5, Y(cutoff) + 44)
+                cr.line_to(round(xm(median)) + .5, depth + 4)
                 cr.stroke()
-            first = xm(empty['runs'][0]['end']) - 10
             if low is not None and high is not None and not ghost:
                 cr.set_source_rgba(*rgb(RUST))
                 cr.set_line_width(1.2)
@@ -504,19 +596,15 @@ class HeroChart(Chart):
                 cr.line_to(xm(high), y - 4)
                 cr.rel_line_to(0, 4)
                 cr.stroke()
-                text(cr, hhmm(now + low * 60), xm(low) - 3, Y(cutoff) - 22, 7.5, MUTED, align='right', halo=SURFACE)
-                text(cr, hhmm(now + high * 60), xm(high) + 3, Y(cutoff) - 22, 7.5, MUTED, halo=SURFACE)
+                taken.append((xm(low) - 1, y - 5, xm(high) + 1, y + 1))
             if median is not None:
-                if charging:
-                    title, note = (f'If unplugged now: cuts out at {hhmm(now + median * 60)}',
-                                   f"each dot is one of {empty.get('n', len(empty['runs']))} futures, where it ends")
-                else:
-                    title = f'Cuts out at {hhmm(now + median * 60)}'
-                    note = (f'8 in 10 futures between {hhmm(now + low * 60)} and {hhmm(now + high * 60)}'
-                            if low is not None and high is not None else '')
-                text(cr, title, first, Y(cutoff) + 6, 9, RUST if charging else BONE, bold=True, align='right',
-                     halo=SURFACE)
-                text(cr, note, first, Y(cutoff) + 20, 8, MUTED, align='right', halo=SURFACE)
+                title = (f'If unplugged now: cuts out at {hhmm(now + median * 60)}' if charging else
+                         f'Cuts out at {hhmm(now + median * 60)}')
+                lines = [(title, 9, RUST if charging else BONE, True), (between(low, high), 8, MUTED, False)]
+                first, last = min(ends) - 10, max(ends) + 10
+                below, above = Y(cutoff) + 6, Y(cutoff) - 8
+                captions.append((lines, [(first, below, 'right', False), (last, below, 'left', False),
+                                         (first, above, 'right', True), (last, above, 'left', True)]))
             if ghost and self.ghost.get('label'):
                 g_median = ghost['median']['end']
                 gx = xm(max(run['end'] for run in ghost['runs'][:int(len(ghost['runs']) * .9)])) + 12
@@ -528,12 +616,17 @@ class HeroChart(Chart):
                      halo=SURFACE)
                 text(cr, self.ghost.get('gain', ''), gx, gy + 27, 8, MUTED, halo=SURFACE)
                 text(cr, 'hollow dots: its futures', gx, gy + 40, 8, MUTED, halo=SURFACE)
+                taken.append((gx, gy, gx + 190, gy + 52))
         if full:
             low, high, median = hours(full, 'low'), hours(full, 'high'), hours(full, 'hours')
-            for x, j in dot_stack([xm(run['end']) for run in full['runs']], step):
-                cr.arc(x, Y(target) - r - 2 - j * (2 * r + .6), r, 0, 2 * math.pi)
+            ends = [xm(run['end']) for run in full['runs']]
+            dots, r, pitch = fit_stack(ends, Y(target) - 2 - 26)
+            for x, j in dots:
+                cr.arc(x, Y(target) - r - 2 - j * pitch, r, 0, 2 * math.pi)
                 cr.set_source_rgba(*rgb(MOSS))
                 cr.fill()
+            columns = stack_columns(dots, r, pitch, Y(target) - 2, -1)
+            taken += columns
             if low is not None and high is not None:
                 cr.set_source_rgba(*rgb(MOSS))
                 cr.set_line_width(1.2)
@@ -543,25 +636,32 @@ class HeroChart(Chart):
                 cr.line_to(xm(high), y + 4)
                 cr.rel_line_to(0, -4)
                 cr.stroke()
-                text(cr, hhmm(now + low * 60), xm(low) - 3, Y(target) + 6, 7.5, MUTED, align='right', halo=SURFACE)
-                text(cr, hhmm(now + high * 60), xm(high) + 3, Y(target) + 6, 7.5, MUTED, halo=SURFACE)
+                taken.append((xm(low) - 1, y - 1, xm(high) + 1, y + 5))
             if median is not None:
+                top = min((c[1] for c in columns), default=Y(target) - 26)
                 cr.set_source_rgba(*rgb(BONE))
                 cr.set_line_width(1.3)
                 cr.move_to(round(xm(median)) + .5, Y(target) + 8)
-                cr.line_to(round(xm(median)) + .5, Y(target) - 26)
+                cr.line_to(round(xm(median)) + .5, top - 4)
                 cr.stroke()
-                first = xm(full['runs'][0]['end']) - 10
-                text(cr, f'Charging: full at {hhmm(now + median * 60)}', first, Y(target) - 30, 9, BONE, bold=True,
-                     align='right', halo=SURFACE)
-                text(cr, '8 in 10 futures land in the brackets', first, Y(target) - 16, 8, MUTED, align='right',
-                     halo=SURFACE)
+                lines = [(f'Charging: full at {hhmm(now + median * 60)}', 9, BONE, True),
+                         (between(low, high), 8, MUTED, False)]
+                tall = [c for c in columns if c[3] - c[1] > 2 * pitch] or columns
+                right = max(c[2] for c in tall) + 8
+                after = (xm(high) if high is not None else max(ends)) + 10
+                captions.append((lines, [(right, Y(target) - 8, 'left', True), (after, Y(target) + 6, 'left', False),
+                                         (min(ends) - 10, Y(target) - 8, 'right', True),
+                                         (right, Y(target) + 12, 'left', False)]))
+        for lines, spots in captions:  # Spots (x, y, align, up): up, the caption ends at y, above its line.
+            height = sum(measure(cr, string, size, bold)[1] for string, size, _, bold in lines)
+            caption(cr, lines, [(x, y - height if up else y, align) for x, y, align, up in spots], taken, bounds)
+        return taken
 
     def minute_at(self, X, x):
         """The minute ahead under x (None behind now)."""
         if X.now is None or x < X(X.now):
             return None
-        lo, hi = 0.0, AHEAD / 60
+        lo, hi = 0.0, (X.end - X.now) / 60
         for _ in range(30):
             mid = (lo + hi) / 2
             lo, hi = (mid, hi) if X(X.now + mid * 60) < x else (lo, mid)
@@ -644,14 +744,15 @@ class PullChart(Chart):
 
     def __init__(self):
         super().__init__(176)
-        self.points, self.span, self.at_now, self.labels, self.now = [], (0, 1), False, None, None
+        self.points, self.span, self.at_now, self.labels, self.now, self.ahead = [], (0, 1), False, None, None, AHEAD
 
     def set_data(self, points, span, at_now):
         self.points, self.span, self.at_now = points, span, at_now
         self.queue_draw()
 
-    def set_now(self, now):
-        self.now = now
+    def set_now(self, now, ahead=AHEAD):
+        """The time now and how far the hero looks ahead (panel_data.ahead_of), so both share an axis."""
+        self.now, self.ahead = now, ahead
         self.queue_draw()
 
     def set_labels(self, labels):
@@ -685,9 +786,10 @@ class PullChart(Chart):
 
     def render(self, cr, width, height):
         start, end = self.span
-        X = time_axis(start, end, self.PL, width - self.PR, (self.now or time.time()) if self.at_now else None)
+        X = time_axis(start, end, self.PL, width - self.PR, (self.now or time.time()) if self.at_now else None,
+                      self.ahead)
         behind_end = X.now or X.end
-        bins, _ = self.bins(start, behind_end, width * (1 - .44 if self.at_now else 1))
+        bins, size = self.bins(start, behind_end, width * (1 - .44 if self.at_now else 1))
         top = max([sum(b['groups'].values()) for b in bins] + [10]) * 1.08
         step = 10 if top > 25 else 5
         top = math.ceil(top / step) * step
@@ -702,7 +804,7 @@ class PullChart(Chart):
             if w:
                 text(cr, f'{w} W', self.PL - 6, Y(w) - 7, 7.5, FAINT, align='right')
             w += step
-        for t, _label, major in ticks(start, behind_end, X.now):
+        for t, _label, major in ticks(start, behind_end, X.now, self.ahead):
             cr.move_to(round(X(t)) + .5, self.TOP)
             cr.line_to(round(X(t)) + .5, height - 6)
             cr.set_source_rgba(*rgb(RULE, .55 if major else .3))
@@ -714,7 +816,7 @@ class PullChart(Chart):
             cr.line_to(round(X(X.now)) + .5, height - 6)
             cr.stroke()
             cr.set_dash([])
-        anchors, anchor_x = None, None
+        anchors, anchor_x, anchor_t = None, None, None
         # Runs of battery bins as smoothed stacked areas; plugged-in runs hatched (chip power only).
         runs = []
         for b in bins:
@@ -743,8 +845,10 @@ class PullChart(Chart):
                     cr.line_to(xs[0] + k + height, Y(0) - height)
                 cr.stroke()
                 cr.restore()
-                label = 'plugged in · chip only'
-                if xs[-1] - xs[0] > measure(cr, label, 7.5)[0] + 16:  # Inside the stretch, clear of its neighbours.
+                # Inside the stretch, clear of its neighbours: in full, else short, else not at all.
+                label = next((label for label in ('plugged in · chip only', 'plugged in')
+                              if xs[-1] - xs[0] > measure(cr, label, 7.5)[0] + 16), None)
+                if label:
                     text(cr, label, (xs[0] + xs[-1]) / 2, Y(3.6), 7.5, MUTED, align='center')
                 continue
             cum = [0.0] * len(xs)
@@ -764,11 +868,13 @@ class PullChart(Chart):
                     anchors = anchors or {}
                     anchors[name] = (cum[-1] + upper[-1]) / 2
                 cum = upper
-            anchor_x = xs[-1]
+            anchor_x, anchor_t = xs[-1], run[-1]['t1']
         if not bins:
             text(cr, 'No battery time in this period', width / 2, height / 2 - 8, 10, MUTED, align='center')
-        if X.now and self.labels and anchors:
-            self.draw_labels(cr, X, Y, width, anchors, anchor_x)
+        if X.now and self.labels:
+            # The live split is the last minutes on battery: led from where they end, if that is now.
+            fresh = anchors and X.now - anchor_t < max(2 * size, 600)
+            self.draw_labels(cr, X, Y, width, anchors if fresh else {}, anchor_x)
         if self.hover and bins:
             self.draw_hover(cr, X, Y, width, height, bins)
 

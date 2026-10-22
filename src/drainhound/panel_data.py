@@ -851,7 +851,9 @@ def chart_colors(groups):
 
 FUTURES_STALE = 90  # s: drainhound eta rewrites futures.json at least every 30 s while there are futures.
 SNAPSHOT_STALE = 15  # s: the collector rewrites snapshot.json every 2 s.
-AHEAD = 165 * 60  # s: how far ahead the hero looks (2¾ h).
+AHEAD = 165 * 60  # s: how far ahead the hero looks (2¾ h), at least: further when the futures land later.
+AHEAD_MAX = 24 * 3600  # s: the furthest it looks.
+OFF_GAP = 15 * 60  # s without readings, outside a suspend, that breaks the level behind (the laptop was off).
 AHEAD_SHARE = 0.44  # Of the hero's width, in every range: so the futures stay readable.
 EASE = 20 * 60  # s either side of now over which the time axis eases from behind's scale to ahead's.
 MIN_WAY = 3  # Minutes per charge: smaller what-if estimates are listed by name only.
@@ -1130,9 +1132,27 @@ def ghost(scenario, gain, low, high, full_minutes, seed=0):
             'median': {'end': median['end'] * f, 'pts': [[m * f, p] for m, p in median['pts']]}}
 
 
-def time_axis(start, end, x0, x1, now=None):
+def ahead_of(futures):
+    """How far the hero looks ahead (s): AHEAD, or far enough that every future in futures.json lands in
+    view with room for its dot, in half hours (hours past 6 h), at most AHEAD_MAX."""
+    ends = [run['end'] for key in ('empty', 'full') for run in ((futures or {}).get(key) or {}).get('runs') or []
+            if isinstance(run, dict) and finite(run.get('end'))]
+    if not ends:
+        return AHEAD
+    need = max(ends) * 60 * 1.1 + 600
+    step = 1800 if need <= 6 * 3600 else 3600
+    return min(AHEAD_MAX, max(AHEAD, math.ceil(need / step) * step))
+
+
+def ahead_text(seconds):
+    """'2¾ H': a span in hours and quarters, for the hero's header."""
+    hours, quarter = divmod(round(seconds / 900), 4)
+    return f"{hours or ('' if quarter else 0)}{' ¼½¾'[quarter].strip()} H"
+
+
+def time_axis(start, end, x0, x1, now=None, ahead=AHEAD):
     """The hero's time axis, t (epoch s) → x. With `now` inside the period (looking at Now), behind is
-    [start, now] and ahead [now, now + AHEAD]; ahead keeps AHEAD_SHARE of the width in every range, and
+    [start, now] and ahead [now, now + ahead]; ahead keeps AHEAD_SHARE of the width in every range, and
     the scale eases from behind's to ahead's over EASE either side of now (a smoothstep in the drawing
     speed), so no line gets a corner there. Without `now`, the plain period. The function carries `zoom`
     (how much wider ahead is drawn), `now`, `start` and `end`."""
@@ -1141,7 +1161,7 @@ def time_axis(start, end, x0, x1, now=None):
         axis = lambda t: x0 + (t - start) * scale
         axis.zoom, axis.now, axis.start, axis.end = 1.0, None, start, end
         return axis
-    behind, ahead = max(now - start, 1), AHEAD
+    behind = max(now - start, 1)
     ratio = AHEAD_SHARE / (1 - AHEAD_SHARE) * behind / ahead
     w = min(EASE, behind / 4)
     a = now - w
@@ -1167,6 +1187,36 @@ def dot_stack(xs, step):
         out.append((c * step, columns[c]))
         columns[c] += 1
     return out
+
+
+def fit_stack(xs, room, r=2.2, least=1.2):
+    """The landing dots in at most `room` px of stack height: ([(x, j)], radius, row pitch). The dots
+    shrink, down to `least`, before a column outgrows the room."""
+    while True:
+        dots = dot_stack(xs, 2 * r + .8)
+        rows = max((j for _, j in dots), default=-1) + 1
+        if rows * (2 * r + .6) <= room or r <= least:
+            return dots, r, 2 * r + .6
+        r = max(least, round(r - .2, 2))
+
+
+def level_segments(levels, sleeps=(), gap=OFF_GAP):
+    """The level behind [(t, pct)] as the stretches it was read in, and the gaps between them [(t0, t1)]:
+    split where readings stop for over `gap` s outside a suspend (the laptop was off). Over a suspend
+    the line goes on: the sleep band says why."""
+    segments, gaps = [], []
+    for t, pct in levels:
+        if segments and t - segments[-1][-1][0] > gap:
+            t0 = segments[-1][-1][0]
+            asleep = sum(max(0.0, min(t, s['end']) - max(t0, s['start'])) for s in sleeps or []
+                         if finite(s.get('start'), s.get('end')))
+            if asleep < (t - t0) / 2:
+                gaps.append((t0, t))
+                segments.append([])
+        elif not segments:
+            segments.append([])
+        segments[-1].append((t, pct))
+    return segments, gaps
 
 
 def week_sleeps(sleeps, now=None, days=7):
