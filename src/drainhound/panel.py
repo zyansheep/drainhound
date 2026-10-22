@@ -18,7 +18,7 @@ gi.require_version("Gdk", "4.0")
 gi.require_version("Graphene", "1.0")  # compute_bounds() returns a Graphene.Rect.
 gi.require_version("Pango", "1.0")
 gi.require_version("PangoCairo", "1.0")
-from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango, PangoCairo  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
 
 try:  # Optional: without it (or a compositor that has it) the panel is a normal window.
     gi.require_version("Gtk4LayerShell", "1.0")
@@ -31,17 +31,19 @@ from . import eta  # noqa: E402,F401 - first: it limits BLAS threads before nump
 from . import experiment  # noqa: E402
 from . import qol  # noqa: E402
 from . import report  # noqa: E402
-from .panel_data import (GONE, NOTE_SECONDS, History, apply_note, banner_text, command_note, duration,  # noqa: E402
-                        gather, health_text, interaction_clear, lever_rows, no_levers, picker, read_battery,
-                        read_estimate, status_line, typical_text, value_text, what_if_note)
-from .panel_data import BLUE, GREEN, ORANGE, chart_colors  # noqa: E402
-from .report import PHRASES  # noqa: E402
+from . import trail  # noqa: E402
+from .panel_data import (GONE, NOTE_SECONDS, History, answers, apply_note, banner_text, command_note,  # noqa: E402
+                         duration, finite, gather, ghost, health_text, interaction_clear, lever_rows,
+                         long_duration, no_levers, picker, processes, pull_labels, read_battery, read_estimate,
+                         read_futures, read_snapshot, state_text, typical_text, value_text, ways, week_sleeps,
+                         what_if_note)
+from .panel_data import chart_colors  # noqa: E402
+from .report import PHRASES, gain_parts  # noqa: E402
 
 # The stack's colours, bottom up; the app groups' follow their configured names (panel_data.chart_colors).
 COLORS = chart_colors(report.GROUPS)
 STACK = list(COLORS)
-SURFACE, CARD = (0x22 / 255, 0x22 / 255, 0x26 / 255), (0x34 / 255, 0x34 / 255, 0x37 / 255)
-INK, MUTED, GRID = (1, 1, 1), (1, 1, 1, .68), (1, 1, 1, .08)
+SURFACE = tuple(int(trail.GROUND[i:i + 2], 16) / 255 for i in (1, 3, 5))
 RANGES = {'6 h': 6 * 3600, 'Day': 24 * 3600, 'Week': 7 * 24 * 3600}
 BATTERY_HOURS = [1, 2, 4, 8, 24]  # Experiment length choices, in hours of battery time.
 DEBOUNCE = 0.15  # s: reloads this close together (holding ← or →) load only the last one.
@@ -54,25 +56,6 @@ def rgb(color, alpha=1.0):
     return tuple(int(color[i:i + 2], 16) / 255 for i in (0, 2, 4)) + (alpha,)
 
 
-def text(cr, string, x, y, size=9, color=MUTED, bold=False, align='left', width=None):
-    layout = PangoCairo.create_layout(cr)
-    font = Pango.FontDescription.from_string(f"Sans {'Bold ' if bold else ''}{size}")
-    layout.set_font_description(font)
-    layout.set_text(string, -1)
-    if width:
-        layout.set_width(int(width * Pango.SCALE))
-        layout.set_ellipsize(Pango.EllipsizeMode.END)
-    w, h = layout.get_pixel_size()
-    if align == 'right':
-        x -= w
-    elif align == 'center':
-        x -= w / 2
-    cr.set_source_rgba(*color)
-    cr.move_to(x, y)
-    PangoCairo.show_layout(cr, layout)
-    return w, h
-
-
 def rounded(cr, x, y, w, h, r):
     r = min(r, w / 2, h / 2)
     cr.new_sub_path()
@@ -83,403 +66,15 @@ def rounded(cr, x, y, w, h, r):
     cr.close_path()
 
 
-def tooltip(cr, lines, x, y, width, height):
-    """Values lead, labels follow; series keyed by a short stroke of their color."""
-    pad, line_h = 8, 16
-    w = 230
-    h = pad * 2 + line_h * len(lines)
-    tx = x + 14 if x + 14 + w < width else x - 14 - w
-    ty = min(max(4, y - h / 2), height - h - 4)
-    rounded(cr, tx, ty, w, h, 8)
-    cr.set_source_rgba(*CARD, .97)
-    cr.fill_preserve()
-    cr.set_source_rgba(1, 1, 1, .12)
-    cr.set_line_width(1)
-    cr.stroke()
-    for i, (value, label, color) in enumerate(lines):
-        yy = ty + pad + i * line_h
-        if color:
-            cr.set_source_rgba(*rgb(color))
-            cr.set_line_width(3)
-            cr.move_to(tx + pad, yy + 8)
-            cr.line_to(tx + pad + 10, yy + 8)
-            cr.stroke()
-        offset = tx + pad + (16 if color else 0)
-        vw, _ = text(cr, value, offset, yy, 9, INK, bold=True)
-        text(cr, label, offset + vw + 6, yy, 9, MUTED, width=w - (offset - tx) - vw - 6 - pad)
-
-
-def nice_step(top, ticks=4):
-    raw = max(top, 1e-6) / ticks
-    magnitude = 10 ** math.floor(math.log10(raw))
-    return next(m * magnitude for m in (1, 2, 2.5, 5, 10) if m * magnitude >= raw)
-
-
-def clock(t, with_day=False):
-    return time.strftime('%a %H:%M' if with_day else '%H:%M', time.localtime(t))
-
-
-def time_ticks(start, end):
-    """Axis ticks on local-clock boundaries: hourly, every 4 h, or daily."""
-    span = end - start
-    hours = 1 if span <= 6 * 3600 else 4 if span <= 86400 else 24
-    day = time.localtime(start)
-    ticks, k = [], 0
-    while True:
-        # mktime normalizes overflowing hours, so DST days still land on local boundaries.
-        t = time.mktime((day.tm_year, day.tm_mon, day.tm_mday, k * hours, 0, 0, 0, 0, -1))
-        if t >= end:
-            return ticks
-        if t >= start:
-            ticks.append((t, time.strftime('%a %-d' if hours == 24 else '%H:%M', time.localtime(t))))
-        k += 1
-
-
 def wrapped(**props):
     """A wrapping label. GTK4 reports a wrapping label's whole text as its natural
     width; the cap keeps the layer surface at the card's width."""
     return Gtk.Label(**{'xalign': 0, 'wrap': True, 'max_width_chars': 100, 'width_chars': 20, **props})
 
 
-class Chart(Gtk.DrawingArea):
-    def __init__(self, height):
-        super().__init__(hexpand=True, content_height=height)
-        self.set_draw_func(self.draw)
-        self.hover = None
-        motion = Gtk.EventControllerMotion()
-        motion.connect('motion', lambda _c, x, y: self.pointer(x, y))
-        motion.connect('leave', lambda _c: self.pointer(None, None))
-        self.add_controller(motion)
-        self.loading = False
-
-    def pointer(self, x, y):
-        self.hover = None if x is None else (x, y)
-        self.queue_draw()
-
-    def draw(self, area, cr, width, height):
-        cr.push_group()
-        self.render(cr, width, height)
-        cr.pop_group_to_source()
-        cr.paint_with_alpha(.45 if self.loading else 1)
-
-    def render(self, cr, width, height):
-        raise NotImplementedError
-
-
-class TimelineChart(Chart):
-    """Stacked power by group (top) and battery % (strip below), one crosshair."""
-    LEFT, STRIP = 44, 64
-
-    def __init__(self):
-        super().__init__(330)
-        self.points, self.span, self.sleeps = [], (0, 1), []
-
-    def set_data(self, points, span, sleeps):
-        self.points, self.span, self.sleeps = points, span, sleeps
-        self.queue_draw()
-
-    def columns(self, width):
-        start, end = self.span
-        plot = width - self.LEFT - 8
-        count = max(1, int(plot // 2))
-        seconds = (end - start) / count
-        bins = [None] * count
-        for p in self.points:
-            i = int((p['t'] - start) / seconds)
-            if 0 <= i < count:
-                bins[i] = bins[i] or []
-                bins[i].append(p)
-        merged = []
-        for points in bins:
-            if not points:
-                merged.append(None)
-                continue
-            groups, idle = {}, {}
-            for p in points:
-                for name, watts in p['groups'].items():
-                    groups[name] = groups.get(name, 0) + watts / len(points)
-                for name, watts in (p.get('idle') or {}).items():
-                    idle[name] = idle.get(name, 0) + watts / len(points)
-            merged.append({'groups': groups, 'idle': idle, 'points': points, 'battery': sum(p['st'] == 'D' for p in points) * 2 > len(points),
-                           'pct': next((p['pct'] for p in reversed(points) if p.get('pct') is not None), None)})
-        return merged, plot / count
-
-    def render(self, cr, width, height):
-        start, end = self.span
-        top_h = height - self.STRIP - 30
-        columns, column_w = self.columns(width)
-        totals = [sum(c['groups'].values()) for c in columns if c]
-        y_max = max(totals or [10]) * 1.08
-        step = nice_step(y_max)
-        y_max = math.ceil(y_max / step) * step
-        sx = lambda t: self.LEFT + (t - start) / (end - start) * (width - self.LEFT - 8)
-        sy = lambda w: 6 + top_h - w / y_max * top_h
-        # Grid and y labels (recessive).
-        cr.set_line_width(1)
-        value = 0
-        while value <= y_max + 1e-6:
-            cr.set_source_rgba(*GRID)
-            cr.move_to(self.LEFT, sy(value) + .5)
-            cr.line_to(width - 8, sy(value) + .5)
-            cr.stroke()
-            text(cr, f'{value:g} W', self.LEFT - 6, sy(value) - 7, 8, MUTED, align='right')
-            value += step
-        for sleep in self.sleeps:
-            x0, x1 = max(self.LEFT, sx(sleep['start'])), min(width - 8, sx(sleep['end']))
-            if x1 > x0:
-                cr.set_source_rgba(1, 1, 1, .035)
-                cr.rectangle(x0, 6, x1 - x0, top_h)
-                cr.fill()
-                if x1 - x0 > 40:
-                    text(cr, 'asleep', (x0 + x1) / 2, 10, 8, MUTED, align='center')
-        for i, column in enumerate(columns):
-            if not column:
-                continue
-            x, base = self.LEFT + i * column_w, 0.0
-            alpha = 1.0 if column['battery'] else .4  # On AC: chip power only.
-            for name in STACK:
-                watts = column['groups'].get(name, 0)
-                if watts <= 0:
-                    continue
-                cr.set_source_rgba(*rgb(COLORS[name], alpha))
-                cr.rectangle(x, sy(base + watts), column_w + .3, sy(base) - sy(base + watts))
-                cr.fill()
-                base += watts
-        # Battery % strip: separate scale, never a second y-axis on the stack.
-        strip_top = 6 + top_h + 18
-        text(cr, 'Battery %', self.LEFT + 4, strip_top - 14, 8, MUTED)
-        for value in (0, 50, 100):
-            y = strip_top + self.STRIP - value / 100 * self.STRIP
-            cr.set_source_rgba(*GRID)
-            cr.move_to(self.LEFT, y + .5)
-            cr.line_to(width - 8, y + .5)
-            cr.stroke()
-            if value:
-                text(cr, f'{value}', self.LEFT - 6, y - 7, 8, MUTED, align='right')
-        cr.set_source_rgba(1, 1, 1, .85)
-        cr.set_line_width(2)
-        previous = None
-        for i, column in enumerate(columns):
-            if not column or column['pct'] is None:
-                previous = None
-                continue
-            x, y = self.LEFT + (i + .5) * column_w, strip_top + self.STRIP - column['pct'] / 100 * self.STRIP
-            if previous is None:
-                cr.move_to(x, y)
-            else:
-                cr.line_to(x, y)
-            previous = (x, y)
-        cr.stroke()
-        # Time axis.
-        span = end - start
-        for t, label in time_ticks(start, end):
-            x = sx(t)
-            text(cr, label, x, height - 16, 8, MUTED, align='center')
-            cr.set_source_rgba(*GRID)
-            cr.move_to(x + .5, 6)
-            cr.line_to(x + .5, 6 + top_h)
-            cr.stroke()
-        if not self.points:
-            text(cr, 'No power-log data in this period', width / 2, top_h / 2, 11, MUTED, align='center')
-            return
-        if self.hover:
-            hx, hy = self.hover
-            i = int((hx - self.LEFT) / column_w)
-            if 0 <= i < len(columns) and columns[i]:
-                column = columns[i]
-                x = self.LEFT + (i + .5) * column_w
-                cr.set_source_rgba(1, 1, 1, .5)
-                cr.set_line_width(1)
-                cr.move_to(x + .5, 6)
-                cr.line_to(x + .5, strip_top + self.STRIP)
-                cr.stroke()
-                points = column['points']
-                t0, t1 = points[0]['t'], points[-1]['t'] + 60
-                total = sum(column['groups'].values())
-                lines = [(f'{total:.1f} W', ('on battery · ' if column['battery'] else 'on AC · chip only · ')
-                          + f"{clock(t0, span > 86400)}–{clock(t1)}", None)]
-                for name in sorted(column['groups'], key=lambda n: -column['groups'][n]):
-                    if column['groups'][name] >= .05:
-                        lines.append((f"{column['groups'][name]:.1f} W", name, COLORS[name]))
-                    if name == report.IDLE and set(column['idle']) != {report.IDLE}:  # Its rails, once learned.
-                        lines += [(f'{w:.1f} W', f'   {part}', None) for part, w in
-                                  sorted(column['idle'].items(), key=lambda kv: -kv[1]) if w >= .05]
-                apps = {}
-                for p in points:
-                    for name, watts in p['apps'].items():
-                        apps[name] = apps.get(name, 0) + watts / len(points)
-                top = sorted(apps.items(), key=lambda kv: -kv[1])[:3]
-                if top:
-                    lines.append(('Top apps', '', None))
-                    lines += [(f'{w:.2f} W', name, None) for name, w in top]
-                if column['pct'] is not None:
-                    lines.append((f"{column['pct']:.0f}%", 'battery', None))
-                tooltip(cr, lines, hx, hy, width, height)
-
-
-class SleepChart(Chart):
-    LEFT = 44
-
-    def __init__(self):
-        super().__init__(190)
-        self.sleeps, self.span, self.median = [], (0, 1), None
-
-    def set_data(self, sleeps, span, median):
-        self.sleeps, self.span, self.median = sleeps, span, median
-        self.queue_draw()
-
-    def render(self, cr, width, height):
-        start, end = self.span
-        plot_h = height - 40
-        top = max([s['pct_per_hour'] for s in self.sleeps] + [self.median or 0, 3]) * 1.15
-        step = nice_step(top)
-        top = math.ceil(top / step) * step
-        sx = lambda t: self.LEFT + (t - start) / (end - start) * (width - self.LEFT - 12)
-        sy = lambda v: 8 + plot_h - v / top * plot_h
-        value = 0
-        while value <= top + 1e-6:
-            cr.set_source_rgba(*GRID)
-            cr.set_line_width(1)
-            cr.move_to(self.LEFT, sy(value) + .5)
-            cr.line_to(width - 12, sy(value) + .5)
-            cr.stroke()
-            text(cr, f'{value:g} %/h', self.LEFT - 6, sy(value) - 7, 8, MUTED, align='right')
-            value += step
-        if self.median is not None:
-            cr.set_source_rgba(1, 1, 1, .45)
-            cr.set_dash([4, 4])
-            cr.move_to(self.LEFT, sy(self.median))
-            cr.line_to(width - 12, sy(self.median))
-            cr.stroke()
-            cr.set_dash([])
-            text(cr, f'median {self.median:.1f} %/h (all history)', self.LEFT + 4, sy(self.median) - 15, 8, MUTED)
-        if not self.sleeps:
-            text(cr, 'No suspends in this period', width / 2, plot_h / 2, 11, MUTED, align='center')
-        nearest, best = None, 24
-        for s in self.sleeps:
-            x, y = sx((s['start'] + s['end']) / 2), sy(s['pct_per_hour'])
-            radius = 4 + min(6, s['hours'])
-            cr.arc(x, y, radius + 2, 0, 2 * math.pi)
-            cr.set_source_rgb(*SURFACE)
-            cr.fill()  # 2px surface ring keeps overlapping dots distinct.
-            cr.arc(x, y, radius, 0, 2 * math.pi)
-            cr.set_source_rgba(*rgb(BLUE))
-            cr.fill()
-            if self.hover and math.hypot(self.hover[0] - x, self.hover[1] - y) < best:
-                nearest, best = s, math.hypot(self.hover[0] - x, self.hover[1] - y)
-        for t, label in time_ticks(start, end):
-            text(cr, label, sx(t), height - 18, 8, MUTED, align='center')
-        if nearest:
-            s = nearest
-            tooltip(cr, [(f"{s['pct_per_hour']:.1f} %/h", f"{s['watts']:.2f} W while asleep", BLUE),
-                         (duration(s['hours']), f"{clock(s['start'], True)} → {clock(s['end'], True)}", None),
-                         (f"{s['pct_before']:.0f}% → {s['pct_after']:.0f}%", 'battery', None)],
-                    *self.hover, width, height)
-
-
-class WhatIfChart(Chart):
-    ROW = 28
-
-    def __init__(self, on_activate):
-        super().__init__(200)
-        self.rows, self.on_activate = [], on_activate
-        click = Gtk.GestureClick()
-        click.connect('released', self.clicked)
-        self.add_controller(click)
-
-    def set_data(self, rows):
-        self.rows = rows
-        self.set_content_height(max(120, 30 + self.ROW * len(rows)))
-        self.queue_draw()
-
-    def row_at(self, y):
-        i = int((y - 24) // self.ROW)
-        return self.rows[i] if 0 <= i < len(self.rows) else None
-
-    def clicked(self, _gesture, _n, _x, y):
-        row = self.row_at(y)
-        if row and row.get('pending'):
-            self.on_activate(row)
-
-    def render(self, cr, width, height):
-        label_w, value_w = 230, 150
-        plot_x0, plot_x1 = label_w + 8, width - value_w
-        values = [v for r in self.rows if not r.get('pending') for v in (r['low'], r['high'], r['minutes'])
-                  if v is not None and math.isfinite(v)]
-        low, high = min(values + [0]), max(values + [10])
-        step = nice_step(high - low, 5)
-        low, high = math.floor(low / step) * step, math.ceil(high / step) * step
-        sx = lambda m: plot_x0 + (m - low) / (high - low) * (plot_x1 - plot_x0)
-        value = low
-        while value <= high + 1e-6:
-            cr.set_source_rgba(*GRID)
-            cr.set_line_width(1)
-            cr.move_to(sx(value) + .5, 18)
-            cr.line_to(sx(value) + .5, height - 4)
-            cr.stroke()
-            text(cr, f'{value:+g} min' if value else '0', sx(value), 2, 8, MUTED, align='center')
-            value += step
-        cr.set_source_rgba(1, 1, 1, .35)
-        cr.move_to(sx(0) + .5, 18)
-        cr.line_to(sx(0) + .5, height - 4)
-        cr.stroke()
-        hovered = self.row_at(self.hover[1]) if self.hover else None
-        for i, row in enumerate(self.rows):
-            y = 24 + i * self.ROW
-            text(cr, row['name'], 4, y + 6, 9, INK if row is hovered else MUTED, width=label_w - 8)
-            if row.get('pending'):
-                text(cr, row['pending'], plot_x0, y + 6, 9, (*rgb(COLORS['Display'])[:3], .9))
-                continue
-            measured = row['evidence'] in ('experiment', 'boot')
-            color = GREEN if measured else BLUE
-            x0, x1 = sorted((sx(0), sx(row['minutes'])))
-            rounded(cr, x0, y + 6, max(2, x1 - x0), self.ROW - 12, 3)
-            if measured:
-                cr.set_source_rgba(*rgb(color))
-                cr.fill()
-            else:  # Model estimates: outlined, never mistaken for measurements.
-                cr.set_source_rgba(*rgb(color, .28))
-                cr.fill_preserve()
-                cr.set_source_rgba(*rgb(color))
-                cr.set_line_width(1.5)
-                cr.stroke()
-            if row.get('low') is not None and math.isfinite(row['low']) and math.isfinite(row['high']):
-                cr.set_source_rgba(1, 1, 1, .85)
-                cr.set_line_width(1.5)
-                cy = y + self.ROW / 2
-                cr.move_to(sx(row['low']), cy)
-                cr.line_to(sx(row['high']), cy)
-                for edge in (row['low'], row['high']):
-                    cr.move_to(sx(edge), cy - 4)
-                    cr.line_to(sx(edge), cy + 4)
-                cr.stroke()
-            interval = (f" ({row['low']:+.0f} to {row['high']:+.0f})"
-                        if row.get('low') is not None and math.isfinite(row['low']) else '')
-            text(cr, f"{row['minutes']:+.0f} min{interval}", width - 4, y + 6, 9, INK, align='right')
-        if hovered and self.hover:
-            lines = self.details(hovered)
-            tooltip(cr, lines, *self.hover, width, height)
-
-    @staticmethod
-    def details(row):
-        if row.get('pending'):
-            return [('Not measured', row['name'], None), ('Click', 'to open Experiments', None)]
-        lines = [(f"{row['minutes']:+.1f} min", 'per full charge', None),
-                 (f"{row['watts']:+.2f} W", 'average saving', None)]
-        if row['evidence'] == 'experiment':
-            lines.append((f"{row['pairs']} pairs", 'of randomized A/B blocks', GREEN))
-        elif row['evidence'] == 'boot':
-            lines.append((f"{row['boots']['on']}+{row['boots']['off']} boots", 'with / without, load-adjusted',
-                          GREEN))
-        else:
-            lines.append(('Model', 'removes activity; ×chip cost', BLUE))
-        if row.get('low') is not None:
-            lines.append((f"{row['low']:+.0f} … {row['high']:+.0f}", '90% interval (min)', None))
-        return lines
-
-
 def render(directory, range_name='Day', offset=0):
-    """Draw the three charts to PNGs without opening a window (`--render DIR`)."""
+    """Draw the hero and what's pulling to PNGs without opening a window (`render DIR`), with the
+    runtime files as they are now (futures.json, snapshot.json)."""
     import cairo
     length = RANGES[range_name]
     today = time.localtime()
@@ -488,71 +83,23 @@ def render(directory, range_name='Day', offset=0):
     result = gather(end - length, end)
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    rows = result.get('estimates') or []
-    drains = sorted(s['pct_per_hour'] for s in result['sleeps_all'])
-    charts = {'timeline': (TimelineChart(), (result['points'], result['span'], result['sleeps']), 330),
-              'sleep': (SleepChart(), (result['sleeps'], result['span'], drains[len(drains) // 2] if drains else None), 300),
-              'whatif': (WhatIfChart(lambda _row: None), (rows,), 30 + WhatIfChart.ROW * len(rows))}
-    for name, (chart, data, height) in charts.items():
-        chart.set_data(*data)
-        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, 880, max(height, 120))
+    now, at_now = time.time(), offset == 0
+    estimate = read_estimate(RUNTIME / 'eta.json', now)
+    hero, pull = trail.HeroChart(), trail.PullChart()
+    hero.set_data(result.get('points') or [], result.get('span') or (end - length, end), result.get('sleeps') or [],
+                  range_name, at_now)
+    hero.set_live(read_futures(RUNTIME / 'futures.json', now), (estimate or {}).get('pct'), now)
+    pull.set_data(result.get('points') or [], result.get('span') or (end - length, end), at_now)
+    pull.set_labels(pull_labels(read_snapshot(RUNTIME / 'snapshot.json', now)))
+    pull.set_now(now)
+    for name, chart, height in (('hero', hero, 304), ('pull', pull, 176)):
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, 840, height)
         cr = cairo.Context(surface)
         cr.set_source_rgb(*SURFACE)
         cr.paint()
-        chart.render(cr, 880, max(height, 120))
+        chart.render(cr, 840, height)
         surface.write_to_png(str(directory / f'{name}.png'))
         print(directory / f'{name}.png')
-
-
-class GainBar(Gtk.DrawingArea):
-    """One saving (minutes per charge) and its 90% interval, on a scale shared down its column."""
-
-    def __init__(self):
-        super().__init__(content_width=190, content_height=18, valign=Gtk.Align.CENTER)
-        self.gain, self.scale = None, (-10, 10)
-        # Not a bound method: one would hold the bar from its own draw func, a
-        # cycle PyGObject can't collect (every rebuilt row leaked).
-        self.set_draw_func(GainBar.paint)
-
-    def set_data(self, gain, scale):
-        if (gain, scale) != (self.gain, self.scale):
-            self.gain, self.scale = gain, scale
-            self.queue_draw()
-
-    @staticmethod
-    def paint(bar, cr, width, height):
-        low, high = bar.scale
-        sx = lambda m: 1 + (min(max(m, low), high) - low) / (high - low) * (width - 2)
-        cr.set_source_rgba(1, 1, 1, .35)
-        cr.set_line_width(1)
-        cr.move_to(round(sx(0)) + .5, 1)
-        cr.line_to(round(sx(0)) + .5, height - 1)
-        cr.stroke()
-        if not bar.gain or bar.gain.get('minutes') is None or not math.isfinite(bar.gain['minutes']):
-            return
-        color = GREEN if bar.gain['minutes'] >= 0 else ORANGE
-        x0, x1 = sorted((sx(0), sx(bar.gain['minutes'])))
-        rounded(cr, x0, 4, max(2, x1 - x0), height - 8, 3)
-        cr.set_source_rgba(*rgb(color))
-        cr.fill()
-        if bar.gain.get('low') is not None and math.isfinite(bar.gain['low']) and math.isfinite(bar.gain['high']):
-            cr.set_source_rgba(1, 1, 1, .85)
-            cr.set_line_width(1.5)
-            cy = height / 2
-            cr.move_to(sx(bar.gain['low']), cy)
-            cr.line_to(sx(bar.gain['high']), cy)
-            for edge in (bar.gain['low'], bar.gain['high']):
-                cr.move_to(sx(edge), cy - 4)
-                cr.line_to(sx(edge), cy + 4)
-            cr.stroke()
-
-
-def shared_scale(gains):
-    values = [v for g in gains if g for v in (g.get('minutes'), g.get('low'), g.get('high'))
-              if v is not None and math.isfinite(v)]
-    low, high = min(values + [-5]), max(values + [15])
-    step = nice_step(high - low, 4)
-    return math.floor(low / step) * step, math.ceil(high / step) * step
 
 
 class BatteryPanel(Adw.Application):
@@ -569,7 +116,8 @@ class BatteryPanel(Adw.Application):
         self.poll = 0
         self.catalog, self.units, self.effects = [], [], []
         self.psr, self.psr_arm = None, None
-        self.result, self.best = None, None
+        self.result, self.best, self.futures, self.full_minutes, self.period_text = None, None, None, None, ''
+        self.minutes_hours = 4  # How long freezing experiments run, in hours of battery time.
         self.lever_names, self.lever_widgets, self.hints = None, {}, {}
         self.unit_names, self.freeze_allowed = [], False
         self.syncing = False  # Set while widgets are updated from state, so they don't echo it back.
@@ -639,36 +187,53 @@ class BatteryPanel(Adw.Application):
                                         child=self.hint_label)
         self.hint_popover.add_css_class('hint')
         self.hint_popover.set_parent(outer)
-        header = Gtk.Box(spacing=8)
-        title = Gtk.Label(label='Battery', xalign=0, valign=Gtk.Align.START)
-        title.add_css_class('title-2')
+        header = Gtk.Box(spacing=10)
+        header.append(trail.Paw())
+        title = Gtk.Label(label='Battery', xalign=0)
+        title.add_css_class('panel-title')
         header.append(title)
-        # Time left awake on battery, and asleep from now on a second line.
-        self.status = self.muted(wrapped(hexpand=True, valign=Gtk.Align.CENTER))
-        header.append(self.status)
+        # Charging · 34% · 29.9 W in; the numbers that answer "how long" lead the Timeline.
+        self.state = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.END)
+        self.state.add_css_class('state')
+        header.append(self.state)
+        right_now = Gtk.Label(label='RIGHT NOW')
+        right_now.add_css_class('lab')
+        header.append(right_now)
+        for choice, words in (('up', 'Especially good right now'), ('down', 'Worse than it should be right now')):
+            thumb = Gtk.Label(label=qol.GLYPHS[choice])
+            thumb.add_css_class('thumb')
+            button = Gtk.Button(child=thumb, valign=Gtk.Align.CENTER)
+            button.add_css_class('vote')
+            button.add_css_class(f'vote-{choice}')
+            button.update_property([Gtk.AccessibleProperty.LABEL], [words])
+            self.hint(button, words)
+            button.connect('clicked', lambda _b, c=choice: self.command([*DRAINHOUND, 'vote', c], done=None))
+            header.append(button)
         close = Gtk.Button.new_from_icon_name('window-close-symbolic')
         close.add_css_class('flat')
-        close.set_valign(Gtk.Align.START)
         close.update_property([Gtk.AccessibleProperty.LABEL], ['Close battery panel'])
         close.connect('clicked', self.close)
         header.append(close)
         card.append(header)
 
-        # One filter row above everything it scopes.
+        # One filter row above everything it scopes, and the tabs.
         controls = Gtk.Box(spacing=6)
+        controls.add_css_class('controls')
         group = None
+        ranges = Gtk.Box()
+        ranges.add_css_class('linked')
         for name in RANGES:
             button = Gtk.ToggleButton(label=name)
             button.set_group(group)
             group = group or button
             button.set_active(name == self.range_name)
             button.connect('toggled', lambda b, n=name: b.get_active() and self.set_range(n))
-            controls.append(button)
-        controls.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
+            ranges.append(button)
+        controls.append(ranges)
         back = Gtk.Button.new_from_icon_name('go-previous-symbolic')
         back.connect('clicked', lambda _b: self.shift(-1))
         controls.append(back)
-        self.period = Gtk.Label(width_chars=26)
+        self.period = Gtk.Label(width_chars=24)
         controls.append(self.period)
         self.forward = Gtk.Button.new_from_icon_name('go-next-symbolic')
         self.forward.connect('clicked', lambda _b: self.shift(1))
@@ -678,9 +243,6 @@ class BatteryPanel(Adw.Application):
         controls.append(now)
         self.spinner = Gtk.Spinner()
         controls.append(self.spinner)
-        self.summary = Gtk.Label(xalign=1, hexpand=True)
-        self.summary.add_css_class('muted')
-        controls.append(self.summary)
         card.append(controls)
         # A part of the data that failed: the rest still shows (panel_data.gather).
         self.problems = wrapped(visible=False)
@@ -688,93 +250,167 @@ class BatteryPanel(Adw.Application):
         card.append(self.problems)
 
         self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
-        switcher = Gtk.StackSwitcher(stack=self.stack)
-        card.append(switcher)
+        switcher = Gtk.StackSwitcher(stack=self.stack, hexpand=True, halign=Gtk.Align.END)
+        switcher.add_css_class('tabs')
+        controls.append(switcher)
         card.append(self.stack)
 
-        self.timeline = TimelineChart()
-        self.legend = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, max_children_per_line=9, column_spacing=12)
-        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        page.append(self.timeline)
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        # The answers first, as one line of numbers (panel_data.answers), from eta.json every 2 s.
+        self.answer_slots = []
+        strip = Gtk.Box(spacing=20)
+        for _ in range(4):
+            slot = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
+            label, value = Gtk.Label(xalign=0), Gtk.Label(xalign=0)
+            label.add_css_class('lab')
+            caption = wrapped(max_width_chars=34, width_chars=10)
+            caption.add_css_class('cap')
+            for widget in (label, value, caption):
+                slot.append(widget)
+            strip.append(slot)
+            self.answer_slots.append((slot, label, value, caption))
+        page.append(strip)
+        # Where the battery has been, and where it can go.
+        self.hero = trail.HeroChart()
+        page.append(self.hero)
+        pull_head = Gtk.Box(spacing=10)
+        lab = Gtk.Label(label="WHAT'S PULLING", valign=Gtk.Align.BASELINE_CENTER)
+        lab.add_css_class('lab')
+        pull_head.append(lab)
+        self.pull_now = Gtk.Label(valign=Gtk.Align.BASELINE_CENTER)
+        self.pull_now.add_css_class('num-small')
+        pull_head.append(self.pull_now)
+        self.pull_caption = Gtk.Label(xalign=0, hexpand=True, valign=Gtk.Align.BASELINE_CENTER, wrap=True,
+                                      max_width_chars=100)
+        self.pull_caption.add_css_class('cap')
+        pull_head.append(self.pull_caption)
+        page.append(pull_head)
+        self.pull = trail.PullChart()
+        page.append(self.pull)
+        # Looking at a past period, there is no live split to label the layers: a legend instead.
+        self.legend = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, max_children_per_line=9, column_spacing=12,
+                                  visible=False)
         page.append(self.legend)
-        note = wrapped(label='Average watts per moment, split by the battery model. Faded '
-                         'columns are on AC (chip power only); shaded bands are sleep. Hover for apps.')
-        note.add_css_class('muted')
-        page.append(note)
-        # Sleep drain sits under the timeline it shades: one dot per suspend in this period.
-        page.append(self.section('Sleep drain'))
-        self.sleep = SleepChart()
-        page.append(self.sleep)
-        self.sleep_note = self.muted(wrapped())
-        page.append(self.sleep_note)
-        scroller = Gtk.ScrolledWindow(vexpand=True, min_content_height=430, hscrollbar_policy=Gtk.PolicyType.NEVER)
+
+        lower = Gtk.Box(spacing=24)
+        lower.add_css_class('lower')
+        further = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3, hexpand=True)
+        # Columns line up through a size group per side: what and where from, the cone, the value and Apply.
+        self.ways_lead = Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL)
+        self.ways_tail = Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL)
+        head = Gtk.Box(spacing=6)
+        titles = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.ways_lead.add_widget(titles)
+        lab = Gtk.Label(label='WAYS TO GO FURTHER', xalign=0)
+        lab.add_css_class('lab')
+        titles.append(lab)
+        caption = wrapped(label='Minutes per full charge, 90% intervals. Hover one to see it on the trail.',
+                          max_width_chars=44)
+        caption.add_css_class('cap')
+        titles.append(caption)
+        head.append(titles)
+        self.ways_axis = trail.ConeAxis()
+        head.append(self.ways_axis)
+        tail = Gtk.Box()
+        self.ways_tail.add_widget(tail)
+        head.append(tail)
+        further.append(head)
+        self.ways_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        further.append(self.ways_list)
+        self.ways_more = Gtk.Label(xalign=0, wrap=True, max_width_chars=70)
+        self.ways_more.add_css_class('cap')
+        further.append(self.ways_more)
+        self.ways_already = wrapped(max_width_chars=70)
+        self.ways_already.add_css_class('already')
+        further.append(self.ways_already)
+        self.timeline_note = wrapped(max_width_chars=70, visible=False)
+        self.timeline_note.add_css_class('cap')
+        further.append(self.timeline_note)
+        lower.append(further)
+        aside = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, width_request=280)
+        sleep = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        sleep.add_css_class('card')
+        lab = Gtk.Label(label='SLEEP', xalign=0)
+        lab.add_css_class('lab')
+        sleep.append(lab)
+        line = Gtk.Box(spacing=8)
+        self.sleep_big = Gtk.Label(xalign=0, hexpand=True)
+        self.sleep_big.add_css_class('strong')
+        line.append(self.sleep_big)
+        self.sleep_caption = Gtk.Label(xalign=1)
+        self.sleep_caption.add_css_class('cap')
+        line.append(self.sleep_caption)
+        sleep.append(line)
+        self.sleep_dots = trail.SleepDots()
+        sleep.append(self.sleep_dots)
+        self.sleep_note = wrapped(max_width_chars=40)
+        self.sleep_note.add_css_class('cap')
+        sleep.append(self.sleep_note)
+        aside.append(sleep)
+        busy = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        busy.add_css_class('card')
+        line = Gtk.Box()
+        lab = Gtk.Label(label='NOW', xalign=0, hexpand=True)
+        lab.add_css_class('lab')
+        line.append(lab)
+        caption = Gtk.Label(label='CPU, past minute')
+        caption.add_css_class('cap')
+        line.append(caption)
+        busy.append(line)
+        self.procs = trail.ProcessList()
+        busy.append(self.procs)
+        aside.append(busy)
+        lower.append(aside)
+        page.append(lower)
+        footer = Gtk.Box(spacing=10)
+        about = Gtk.Expander(label='About these numbers', hexpand=True)
+        self.about = wrapped(max_width_chars=90)
+        self.about.add_css_class('cap')
+        about.set_child(self.about)
+        footer.append(about)
+        self.power_log = Gtk.Label(xalign=1, valign=Gtk.Align.START)
+        self.power_log.add_css_class('cap')
+        footer.append(self.power_log)
+        page.append(footer)
+        scroller = Gtk.ScrolledWindow(vexpand=True, min_content_height=600, hscrollbar_policy=Gtk.PolicyType.NEVER)
         scroller.set_child(page)
         self.stack.add_titled(scroller, 'timeline', 'Timeline')
         self.stack.add_titled(self.build_experiments(), 'experiments', 'Experiments')
         self.window.set_content(outer)
 
     def build_experiments(self):
-        """Automatic experiments and 👍/👎 votes, what each setting saves,
-        model estimates for apps and the display, and the lock-screen and boot
-        experiments. Built once; fill_experiments updates it in place."""
-        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        top = Gtk.Box(spacing=10)
+        """Automatic experiments: what the runner is doing; what the goal would change, whether more
+        testing pays, and the votes; what each setting saves on one axis (a forest plot), grouped by
+        how automatic runs treat it; and the lock-screen and boot experiments. Built once;
+        fill_experiments updates it in place."""
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        status = Gtk.Box(spacing=14)
+        status.add_css_class('card')
         self.auto_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
         self.auto_switch.connect('state-set', self.switch_experiments)
         self.hint(self.auto_switch, 'Off (drainhound experiment disable) puts every setting back to stock, '
                                     'applied ones too')
-        top.append(self.auto_switch)
+        status.append(self.auto_switch)
+        info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
         title = Gtk.Label(label='Automatic experiments', xalign=0)
-        title.add_css_class('heading')
-        top.append(title)
+        title.add_css_class('strong')
+        info.append(title)
         self.banner = wrapped(hexpand=True)
-        self.banner.add_css_class('banner')
-        top.append(self.banner)
+        info.append(self.banner)
+        status.append(info)
         self.stop_button = Gtk.Button(label='Stop', valign=Gtk.Align.CENTER)
         self.stop_button.add_css_class('destructive-action')
         self.stop_button.connect('clicked', lambda _b: self.command([*DRAINHOUND, 'experiment', 'stop']))
-        top.append(self.stop_button)
-        page.append(top)
-        votes = Gtk.Box(spacing=8)
-        votes.append(Gtk.Label(label='Right now the laptop is'))
-        for choice, label in (('up', 'Especially good'), ('down', 'Worse than it should be')):
-            content = Gtk.Box(spacing=6)
-            thumb = Gtk.Label(label=qol.GLYPHS[choice])
-            thumb.add_css_class('thumb')
-            content.append(thumb)
-            content.append(Gtk.Label(label=label))
-            button = Gtk.Button(child=content)
-            button.add_css_class(f'vote-{choice}')
-            button.connect('clicked', lambda _b, c=choice: self.command([*DRAINHOUND, 'vote', c], done=None))
-            votes.append(button)
-        self.vote_note = self.muted(wrapped(hexpand=True))
-        votes.append(self.vote_note)
+        status.append(self.stop_button)
         self.resume_button = Gtk.Button(label='Resume now', valign=Gtk.Align.CENTER)
+        self.hint(self.resume_button, 'End the rest after a 👎 (drainhound vote resume)')
         self.resume_button.connect('clicked', lambda _b: self.command([*DRAINHOUND, 'vote', 'resume']))
-        votes.append(self.resume_button)
-        page.append(votes)
-        self.experiments_note = self.muted(wrapped())
-        page.append(self.experiments_note)
-        # What the numbers below were computed on, and how fresh the models are.
-        self.health = self.muted(wrapped())
-        self.health.add_css_class('health')
-        page.append(self.health)
+        status.append(self.resume_button)
+        page.append(status)
 
-        page.append(self.section('Settings'))
-        self.lever_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
-        self.lever_list.add_css_class('boxed-list')
-        page.append(self.lever_list)
-        self.accuracy = self.muted(wrapped())
-        page.append(self.accuracy)
-        # Whether more testing is worth it: what it would save and cost.
-        self.worth = self.muted(wrapped())
-        page.append(self.worth)
-        self.worth_grid, self.worth_rows = Gtk.Grid(column_spacing=18, row_spacing=2, margin_start=12), None
-        page.append(self.worth_grid)
-        self.together = self.muted(wrapped())
-        page.append(self.together)
-        best = Gtk.Box(spacing=8)
-        goals = Gtk.Box(valign=Gtk.Align.CENTER)
+        trio = Gtk.Box(spacing=12, homogeneous=True)
+        goal = self.card('What the goal would change')
+        goals = Gtk.Box(halign=Gtk.Align.START)
         goals.add_css_class('linked')
         self.goal_buttons, group = {}, None
         for name, label in (('battery', 'Battery'), ('comfort', 'Comfort')):
@@ -784,43 +420,118 @@ class BatteryPanel(Adw.Application):
             button.connect('toggled', lambda b, n=name: b.get_active() and not self.syncing and self.set_goal(n))
             goals.append(button)
             self.goal_buttons[name] = button
-        best.append(goals)
-        self.best_label = wrapped(hexpand=True)
-        self.best_label.add_css_class('result')
-        best.append(self.best_label)
-        self.apply_button = Gtk.Button(label='Apply', valign=Gtk.Align.CENTER, visible=False)
+        goal.append(goals)
+        self.best_label = wrapped(max_width_chars=30)
+        self.best_label.add_css_class('cap')
+        goal.append(self.best_label)
+        self.apply_button = Gtk.Button(label='Apply', halign=Gtk.Align.START, visible=False)
+        self.apply_button.add_css_class('go')
         self.hint(self.apply_button, 'Until reboot, on battery: on AC they go back to stock and return on '
                                      'battery. Risky settings and quarantined ones are left out; the note under '
                                      'the banner says which.')
         self.apply_button.connect('clicked', lambda _b: self.apply_best())
-        best.append(self.apply_button)
-        page.append(best)
+        goal.append(self.apply_button)
+        trio.append(goal)
+        worth = self.card('Is more testing worth it?')
+        self.worth_chart = trail.WorthChart()
+        worth.append(self.worth_chart)
+        self.worth = wrapped(max_width_chars=40)
+        self.worth.add_css_class('cap')
+        worth.append(self.worth)
+        trio.append(worth)
+        votes = self.card('Right now the laptop is')
+        for choice, label in (('up', 'Especially good'), ('down', 'Worse than it should be')):
+            content = Gtk.Box(spacing=8)
+            thumb = Gtk.Label(label=qol.GLYPHS[choice])
+            thumb.add_css_class('thumb')
+            content.append(thumb)
+            content.append(Gtk.Label(label=label))
+            button = Gtk.Button(child=content)
+            button.add_css_class(f'vote-{choice}')
+            button.connect('clicked', lambda _b, c=choice: self.command([*DRAINHOUND, 'vote', c], done=None))
+            votes.append(button)
+        self.vote_note = wrapped(max_width_chars=36)
+        self.vote_note.add_css_class('cap')
+        votes.append(self.vote_note)
+        trio.append(votes)
+        page.append(trio)
 
-        page.append(self.section('Apps and display (model estimates)'))
-        self.whatif = WhatIfChart(lambda _row: None)
-        page.append(self.whatif)
-        self.whatif_note = self.muted(wrapped())
-        page.append(self.whatif_note)
+        # The forest plot: columns line up through size groups.
+        self.forest_lead = Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL)
+        self.forest_value = Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL)
+        head = Gtk.Box(spacing=8)
+        titles = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.forest_lead.add_widget(titles)
+        lab = Gtk.Label(label='WHAT EACH SETTING SAVES', xalign=0)
+        lab.add_css_class('lab')
+        titles.append(lab)
+        caption = Gtk.Label(label='Minutes per full charge, 90% intervals.', xalign=0)
+        caption.add_css_class('cap')
+        titles.append(caption)
+        head.append(titles)
+        head.append(trail.ForestAxis())
+        gain = Gtk.Label(label='Gain', xalign=0, valign=Gtk.Align.END)
+        gain.add_css_class('cap')
+        self.forest_value.add_widget(gain)
+        head.append(gain)
+        evidence = Gtk.Label(label='Evidence', xalign=0, hexpand=True, valign=Gtk.Align.END)
+        evidence.add_css_class('cap')
+        head.append(evidence)
+        include = Gtk.Label(label='In', valign=Gtk.Align.END, width_chars=8, xalign=0)
+        include.add_css_class('cap')
+        self.hint(include, 'Include in automatic runs')
+        head.append(include)
+        page.append(head)
+        self.lever_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        page.append(self.lever_list)
 
-        page.append(self.section('On the lock screen and at boot'))
+        lab = Gtk.Label(label='ON THE LOCK SCREEN AND AT BOOT', xalign=0, margin_top=6)
+        lab.add_css_class('lab')
+        page.append(lab)
         length = Gtk.Box(spacing=8)
         length.append(Gtk.Label(label='Freezing experiments run for'))
-        self.minutes = Gtk.DropDown.new_from_strings([f'{h} h' for h in BATTERY_HOURS])
-        self.minutes.set_selected(BATTERY_HOURS.index(4))
-        length.append(self.minutes)
-        length.append(Gtk.Label(label='of battery time (they stop automatic experiments meanwhile).'))
+        hours, group = Gtk.Box(), None
+        hours.add_css_class('linked')
+        self.minutes_hours = 4
+        for h in BATTERY_HOURS:
+            button = Gtk.ToggleButton(label=f'{h} h', active=h == self.minutes_hours)
+            button.set_group(group)
+            group = group or button
+            button.connect('toggled', lambda b, h=h: b.get_active() and setattr(self, 'minutes_hours', h))
+            hours.append(button)
+        length.append(hours)
+        length.append(wrapped(label='of battery time (they stop automatic experiments meanwhile).', max_width_chars=40,
+                              hexpand=True))
         page.append(length)
-        self.experiment_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
-        self.experiment_list.add_css_class('boxed-list')
-        for row in (self.freeze_row(), self.freeze_all_row(), self.psr_row()):
-            self.experiment_list.append(row)
-        # The two freezing rows show only with app scopes to freeze, PSR's with a 'psr' boot arm.
-        self.freeze_rows = [self.experiment_list.get_row_at_index(i) for i in (0, 1)]
-        self.psr_list_row = self.experiment_list.get_row_at_index(2)
-        page.append(self.experiment_list)
-        scroller = Gtk.ScrolledWindow(vexpand=True, min_content_height=430, hscrollbar_policy=Gtk.PolicyType.NEVER)
+        cards = Gtk.Box(spacing=12, homogeneous=True, valign=Gtk.Align.START)
+        self.freeze_cards = [self.freeze_row(), self.freeze_all_row()]
+        self.psr_card = self.psr_row()
+        for card in (*self.freeze_cards, self.psr_card):
+            cards.append(card)
+        page.append(cards)
+        # The long explanations: behind a disclosure.
+        about = Gtk.Expander(label='About these numbers')
+        notes = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.experiments_note, self.health = wrapped(max_width_chars=110), wrapped(max_width_chars=110)
+        self.accuracy, self.together = wrapped(max_width_chars=110), wrapped(max_width_chars=110)
+        self.worth_note = wrapped(max_width_chars=110)
+        for label in (self.experiments_note, self.accuracy, self.worth_note, self.together, self.health):
+            label.add_css_class('cap')
+            notes.append(label)
+        about.set_child(notes)
+        page.append(about)
+        scroller = Gtk.ScrolledWindow(vexpand=True, min_content_height=600, hscrollbar_policy=Gtk.PolicyType.NEVER)
         scroller.set_child(page)
         return scroller
+
+    @staticmethod
+    def card(title):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.add_css_class('card')
+        label = Gtk.Label(label=title, xalign=0)
+        label.add_css_class('strong')
+        box.append(label)
+        return box
 
     @staticmethod
     def section(title):
@@ -946,7 +657,7 @@ class BatteryPanel(Adw.Application):
             label += ' – ' + time.strftime('%a %b %-d', time.localtime(end - 1))
         self.period.set_text(label)
         self.forward.set_sensitive(self.offset < 0)
-        for chart in (self.timeline, self.sleep, self.whatif):
+        for chart in (self.hero, self.pull):
             chart.loading = True
             chart.queue_draw()
         self.spinner.start()
@@ -1002,44 +713,45 @@ class BatteryPanel(Adw.Application):
             self.spinner.stop()
             self.loaded, self.busy = time.time(), False
         self.show_problems(result.get('errors') or {})
+        at_now = self.offset == 0
+        for chart in (self.hero, self.pull):
+            chart.loading = False
         if 'error' in result:
             # Nothing of the previous period stays under the new one's label.
-            self.summary.set_text(result['error'])
-            self.timeline.set_data([], self.shown, [])
-            self.sleep.set_data([], self.shown, None)
-            self.whatif.set_data([])
-            self.whatif_note.set_text('')
-            for chart in (self.timeline, self.sleep, self.whatif):
-                chart.loading = False
-            self.fill_legend([])
+            self.period_text = result['error']
+            self.hero.set_data([], self.shown, [], self.range_name, at_now)
+            self.pull.set_data([], self.shown, at_now)
+            self.fill_legend([], at_now)
+            self.refresh_live()
             return
-        self.timeline.loading = self.sleep.loading = False
         points = result['points']
-        self.timeline.set_data(points, result['span'], result['sleeps'])
-        self.fill_legend(points)
+        self.hero.set_data(points, result['span'], result['sleeps'], self.range_name, at_now)
+        self.pull.set_data(points, result['span'], at_now)
+        self.fill_legend(points, at_now)
         battery = [p for p in points if p['st'] == 'D' and p['bat']]
+        where = {'6 h': 'these 6 h', 'Day': 'this day', 'Week': 'this week'}[self.range_name]
         if battery:
             mean = sum(p['bat'] for p in battery) / len(battery)
-            self.summary.set_text(f'{duration(len(battery) / 60)} on battery · {mean:.1f} W average')
+            self.period_text = f'{mean:.1f} W average over the {duration(len(battery) / 60)} on battery in {where}'
         else:
-            self.summary.set_text('No battery time in this period')
-        drains = sorted(s['pct_per_hour'] for s in result['sleeps_all'])
-        median = drains[len(drains) // 2] if drains else None
-        self.sleep.set_data(result['sleeps'], result['span'], median)
-        if drains:
-            watts = sorted(s['watts'] for s in result['sleeps_all'])[len(drains) // 2]
-            self.sleep_note.set_text(f'{len(drains)} suspends logged; median drain {median:.1f} %/h ({watts:.2f} W) — '
-                                     f'about {100 / median:.0f} h from full to empty asleep. Dot size is sleep length.'
-                                     if median > 0 else f'{len(drains)} suspends logged.')
-        else:
-            self.sleep_note.set_text('No suspends logged yet.')
+            self.period_text = f'No battery time in {where}'
+        dots, median = week_sleeps(result['sleeps_all'])
+        self.sleep_dots.set_data(dots, median)
+        self.sleep_note.set_text(f"This week's suspends, from {len(result['sleeps_all'])} logged in all."
+                                 if result['sleeps_all'] else 'No suspends logged yet.')
+        self.refresh_live()
         if pending:
-            return  # The what-if stays faded: its estimates come with the rest.
-        self.whatif.loading = False
+            return  # Ways to go further comes with the rest.
         self.effects = result['effects']
         self.catalog, self.units = result['catalog'], result['units']
         self.psr, self.psr_arm = result.get('psr'), result.get('psr_arm')
         self.result = result
+        self.fill_ways()
+        typical = result.get('typical')
+        self.about.set_text('\n\n'.join(filter(None, (
+            typical_text(result) + ('The futures ahead are drainhound eta\'s: the models it forecasts with, '
+                                    'sampled 40 times, each landing on a quantile of the forecast.' if typical else ''),
+            what_if_note(result), health_text(result.get('health'))))))
         self.fill_experiments()
         self.refresh_status()  # The banner shows the quarantine, now known.
 
@@ -1050,22 +762,120 @@ class BatteryPanel(Adw.Application):
                                    'journalctl --user -u drainhound panel, or drainhound check.')
         self.problems.set_visible(bool(errors))
 
-    def fill_legend(self, points):
+    def fill_legend(self, points, at_now):
+        """At Now the layers carry their own labels; looking back, a legend with each layer's average
+        on battery and its share."""
         while (child := self.legend.get_first_child()) is not None:
             self.legend.remove(child)
-        present = {name for p in points for name, w in p['groups'].items() if w > .05}
+        self.legend.set_visible(not at_now)
+        if at_now:
+            return
+        battery = [p for p in points if p['st'] == 'D' and p['groups']]
+        means = {name: sum(p['groups'].get(name, 0) for p in battery) / len(battery) for name in STACK} if battery else {}
+        total = sum(means.values())
         for name in STACK:
-            if name not in present:
+            if means.get(name, 0) < .05:
                 continue
             box = Gtk.Box(spacing=5)
-            swatch = Gtk.DrawingArea(content_width=12, content_height=12, valign=Gtk.Align.CENTER)
+            swatch = Gtk.DrawingArea(content_width=10, content_height=10, valign=Gtk.Align.CENTER)
             swatch.set_draw_func(lambda _a, cr, w, h, c=COLORS[name]: (cr.set_source_rgba(*rgb(c)),
-                                                                     rounded(cr, 0, 0, w, h, 3), cr.fill()))
+                                                                     rounded(cr, 0, 0, w, h, 2), cr.fill()))
             box.append(swatch)
-            label = Gtk.Label(label=name)
-            label.add_css_class('muted')
+            label = Gtk.Label(label=f'{name} {means[name]:.1f} W · {means[name] / total * 100:.0f}%')
+            label.add_css_class('cap')
             box.append(label)
             self.legend.append(box)
+
+    def fill_ways(self):
+        """Ways to go further (panel_data.ways): each row hovers its change onto the hero as a ghost of
+        the futures; tested settings that would change something carry Apply."""
+        result = self.result
+        data = ways(result.get('estimates'), result.get('levers'), self.settings(), result.get('quarantine'))
+        energy, typical = result.get('energy'), result.get('typical')
+        self.full_minutes = 60 * energy / typical if finite(energy, typical) and typical > 0 else None
+        rows = data['rows']
+        top = max([r['high'] if finite(r.get('high')) else r['minutes'] for r in rows] + [20])
+        scale = (0, max(20, -(-top // 20) * 20))
+        self.ways_axis.set_scale(scale)
+        while (child := self.ways_list.get_first_child()) is not None:
+            self.ways_list.remove(child)
+        for row in rows:
+            self.ways_list.append(self.way_row(row, scale))
+        more = data['more']
+        self.ways_more.set_text(f"▸ {len(more)} more estimates under +3 min: {', '.join(more)}." if more else '')
+        self.ways_more.set_visible(bool(more))
+        already = ''
+        if data['already']:
+            names = ' · '.join(label for label, _ in data['already'])
+            together = sum(m for _, m in data['already'])
+            already = f'<b>ALREADY SET</b>  {GLib.markup_escape_text(names)}: about +{together:.0f} min together ' \
+                      '(the sum of their separate gains).'
+        if data['unclear']:
+            already += (' ' if already else '') + GLib.markup_escape_text(
+                f"{', '.join(data['unclear'])}: set, with no clear effect yet.")
+        self.ways_already.set_markup(already)
+        self.ways_already.set_visible(bool(already))
+        if not rows:
+            empty = Gtk.Label(label=what_if_note(result) if not result.get('estimates') else
+                              'Nothing measured would give back more than 3 minutes.', xalign=0, wrap=True,
+                              max_width_chars=70)
+            empty.add_css_class('cap')
+            self.ways_list.append(empty)
+
+    def way_row(self, row, scale):
+        box = Gtk.Box(spacing=6)
+        box.add_css_class('way')
+        lead = Gtk.Box(spacing=6)
+        self.ways_lead.add_widget(lead)
+        label = Gtk.Label(label=row['label'], xalign=0, hexpand=True, width_chars=18, max_width_chars=22,
+                          ellipsize=Pango.EllipsizeMode.END)
+        lead.append(label)
+        tested = row['kind'] == 'tested'
+        tag = Gtk.Label(label='tested' if tested else 'estimate', valign=Gtk.Align.CENTER, width_chars=8)
+        tag.add_css_class('tag')
+        if tested:
+            tag.add_css_class('tested')
+        self.hint(tag, 'Measured in randomized experiments on this laptop' if tested else
+                  'The battery model with that activity removed: an estimate, not a measurement')
+        lead.append(tag)
+        box.append(lead)
+        cone = trail.Cone()
+        cone.set_data(row, scale, tested)
+        box.append(cone)
+        minutes, interval = gain_parts(row)
+        tail = Gtk.Box(spacing=6)
+        self.ways_tail.add_widget(tail)
+        value = Gtk.Label(xalign=0, hexpand=True, width_chars=14)
+        value.set_markup(f'<b>{GLib.markup_escape_text(minutes)}</b> '
+                         f"<span alpha='70%' size='small'>{GLib.markup_escape_text(interval)}</span>")
+        tail.append(value)
+        if tested:
+            apply = Gtk.Button(label='Apply', valign=Gtk.Align.CENTER)
+            apply.add_css_class('go')
+            self.hint(apply, 'Until reboot, on battery: on AC it goes back to stock and returns on battery')
+            assignments = list(row['apply'])
+            apply.connect('clicked', lambda _b: self.command(
+                [*DRAINHOUND, 'experiment', 'apply', *assignments],
+                done=lambda out, err: apply_note(assignments, out, err)))
+            tail.append(apply)
+        else:
+            tail.append(Gtk.Box(width_request=54))
+        box.append(tail)
+        gain = f"{minutes} per full charge{f' ({interval})' if interval else ''}"
+        motion = Gtk.EventControllerMotion()
+        motion.connect('enter', lambda *_: self.preview(row, gain))
+        motion.connect('leave', lambda *_: self.hero.set_ghost(None))
+        box.add_controller(motion)
+        return box
+
+    def preview(self, row, gain):
+        """Hovering a way to go further: its change on the trail, as a ghost of the futures to the cutoff."""
+        empty = (self.futures or {}).get('empty')
+        if self.offset != 0 or not empty or not self.full_minutes:
+            return
+        scenario = ghost(empty, row['minutes'], row.get('low'), row.get('high'), self.full_minutes,
+                         seed=sum(map(ord, row['label'])))
+        self.hero.set_ghost({'scenario': scenario, 'label': row['label'], 'gain': gain})
 
     # --- experiments ------------------------------------------------------------------------
     def experiment_state(self):
@@ -1107,17 +917,15 @@ class BatteryPanel(Adw.Application):
                                    f"least certain: {least}. That is where the next blocks look.")
         else:
             self.accuracy.set_text('Include settings to experiment with.')
-        text, rows = value_text((plan or {}).get('value'), result.get('typical'), result.get('retest'))
-        self.worth.set_text(text)
-        self.worth.set_visible(bool(text))
-        if rows != self.worth_rows:  # Rebuilt only when they change.
-            while (child := self.worth_grid.get_first_child()) is not None:
-                self.worth_grid.remove(child)
-            for i, row in enumerate(rows):
-                for j, cell in enumerate(row):
-                    self.worth_grid.attach(self.muted(Gtk.Label(label=cell, xalign=0)), j, i, 1, 1)
-            self.worth_rows = rows
-        self.worth_grid.set_visible(bool(rows))
+        value = (plan or {}).get('value')
+        text, _rows = value_text(value, result.get('typical'), result.get('retest'))
+        verdict, _, why = text.partition('. ')  # The verdict on the card; how it is priced under About.
+        self.worth.set_text(f'{verdict}.' if why else text or 'Priced once automatic experiments have run.')
+        self.worth_why = why
+        self.worth_note.set_text(self.worth_why)
+        self.worth_note.set_visible(bool(self.worth_why))
+        self.worth_chart.set_data([r for r in (value or {}).get('rows') or []
+                                   if finite(r.get('hours'), r.get('saves'), r.get('costs'))])
         interactions = levers.get('interactions') or []
         found = [i for i in interactions if interaction_clear(i)]
         if found:
@@ -1134,72 +942,125 @@ class BatteryPanel(Adw.Application):
             self.together.set_text('')
         self.together.set_visible(bool(self.together.get_text()))
         self.fill_best()
-        self.whatif.set_data(result.get('estimates') or [])
-        self.whatif_note.set_text(what_if_note(result))
         active = self.manual_active()
         self.fill_units()
-        for row in self.freeze_rows:
-            row.set_visible(bool(self.units))
+        for card in self.freeze_cards:
+            card.set_visible(bool(self.units))
         self.freeze_allowed = not active and bool(self.units)
         self.freeze_sensitivity()
         freezes = {e['experiment']: e for e in self.effects}
         self.fill_freeze_all(freezes.get('freeze-apps'), active)
-        self.psr_list_row.set_visible('psr' in (result.get('boot_arms') or {}))
+        self.psr_card.set_visible('psr' in (result.get('boot_arms') or {}))
         self.fill_psr()
 
     def fill_levers(self, rows):
-        """The settings rows, updated in place; rebuilt only when the settings
-        themselves change (a rebuild closes a hint and drops focus)."""
-        names = [row['name'] for row in rows]
+        """The forest plot, by how automatic runs treat each setting, best first within each group;
+        rebuilt only when the settings or their groups change (a rebuild closes a hint and drops
+        focus), else updated in place."""
+        groups = (('auto', 'IN AUTOMATIC RUNS', 'The blocks vary these.'),
+                  ('risky', 'KEPT OUT: RISKY FOR SOME HARDWARE', 'Measured in runs you start. Add one with --risky.'),
+                  ('other', 'NOT IN THE POOL', 'Tick to let automatic runs vary it.'),
+                  ('quarantined', 'QUARANTINED', 'After a hardware incident: automatic experiments leave these alone.'),
+                  ('unavailable', 'UNAVAILABLE', ''))
+        gain = lambda row: -(row['effect'] or {}).get('minutes', -1e9) if finite((row['effect'] or {}).get('minutes')) else 1e9
+        ordered = [(group, row) for group, *_ in groups for row in sorted(rows, key=gain) if row['group'] == group]
+        names = [(group, row['name']) for group, row in ordered]
         if names != self.lever_names:
             self.hint_popover.popdown()  # Its widget may be about to go.
             while (child := self.lever_list.get_first_child()) is not None:
                 self.lever_list.remove(child)
             self.lever_widgets = {}
-            for row in rows:
-                box, self.lever_widgets[row['name']] = self.lever_row(row['name'], row['label'])
-                self.lever_list.append(box)
+            shown = {group for group, _ in names}
+            for group, title, note in groups:
+                if group not in shown:
+                    continue
+                head = Gtk.Box(spacing=10, margin_top=8)
+                head.add_css_class('forest-group')
+                lab = Gtk.Label(label=title, xalign=0)
+                lab.add_css_class('lab')
+                head.append(lab)
+                caption = Gtk.Label(label=note, xalign=0, ellipsize=Pango.EllipsizeMode.END, hexpand=True)
+                caption.add_css_class('cap')
+                head.append(caption)
+                self.lever_list.append(head)
+                for g, row in ordered:
+                    if g == group:
+                        box, self.lever_widgets[row['name']] = self.lever_row(row['name'], row['label'], group)
+                        self.lever_list.append(box)
             self.lever_names = names
-        scale = shared_scale([row['effect'] for row in rows])
         self.syncing = True
         try:
             for row in rows:
                 widgets = self.lever_widgets[row['name']]
-                widgets['detail'].set_text(row['detail'])
-                widgets['bar'].set_data(row['effect'], scale)
-                widgets['value'].set_text(row['value'])
-                widgets['evidence'].set_text(row['evidence'])
+                widgets['sub'].set_text(f"Now {row['now']} · or {row['other']}" if row['now'] else row['detail'])
+                widgets['forest'].set_data(row['effect'])
+                minutes, interval = gain_parts(row['effect'])
+                widgets['value'].set_markup(
+                    f'<b>{GLib.markup_escape_text(minutes)}</b> '
+                    f"<span alpha='70%' size='small'>({GLib.markup_escape_text(interval)})</span>" if minutes
+                    else GLib.markup_escape_text(row['value']))
+                widgets['verdict'].set_text(row['verdict'])
+                blocks = (row['effect'] or {}).get('blocks') or {}
+                widgets['evidence'].set_text(
+                    f"{blocks.get('on', 0)} + {blocks.get('off', 0)} blocks · {row['effect'].get('hours', 0):.0f} h"
+                    if row['effect'] else row['evidence'])
+                widgets['comfort'].set_text(row['comfort'])
                 widgets['check'].set_active(row['included'])
                 widgets['check'].set_sensitive(row['sensitive'])
-                self.hints[row['name']] = (row['description'], row['include_hint'])
+                saving, safe = row['saving'], row['group'] not in ('risky', 'quarantined', 'unavailable')
+                widgets['apply'].set_label('Set' if saving else 'Apply')
+                widgets['apply'].set_sensitive(safe and not saving)
+                self.hints[row['name']] = (row['description'], row['include_hint'],
+                                           'Already at its saving value' if saving else
+                                           'Until reboot, on battery: on AC it goes back to stock and returns on '
+                                           'battery' if safe else 'Not from the panel: ' + row['include_hint'])
         finally:
             self.syncing = False
 
-    def lever_row(self, name, label):
-        """One setting's row, and its widgets for fill_levers."""
-        row = Gtk.Box(spacing=10)
-        row.add_css_class('experiment')
-        info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
-        title = Gtk.Label(xalign=0, label=label)
-        title.add_css_class('heading')
-        info.append(title)
-        detail = self.muted(wrapped(max_width_chars=56))
-        info.append(detail)
-        self.hint(info, lambda: self.hints.get(name, ('', ''))[0])
-        row.append(info)
-        bar = GainBar()
-        row.append(bar)
-        numbers = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, valign=Gtk.Align.CENTER)
-        value = Gtk.Label(xalign=1, width_chars=17)
+    def lever_row(self, name, label, group):
+        """One setting's row on the forest plot, and its widgets for fill_levers."""
+        row = Gtk.Box(spacing=8)
+        row.add_css_class('forest-row')
+        lead = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1, valign=Gtk.Align.CENTER)
+        self.forest_lead.add_widget(lead)
+        title = Gtk.Label(label=label, xalign=0, width_chars=24, max_width_chars=28, ellipsize=Pango.EllipsizeMode.END)
+        title.add_css_class('strong')
+        lead.append(title)
+        sub = Gtk.Label(xalign=0, max_width_chars=30, ellipsize=Pango.EllipsizeMode.END)
+        sub.add_css_class('cap')
+        lead.append(sub)
+        self.hint(lead, lambda: self.hints.get(name, ('', '', ''))[0])
+        row.append(lead)
+        forest = trail.Forest()
+        row.append(forest)
+        numbers = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1, valign=Gtk.Align.CENTER)
+        self.forest_value.add_widget(numbers)
+        value = Gtk.Label(xalign=0, width_chars=16)
         numbers.append(value)
-        evidence = self.muted(Gtk.Label(xalign=1, width_chars=17))
-        numbers.append(evidence)
+        verdict = Gtk.Label(xalign=0)
+        verdict.add_css_class('cap')
+        numbers.append(verdict)
         row.append(numbers)
-        check = Gtk.CheckButton(label='Include', valign=Gtk.Align.CENTER)
-        self.hint(check, lambda: self.hints.get(name, ('', ''))[1])
+        proof = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1, valign=Gtk.Align.CENTER, hexpand=True)
+        evidence = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END, max_width_chars=34)
+        proof.append(evidence)
+        comfort = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END, max_width_chars=40)
+        comfort.add_css_class('cap')
+        proof.append(comfort)
+        row.append(proof)
+        check = Gtk.CheckButton(valign=Gtk.Align.CENTER)
+        self.hint(check, lambda: self.hints.get(name, ('', '', ''))[1])
         check.connect('toggled', lambda b: self.syncing or self.set_pool(name, b.get_active()))
         row.append(check)
-        return row, {'detail': detail, 'bar': bar, 'value': value, 'evidence': evidence, 'check': check}
+        apply = Gtk.Button(label='Apply', valign=Gtk.Align.CENTER)
+        apply.add_css_class('go')
+        self.hint(apply, lambda: self.hints.get(name, ('', '', ''))[2])
+        assignment = [f'{name}=saving']
+        apply.connect('clicked', lambda _b: self.command([*DRAINHOUND, 'experiment', 'apply', *assignment],
+                                                         done=lambda out, err: apply_note(assignment, out, err)))
+        row.append(apply)
+        return row, {'sub': sub, 'forest': forest, 'value': value, 'verdict': verdict, 'evidence': evidence,
+                     'comfort': comfort, 'check': check, 'apply': apply}
 
     def set_pool(self, name, included):
         """One box, one name: `pool add|remove NAME` leaves the rest of the chosen
@@ -1276,13 +1137,13 @@ class BatteryPanel(Adw.Application):
                          done=lambda out, err: apply_note(assignments, out, err))
 
     def freeze_row(self):
-        row = Gtk.Box(spacing=10)
-        row.add_css_class('experiment')
-        info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, hexpand=True)
-        title = Gtk.Label(xalign=0, label='Close an app (freeze it in B blocks)')
-        title.add_css_class('heading')
+        row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        row.add_css_class('card')
+        info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        title = wrapped(label='Close an app (freeze it in B blocks)', max_width_chars=30)
+        title.add_css_class('strong')
         info.append(title)
-        choice = Gtk.Box(spacing=8)
+        choice = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self.unit_model = Gtk.StringList()
         self.unit_picker = Gtk.DropDown(model=self.unit_model)
         self.unit_picker.connect('notify::selected', lambda *_: self.freeze_sensitivity())
@@ -1291,11 +1152,12 @@ class BatteryPanel(Adw.Application):
         choice.append(self.only_locked)
         info.append(choice)
         note = wrapped(label='Measures everything the app costs, wakeups included. Frozen '
-                         'apps stop responding until their B block ends.')
+                         'apps stop responding until their B block ends.', max_width_chars=34)
         note.add_css_class('muted')
         info.append(note)
         row.append(info)
-        self.freeze_start = Gtk.Button(label='Start', valign=Gtk.Align.CENTER)
+        self.freeze_start = Gtk.Button(label='Start', halign=Gtk.Align.START)
+        self.freeze_start.add_css_class('go')
         self.freeze_start.connect('clicked', lambda _b: self.start_freeze())
         row.append(self.freeze_start)
         return row
@@ -1328,26 +1190,28 @@ class BatteryPanel(Adw.Application):
             self.start('freeze', unit=unit, only_locked=self.only_locked.get_active())
 
     def freeze_all_row(self):
-        row = Gtk.Box(spacing=10)
-        row.add_css_class('experiment')
-        info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, hexpand=True)
-        title = Gtk.Label(xalign=0, label='Close every app (freeze all, while locked)')
-        title.add_css_class('heading')
+        row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        row.add_css_class('card')
+        info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        title = wrapped(label='Close every app (freeze all, while locked)', max_width_chars=30)
+        title.add_css_class('strong')
         info.append(title)
         info.append(self.muted(wrapped(label='Runs only while the screen is locked. Frozen blocks measure the '
-                                       'platform floor; A − B is what the apps cost in the background.')))
+                                       'platform floor; A − B is what the apps cost in the background.',
+                                       max_width_chars=34)))
         keeping = experiment.freeze_keep()  # config [experiments] freeze_keep
         self.keep_apps = Gtk.CheckButton(label=f"Keep {', '.join(keeping)} running", active=True,
                                          visible=bool(keeping))
         info.append(self.keep_apps)
-        self.freeze_all_result = Gtk.Label(xalign=0, visible=False)
+        self.freeze_all_result = wrapped(visible=False, max_width_chars=34)
         self.freeze_all_result.add_css_class('result')
         info.append(self.freeze_all_result)
         row.append(info)
-        buttons = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, valign=Gtk.Align.CENTER)
+        buttons = Gtk.Box(spacing=6)
         keep = lambda: ([a for k in keeping for a in ('--keep', k)] if self.keep_apps.get_active()
                         else ['--keep', '//'])  # '//' matches nothing.
         self.freeze_all_start = Gtk.Button(label='Start')
+        self.freeze_all_start.add_css_class('go')
         self.freeze_all_start.connect('clicked', lambda _b: self.start('freeze-apps', extra=keep()))
         buttons.append(self.freeze_all_start)
         self.freeze_test = Gtk.Button(label='Test now (5 s)')
@@ -1386,19 +1250,19 @@ class BatteryPanel(Adw.Application):
         return text
 
     def psr_row(self):
-        row = Gtk.Box(spacing=10)
-        row.add_css_class('experiment')
-        info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, hexpand=True)
-        title = Gtk.Label(xalign=0, label='Panel self-refresh (PSR) — boot-level')
-        title.add_css_class('heading')
+        row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        row.add_css_class('card')
+        info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        title = wrapped(label='Panel self-refresh (PSR) — boot-level', max_width_chars=30)
+        title.add_css_class('strong')
         info.append(title)
-        self.psr_note = self.muted(wrapped())
+        self.psr_note = self.muted(wrapped(max_width_chars=34))
         info.append(self.psr_note)
-        self.psr_result = Gtk.Label(xalign=0, visible=False)
+        self.psr_result = wrapped(visible=False, max_width_chars=34)
         self.psr_result.add_css_class('result')
         info.append(self.psr_result)
         row.append(info)
-        buttons = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, valign=Gtk.Align.CENTER)
+        buttons = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         self.psr_buttons = {}
         for arm, label in (('psr', 'Next boot: PSR on'), ('default', 'Next boot: default')):
             button = Gtk.Button(label=label)
@@ -1436,7 +1300,7 @@ class BatteryPanel(Adw.Application):
         return label
 
     def start(self, names, unit=None, only_locked=False, extra=()):
-        minutes = 60 * BATTERY_HOURS[self.minutes.get_selected()]
+        minutes = 60 * self.minutes_hours
         names = [names] if isinstance(names, str) else list(names)
         command = [*DRAINHOUND, 'experiment', 'start', *names, '--minutes', str(minutes)]
         if unit:
@@ -1476,20 +1340,60 @@ class BatteryPanel(Adw.Application):
     def set_note(self, text, seconds=None):
         """Under the banner until the next command, or for `seconds`."""
         self.note, self.note_until = text or '', time.monotonic() + seconds if seconds else None
+        self.timeline_note.set_text(self.note)
+        self.timeline_note.set_visible(bool(self.note))
         self.refresh_status()
 
     def refresh_status(self):
-        """The header's status line and the experiments banner, from the files
-        the services write; neither may raise (the 2 s timer calls this)."""
+        """The live parts and the experiments banner, from the files the services
+        write; neither may raise (the 2 s timer calls this)."""
         try:
-            self.status.set_text(status_line(read_estimate(RUNTIME / 'eta.json'), read_battery()))
-        except Exception:  # noqa: BLE001 - one bad line must not stop the rest
+            self.refresh_live()
+        except Exception:  # noqa: BLE001 - one bad file must not stop the rest
             traceback.print_exc()
-            self.status.set_text('')
         try:
             self.refresh_experiments()
         except Exception:  # noqa: BLE001
             traceback.print_exc()
+
+    def refresh_live(self):
+        """What drainhound eta (eta.json, futures.json) and the collector (snapshot.json) say now: the
+        header's state, the answers, the futures ahead, the labels on what's pulling, the busiest apps."""
+        now = time.time()
+        estimate, battery = read_estimate(RUNTIME / 'eta.json', now), read_battery()
+        self.state.set_text(state_text(estimate, battery))
+        items = answers(estimate, now)
+        for i, (slot, label, value, caption) in enumerate(self.answer_slots):
+            slot.set_visible(i < len(items))
+            if i < len(items):
+                item = items[i]
+                label.set_text(item['label'].upper())
+                value.set_text(item['value'])
+                value.set_css_classes(['big' if item['big'] else 'num'])
+                caption.set_markup(item['caption'])
+        self.futures = read_futures(RUNTIME / 'futures.json', now)
+        level = (estimate or {}).get('pct') if finite((estimate or {}).get('pct')) else (battery or {}).get('pct')
+        self.hero.set_live(self.futures if self.offset == 0 else None, level, now)
+        snapshot = read_snapshot(RUNTIME / 'snapshot.json', now)
+        labels = pull_labels(snapshot)
+        self.pull.set_labels(labels if self.offset == 0 else None)
+        self.pull.set_now(now)
+        live = labels and self.offset == 0 and finite(labels.get('total'))
+        self.pull_now.set_text(f"{labels['total']:.1f} W" if live else '')
+        self.pull_now.set_visible(bool(live))
+        typical = (self.result or {}).get('typical')
+        self.pull_caption.set_text(' · '.join(filter(None, (
+            f"now, {labels['window']}" if live and labels.get('window') else '', getattr(self, 'period_text', ''),
+            f'{typical:.1f} W typical' if finite(typical) else ''))))
+        self.procs.set_data(processes(snapshot))
+        asleep = (estimate or {}).get('sleep') or {}
+        self.sleep_big.set_text(f"~{long_duration(asleep['hours'])} from now" if finite(asleep.get('hours')) else
+                                'Asleep from now: waiting for drainhound eta')
+        self.sleep_caption.set_text(' · '.join(filter(None, (
+            f"80%: {round(asleep['low'])}–{round(asleep['high'])} h" if finite(asleep.get('low'), asleep.get('high'))
+            else '', f"{asleep['watts']:.2f} W" if finite(asleep.get('watts')) else ''))))
+        footer = ((snapshot or {}).get('battery') or {}).get('footer')
+        self.power_log.set_text(footer if isinstance(footer, str) else '')
 
     def refresh_experiments(self):
         state = self.experiment_state()
@@ -1518,20 +1422,20 @@ class BatteryPanel(Adw.Application):
                              + (f'\n{self.note}' if self.note else ''))
 
 
-# The panel's palette (dark: it forces Adwaita's dark style, and its charts are
-# drawn on SURFACE). A menu-theme.css beside this file, defining the same
-# @menu_* colours, overrides it, to match other panels of a desktop theme.
+# The panel's palette: Trail's night ground (docs/design/1-trail.html; its charts are
+# drawn on trail.GROUND and trail.SURFACE). A menu-theme.css beside this file,
+# defining the same @menu_* colours, overrides it, to match other panels of a desktop theme.
 PALETTE = b"""
-@define-color menu_bg #222226;
-@define-color menu_card #343437;
-@define-color menu_hover #414144;
-@define-color menu_active #343f4f;
-@define-color menu_active_hover #3a485c;
-@define-color menu_accent #3584e4;
-@define-color menu_fg #ffffff;
-@define-color menu_muted rgba(255, 255, 255, 0.68);
-@define-color menu_border rgba(255, 255, 255, 0.06);
-@define-color menu_border_strong rgba(255, 255, 255, 0.12);
+@define-color menu_bg #10171a;
+@define-color menu_card #16211f;
+@define-color menu_hover #1d2b28;
+@define-color menu_active #253a2b;
+@define-color menu_active_hover #2c4429;
+@define-color menu_accent #8cc084;
+@define-color menu_fg #ece4d4;
+@define-color menu_muted #a3b2a9;
+@define-color menu_border rgba(236, 228, 212, 0.07);
+@define-color menu_border_strong rgba(236, 228, 212, 0.13);
 """
 # Font Awesome's thumbs (qol.GLYPHS) need its font; plain emoji need none.
 THUMB_FONT = b"""
@@ -1540,19 +1444,44 @@ THUMB_FONT = b"""
 CSS = b"""
 window { background: transparent; }
 #battery-card { background: @menu_bg; color: @menu_fg; border: 1px solid @menu_border;
-                border-left-color: @menu_border_strong; border-radius: 12px;
-                padding: 12px 14px; font-family: sans-serif; font-size: 13px; }
-#battery-card .muted { color: @menu_muted; font-size: 12px; }
+                border-left-color: @menu_border_strong; border-radius: 14px;
+                padding: 14px 20px 12px; font-family: sans-serif; font-size: 13px; }
+#battery-card .muted, #battery-card .cap { color: @menu_muted; font-size: 12px; }
+#battery-card .cap b { color: @menu_fg; }
+#battery-card .lab { color: @menu_muted; font-size: 10.5px; font-weight: 700; letter-spacing: 1.6px; }
+#battery-card .panel-title { font-size: 17px; font-weight: 700; }
+#battery-card .state { color: @menu_muted; }
+#battery-card .big { font-size: 46px; font-weight: 300; }
+#battery-card .num { font-size: 27px; font-weight: 300; margin: 6px 0 3px; }
+#battery-card .num-small { font-size: 22px; font-weight: 300; }
+#battery-card .strong { font-weight: 700; }
 #battery-card .problem { color: #f0a35e; font-size: 12px; }
 #battery-card .health { font-size: 11px; }
+#battery-card .card { background: @menu_card; border: 1px solid @menu_border; border-radius: 12px; padding: 10px 12px; }
+#battery-card .already { background: @menu_card; border-radius: 10px; padding: 7px 10px; margin-top: 6px;
+                         color: @menu_muted; font-size: 12px; }
+#battery-card .lower { border-top: 1px solid @menu_border_strong; padding-top: 12px; }
+#battery-card .way { min-height: 24px; }
+#battery-card .way:hover { background: alpha(@menu_fg, 0.04); border-radius: 6px; }
+#battery-card .tag { font-size: 10px; border-radius: 999px; padding: 0 7px; border: 1px solid #44574f;
+                     color: @menu_muted; }
+#battery-card .tag.tested { background: #2c4429; color: #b9e3ad; border-color: #4d6b48; }
+#battery-card button.go { color: @menu_accent; border: 1px solid #4d6b48; padding: 1px 8px; min-height: 0; }
+#battery-card .controls { padding-bottom: 8px; border-bottom: 1px solid @menu_border_strong; }
+#battery-card stackswitcher.tabs button { background: none; border: none; box-shadow: none; color: @menu_muted;
+                                          font-weight: 700; border-radius: 0; padding: 3px 2px; margin-left: 18px;
+                                          border-bottom: 2px solid transparent; }
+#battery-card stackswitcher.tabs button:checked { color: @menu_fg; border-bottom-color: @menu_fg; }
+#battery-card button.vote { padding: 2px 9px; min-height: 0; min-width: 0; }
 #battery-card .banner { background: @menu_card; border-radius: 10px; padding: 8px 10px; }
 #battery-card .experiment { padding: 8px 10px; }
 #battery-card .result { font-weight: bold; font-size: 12px; }
 #battery-card list { background: @menu_card; border-radius: 10px; }
 #battery-card button:hover { background: @menu_hover; }
+#battery-card expander title { color: @menu_muted; font-size: 12px; }
 popover.hint > contents { background: @menu_card; color: @menu_fg; padding: 6px 9px; font-size: 12px; }
-#battery-card button.vote-up .thumb { color: #8fdf8f; }
-#battery-card button.vote-down .thumb { color: #e5484d; }
+#battery-card button.vote-up .thumb { color: #8cc084; }
+#battery-card button.vote-down .thumb { color: #e57a55; }
 """
 
 

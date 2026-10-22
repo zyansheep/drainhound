@@ -1,6 +1,7 @@
 import contextlib
 import functools
 import inspect
+import itertools
 import io
 import json
 import tempfile
@@ -767,6 +768,157 @@ class ExperimentEffectsTests(unittest.TestCase):
         minutes, _ = month(days=5)
         effects = report.experiment_effects(minutes, 50, 15)
         self.assertEqual(sorted(e['experiment'] for e in effects), ['aspm', 'freeze-apps'])
+
+
+class TrailTests(unittest.TestCase):
+    """The Trail view's data: the live files, the answers, the labels, the futures' readouts."""
+    NOW = 1_800_000_000.0
+    # The collector's snapshot as a Framework 13 wrote it (snapshot.json's battery and cpu, abridged).
+    SNAPSHOT = {'timestamp': NOW, 'battery': {
+        'title': 'Battery use · last 6 min on battery · 13.9 W', 'footer': 'Power log: 74,232 samples · 207.8 h',
+        'rows': [{'name': 'Idle chip', 'value': ' 8.8 W  63%', 'parts': [
+                     {'name': 'Memory & I/O links', 'value': ' 3.2 W'}, {'name': 'Cores & graphics', 'value': ' 1.5 W'}]},
+                 {'name': 'Floorp', 'value': ' 1.5 W  10%'}, {'name': 'Display', 'value': ' 1.4 W  10%'},
+                 {'name': 'Kernel', 'value': ' 0.5 W   4%'}, {'name': 'USB devices', 'value': ' 0.5 W   3%'},
+                 {'name': 'Everything else (62)', 'value': ' 1.4 W  10%',
+                  'parts': [{'name': 'T3 Code', 'value': ' 0.4 W'}, {'name': 'Niri', 'value': ' 0.2 W'}]}]},
+        'cpu': [{'name': 'python3.14', 'value': '2.7%'}, {'name': 'T3 Code', 'value': '1.9%'},
+                {'name': 'Floorp', 'value': '1.1%'}, {'name': 'Floorp web · PID 627118', 'value': '0.3%'},
+                {'name': 'Floorp · extensions', 'value': '0.1%'}, {'name': 'claude', 'value': '0.8%'}]}
+
+    @staticmethod
+    def line(end, start=34.0, final=2.0):
+        return {'end': end, 'pts': [[0.0, start], [end / 2, (start + final) / 2], [end, final]]}
+
+    def futures(self):
+        empty = [self.line(e) for e in (40.0, 50.0, 60.0, 70.0)]
+        full = [self.line(e, final=90.0) for e in (60.0, 80.0, 100.0, 120.0)]
+        return {'updated': self.NOW, 'now': self.NOW, 'pct': 34.0, 'cutoff_pct': 2.0, 'target': 90.0,
+                'empty': {'n': 4, 'hours': 0.9, 'low': 0.7, 'high': 1.1, 'runs': empty, 'median': self.line(55.0)},
+                'full': {'n': 4, 'hours': 1.5, 'low': 1.1, 'high': 1.9, 'runs': full,
+                         'median': self.line(90.0, final=90.0)}}
+
+    def test_live_files_are_read_while_fresh_and_futures_only_with_runs_to_draw(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'futures.json'
+            path.write_text(json.dumps(self.futures()))
+            self.assertEqual(sorted(k for k in ('empty', 'full') if k in panel_data.read_futures(path, self.NOW + 5)),
+                             ['empty', 'full'])
+            self.assertIsNone(panel_data.read_futures(path, self.NOW + panel_data.FUTURES_STALE))
+            broken = dict(self.futures(), full={'runs': [{'end': 3.0, 'pts': [[0, 34.0]]}]})
+            path.write_text(json.dumps(broken))
+            self.assertNotIn('full', panel_data.read_futures(path, self.NOW))
+            path.write_text('not json')
+            self.assertIsNone(panel_data.read_futures(path, self.NOW))
+            snapshot = Path(tmp) / 'snapshot.json'
+            snapshot.write_text(json.dumps(self.SNAPSHOT))
+            self.assertIsNotNone(panel_data.read_snapshot(snapshot, self.NOW + 5))
+            self.assertIsNone(panel_data.read_snapshot(snapshot, self.NOW + panel_data.SNAPSHOT_STALE))
+
+    def test_the_state_and_the_answers_lead_with_what_matters_for_each_kind(self):
+        charging = {'status': 'Charging', 'classes': ['charging'], 'pct': 34.2, 'watts': 29.9, 'hours': 1.3,
+                    'low': 0.9, 'high': 1.9, 'target': 90.0, 'banked': 0.906, 'banked_low': 0.744,
+                    'banked_high': 1.112, 'ratio': 1.69, 'ratio_low': 1.37, 'ratio_high': 2.1,
+                    'sleep': {'hours': 16.2, 'low': 12.97, 'high': 20.27, 'watts': 0.864}}
+        self.assertEqual(panel_data.state_text(charging), 'Charging · 34% · 29.9 W in')
+        labels = [a['label'] for a in panel_data.answers(charging, self.NOW)]
+        self.assertEqual(labels, ['On battery, if unplugged now', 'Full (90%)', 'Charging buys', 'Asleep from now'])
+        first = panel_data.answers(charging, self.NOW)[0]
+        self.assertEqual((first['value'], first['big']), ('0:54', True))
+        self.assertIn(f"cuts out at <b>{panel_data.hhmm(self.NOW + 0.906 * 3600)}</b>", first['caption'])
+        self.assertEqual(panel_data.answers(charging, self.NOW)[3]['caption'], '80%: 13–20 h · at 0.86 W')
+        discharging = {'status': 'Discharging', 'classes': ['discharging'], 'pct': 52.0, 'watts': 13.1, 'hours': 1.28,
+                       'low': 1.03, 'high': 1.53, 'params': {'typical': 15.3}}
+        self.assertEqual(panel_data.state_text(discharging), 'On battery · 52% · 13.1 W')
+        left, draw = panel_data.answers(discharging, self.NOW)
+        self.assertEqual((left['label'], left['value']), ('Left on battery', '1:17'))
+        self.assertEqual((draw['value'], draw['caption']), ('13.1 W', 'typical 15.3 W'))
+        ending = dict(discharging, cutout=self.NOW + 250, cutout_pm=12)
+        self.assertEqual(panel_data.answers(ending, self.NOW)[0]['value'], '4m 10s')
+        self.assertEqual(panel_data.answers(None, self.NOW), [])
+        self.assertEqual(panel_data.state_text(None, {'pct': 80, 'status': 'Not charging'}), 'Plugged in · 80%')
+
+    def test_the_live_split_labels_the_layers_it_belongs_to(self):
+        labels = panel_data.pull_labels(self.SNAPSHOT)
+        self.assertEqual((labels['total'], labels['window']), (13.9, 'last 6 min on battery'))
+        layers = {row['name']: row['layer'] for row in labels['rows']}
+        self.assertEqual(layers, {'Idle chip': report.IDLE, 'Floorp': 'Browsers', 'Display': 'Display',
+                                  'Kernel': 'Desktop & system', 'USB devices': 'Rest of system',
+                                  'Everything else (62)': 'Other apps'})
+        idle = labels['rows'][0]
+        self.assertEqual((idle['watts'], idle['share']), (8.8, 63.0))
+        self.assertEqual([(n, w, round(s)) for n, w, s in idle['parts']], [('Memory & I/O links', 3.2, 23),
+                                                                         ('Cores & graphics', 1.5, 11)])
+        self.assertEqual(labels['rows'][-1]['sub'], 'T3 Code 0.4 · Niri 0.2')
+        self.assertIsNone(panel_data.pull_labels({}))
+
+    def test_an_apps_processes_are_one_row(self):
+        self.assertEqual(panel_data.processes(self.SNAPSHOT, 3),
+                         [('python3.14', 2.7, 1), ('T3 Code', 1.9, 1), ('Floorp', 1.5, 3)])
+
+    def test_ways_to_go_further_merge_estimates_and_tested_settings_that_would_change_something(self):
+        estimates = [{'name': 'Brightness at minimum', 'minutes': 39.0, 'low': 30.0, 'high': 54.0},
+                     {'name': 'Close Floorp', 'minutes': 9.0, 'low': 6.0, 'high': 11.0},
+                     {'name': 'Close T3 Code', 'minutes': 2.0, 'low': 1.0, 'high': 2.0}]
+        effect = lambda name, minutes, low, chance=1.0: {'experiment': name, 'minutes': minutes, 'low': low,
+                                                         'high': minutes + 5, 'chance': chance}
+        levers = {'effects': [effect('throttle-apps', 8.4, 3.4), effect('boost', 11.6, 6.7), effect('aspm', 21.3, 19.9),
+                              effect('wifi-ps', 0.5, -2.1, 0.63), effect('cpu-cap', 6.4, 2.5, 0.8)]}
+        spec = lambda name, current, saving: {'name': name, 'label': name.title(), 'current': current, 'saving': saving}
+        catalog = [spec('throttle-apps', 'off', 'on'), spec('boost', '0', '0'), spec('aspm', 'performance', 'powersupersave'),
+                   spec('wifi-ps', 'on', 'on'), spec('cpu-cap', 'none', '2000')]
+        result = panel_data.ways(estimates, levers, catalog)
+        self.assertEqual([(r['label'], r['kind']) for r in result['rows']],
+                         [('Brightness at minimum', 'estimate'), ('Close Floorp', 'estimate'),
+                          ('Throttle-Apps', 'tested')])  # ASPM is risky; the CPU cap isn't sure.
+        self.assertEqual(result['rows'][2]['apply'], ['throttle-apps=saving'])
+        self.assertEqual((result['more'], result['already'], result['unclear']),
+                         (['Close T3 Code'], [('Boost', 11.6)], ['Wifi-Ps']))
+        quarantined = panel_data.ways([], levers, catalog, quarantine={'throttle-apps': 'usb'})
+        self.assertEqual(quarantined['rows'], [])
+
+    def test_the_readout_counts_futures_at_a_minute(self):
+        futures = self.futures()
+        said = panel_data.readout(futures, 55.0)
+        self.assertEqual((said['empty']['out'], said['empty']['n']), (2, 4))
+        self.assertTrue(2.0 < said['empty']['low'] <= said['empty']['high'] < 34.0)
+        low, high = said['full']
+        self.assertTrue(34.0 < low < high <= 90.0)
+        self.assertEqual(panel_data.readout(futures, 500.0)['empty']['low'], None)
+        self.assertEqual(panel_data.run_at(futures['empty']['runs'][0], 20.0), 18.0)
+
+    def test_a_change_stretches_every_future_by_its_gain_and_carries_its_interval(self):
+        empty = self.futures()['empty']
+        g = panel_data.ghost(empty, 39.0, 30.0, 54.0, full_minutes=177.0, seed=1)
+        self.assertAlmostEqual(g['median']['end'], 55.0 * (177 + 39) / 177)
+        ends = [r['end'] for r in g['runs']]
+        self.assertEqual(ends, sorted(ends))
+        self.assertTrue(all(e > o['end'] for e, o in zip(sorted(ends), empty['runs'])))
+        self.assertEqual(g, panel_data.ghost(empty, 39.0, 30.0, 54.0, full_minutes=177.0, seed=1))
+
+    def test_the_time_axis_gives_ahead_its_share_and_no_corner_at_now(self):
+        start, now = self.NOW - 6 * 3600, self.NOW
+        X = panel_data.time_axis(start, now, 0.0, 800.0, now)
+        self.assertAlmostEqual(X(start), 0.0)
+        self.assertAlmostEqual(X(now + panel_data.AHEAD), 800.0)
+        self.assertAlmostEqual(800.0 - X(now), 800.0 * panel_data.AHEAD_SHARE, delta=5)  # The ease moves now a little.
+        self.assertAlmostEqual(X.zoom, 0.44 / 0.56 * 360 / 165)
+        xs = [X(now + d) for d in range(-3600, 3601, 30)]
+        steps = [b - a for a, b in itertools.pairwise(xs)]
+        self.assertTrue(all(s > 0 for s in steps))
+        self.assertTrue(all(abs(b - a) < 0.05 for a, b in itertools.pairwise(steps)))  # The scale eases: no corner.
+        plain = panel_data.time_axis(start, now, 0.0, 800.0)
+        self.assertEqual((plain(start), plain(now), plain.zoom, plain.now), (0.0, 800.0, 1.0, None))
+
+    def test_landing_dots_stack_in_columns_and_this_weeks_sleeps_are_by_day(self):
+        self.assertEqual(panel_data.dot_stack([10.0, 11.0, 30.0, 10.4], 5.0), [(10.0, 0), (10.0, 1), (10.0, 2),
+                                                                               (30.0, 0)])
+        midnight = time.mktime(time.localtime(self.NOW)[:3] + (0, 0, 0, 0, 0, -1))
+        sleeps = [{'end': midnight + 3600, 'pct_per_hour': 1.6}, {'end': midnight - 2 * 86400 + 3600, 'pct_per_hour': 1.4},
+                  {'end': midnight - 20 * 86400, 'pct_per_hour': 2.0}]
+        dots, median = panel_data.week_sleeps(sleeps, self.NOW)
+        self.assertEqual(dots, [(0, 1.6), (2, 1.4)])
+        self.assertEqual(median, 1.6)
 
 
 if __name__ == '__main__':

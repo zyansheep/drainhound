@@ -12,6 +12,7 @@ and the rest still shows. A failure in one analysis once left the whole panel
 blank.
 """
 import collections
+import itertools
 import json
 import math
 import sys
@@ -543,17 +544,23 @@ def tally(quality, vote, name):
 def lever_rows(settings, levers, quality, pool, risky=(), quarantine=None):
     """What each setting's row in the Experiments tab shows: [{'name', 'label',
     'description', 'detail', 'effect', 'value', 'evidence', 'included',
-    'sensitive', 'include_hint'}]."""
+    'sensitive', 'include_hint'}], and the same in parts for its columns:
+    'now' ('off (saving)'), 'other', 'saving' (at its saving value now), 'verdict'
+    ('100% chance it saves', 'no clear effect (63%)'), 'comfort' (👎 with it on),
+    'group' ('auto', 'risky', 'quarantined', 'unavailable' or 'other')."""
     quarantine, effects = quarantine or {}, {e['experiment']: e for e in levers.get('effects') or []}
     rows = []
     for spec in settings:
         name = spec['name']
+        saving, other = False, None
         if spec.get('error'):
             detail = f"Unavailable: {spec['error']}"
         else:
             saving = spec.get('saving') is not None and spec.get('current') == spec.get('saving')
             other = (spec.get('normal') if saving else spec.get('saving')) or spec.get('alternative')
             detail = f"Now {spec.get('current')}{' (power-saving)' if saving else ''} · or {other}"
+        comfort = (f"👎 in {down['on']['votes']} of {down['on']['windows']} blocks with it on"
+                   if (down := tally(quality, 'down', name)) and down['on']['windows'] else '')
         down, up = tally(quality, 'down', name), tally(quality, 'up', name)
         detail += (f" · 👎 {down['on']['votes']}/{down['on']['windows']} blocks on" if down and down['on']['windows']
                    else f" · {spec.get('visible') or 'not noticeable'}")
@@ -561,6 +568,7 @@ def lever_rows(settings, levers, quality, pool, risky=(), quarantine=None):
             detail += f" · 👍 {up['on']['votes']}/{up['on']['windows']} on, {up['off']['votes']}/{up['off']['windows']} off"
         if quality and report.qol_risk(quality, {name: True}) > report.QOL_RISK:
             detail += ' — kept off while you are here'
+            comfort += ' · kept off while you are here'
         includable = not spec.get('error') and spec.get('saving') is not None
         hint = 'Let automatic experiments vary this setting'
         if name in quarantine:
@@ -576,8 +584,11 @@ def lever_rows(settings, levers, quality, pool, risky=(), quarantine=None):
             includable, hint = False, ('Risky for some hardware (config [experiments] risky): automatic '
                                        f'experiments vary it only after `drainhound experiment pool add {name} --risky`')
         effect, progress = effects.get(name), (levers.get('progress') or {}).get(name)
+        verdict = ''
         if effect and finite(effect.get('chance')):
             detail += f" · {effect['chance']:.0%} chance it saves"
+            sure = effect['chance'] >= 0.9 and finite(effect.get('low')) and effect['low'] > 0
+            verdict = f"{effect['chance']:.0%} chance it saves" if sure else f"no clear effect ({effect['chance']:.0%})"
         if effect:
             blocks = effect.get('blocks') or {}
             evidence = f"{blocks.get('on', 0)}+{blocks.get('off', 0)} blocks, {effect.get('hours', 0):.1f} h"
@@ -587,9 +598,14 @@ def lever_rows(settings, levers, quality, pool, risky=(), quarantine=None):
         else:
             evidence = 'CPU setting: needs ~4× the time' if name in report.CPU_LEVERS else ''
             value = 'not measured'
+        group = ('unavailable' if spec.get('error') else 'quarantined' if name in quarantine
+                 else 'auto' if includable and name in pool else 'risky' if name in risky else 'other')
         rows.append({'name': name, 'label': spec.get('label', name), 'description': spec.get('description', ''),
                      'detail': detail, 'effect': effect, 'value': value, 'evidence': evidence,
-                     'included': includable and name in pool, 'sensitive': includable, 'include_hint': hint})
+                     'included': includable and name in pool, 'sensitive': includable, 'include_hint': hint,
+                     'now': f"{spec.get('current')}{' (saving)' if saving else ''}" if not spec.get('error') else '',
+                     'other': other, 'saving': saving, 'verdict': verdict, 'comfort': comfort.strip(' ·'),
+                     'group': group})
     return rows
 
 
@@ -814,11 +830,11 @@ def banner_text(state, enabled, now=None, frozen='', quarantine=None):
     return text.strip()
 
 
-# The charts' categorical slots, validated on the panel's dark surface #222226
-# in this order (adjacent stack pairs cleared CVD ΔE 8.4 / normal 19.3).
-BLUE, ORANGE, GREEN, AMBER, PINK, DARK_GREEN, PURPLE = (
-    '#3987e5', '#d95926', '#199e70', '#c98500', '#d55181', '#008300', '#9085e9')
-GROUP_SLOTS = (BLUE, ORANGE, GREEN, PINK, PURPLE)  # The app groups', in that order.
+# The charts' categorical slots: earthy, on the panel's night-trail ground #10171a,
+# in this order (adjacent stack pairs stay apart in hue and lightness).
+BLUE, ORANGE, GREEN, OCHRE, HEATHER, TEAL, LAVENDER = (
+    '#5fa8d3', '#d9663f', '#6cbf8b', '#d6a84a', '#c784b0', '#4fb3a9', '#9d8fd6')
+GROUP_SLOTS = (BLUE, ORANGE, GREEN, HEATHER, TEAL)  # The app groups', in that order.
 
 
 def chart_colors(groups):
@@ -826,9 +842,342 @@ def chart_colors(groups):
     the display, the app groups ([(name, prefixes)]: report.GROUPS, as
     configured) taking GROUP_SLOTS by position (past the fifth they repeat),
     and "Other apps"."""
-    return {report.IDLE: '#707076', 'Rest of system': '#aaaab0', 'Display': AMBER,
+    return {report.IDLE: '#5f6d68', 'Rest of system': '#8d9c94', 'Display': OCHRE,
             **{name: GROUP_SLOTS[i % len(GROUP_SLOTS)] for i, (name, _) in enumerate(groups)},
-            'Other apps': DARK_GREEN}
+            'Other apps': LAVENDER}
+
+
+# --- The Trail view: the hero, what's pulling, the answers ------------------------------
+
+FUTURES_STALE = 90  # s: drainhound eta rewrites futures.json at least every 30 s while there are futures.
+SNAPSHOT_STALE = 15  # s: the collector rewrites snapshot.json every 2 s.
+AHEAD = 165 * 60  # s: how far ahead the hero looks (2¾ h).
+AHEAD_SHARE = 0.44  # Of the hero's width, in every range: so the futures stay readable.
+EASE = 20 * 60  # s either side of now over which the time axis eases from behind's scale to ahead's.
+MIN_WAY = 3  # Minutes per charge: smaller what-if estimates are listed by name only.
+Z80 = 1.2815515655446004  # The 80% interval's half-width in standard deviations.
+
+
+def read_fresh(path, stamp, stale, now=None):
+    """A runtime JSON file while its `stamp` is under `stale` seconds old, else None."""
+    try:
+        data = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not finite(data.get(stamp)) or (now or time.time()) - data[stamp] >= stale:
+        return None
+    return data
+
+
+def read_futures(path, now=None):
+    """drainhound eta's sampled futures (futures.json), fresh, with runs that can be drawn."""
+    data = read_fresh(path, 'updated', FUTURES_STALE, now)
+    if data is None:
+        return None
+    for kind in ('empty', 'full'):
+        scenario = data.get(kind)
+        runs = scenario.get('runs') if isinstance(scenario, dict) else None
+        good = isinstance(runs, list) and runs and all(
+            isinstance(r, dict) and finite(r.get('end')) and isinstance(r.get('pts'), list) and len(r['pts']) >= 2
+            for r in runs + [scenario.get('median') or {}])
+        if not good:
+            data.pop(kind, None)
+    return data
+
+
+def read_snapshot(path, now=None):
+    """The collector's live snapshot (snapshot.json), fresh."""
+    return read_fresh(path, 'timestamp', SNAPSHOT_STALE, now)
+
+
+def estimate_kind(estimate, battery=None):
+    """'discharging', 'charging' or 'plugged': drainhound eta's own kind (its classes), else the battery's status."""
+    classes = estimate.get('classes') if isinstance((estimate or {}).get('classes'), list) else ()
+    for kind in ('discharging', 'charging'):
+        if kind in classes:
+            return kind
+    status = str((estimate or {}).get('status') or (battery or {}).get('status') or '')
+    return {'Discharging': 'discharging', 'Charging': 'charging'}.get(status, 'plugged' if status else '')
+
+
+def hhmm(t):
+    return time.strftime('%H:%M', time.localtime(t))
+
+
+def state_text(estimate, battery=None):
+    """The header's state: 'Charging · 34% · 29.9 W in', 'On battery · 52% · 13.1 W', 'Plugged in · 80%'."""
+    estimate, battery = estimate or {}, battery or {}
+    pct = estimate.get('pct') if finite(estimate.get('pct')) else battery.get('pct')
+    watts = estimate.get('watts') if finite(estimate.get('watts')) else battery.get('watts')
+    kind = estimate_kind(estimate, battery)
+    parts = [{'charging': 'Charging', 'discharging': 'On battery', 'plugged': 'Plugged in'}.get(kind, 'Battery')]
+    if finite(pct):
+        parts.append(f'{pct:.0f}%')
+    if finite(watts) and kind in ('charging', 'discharging') and abs(watts) >= 0.05:
+        parts.append(f"{abs(watts):.1f} W{' in' if kind == 'charging' else ''}")
+    return ' · '.join(parts)
+
+
+def answers(estimate, now=None):
+    """The answer strip above the hero: [{'label', 'value', 'caption', 'big'}], first the one that matters most.
+    Discharging: time left (or, in the last minutes, the countdown), the draw, asleep. Charging: time on
+    battery if unplugged now, when it is full, what charging buys, asleep."""
+    now, e, out = now or time.time(), estimate or {}, []
+    kind = estimate_kind(e)
+    interval = lambda low, high: f'80%: {hhmm(now + low * 3600)}–{hhmm(now + high * 3600)}' if finite(low, high) else ''
+    join = lambda *parts: ' · '.join(p for p in parts if p)
+    if kind == 'discharging' and finite(e.get('cutout')):
+        end = e.get('poweroff') if finite(e.get('poweroff')) else e['cutout']
+        pm = f"±{e['cutout_pm']:.0f} s" if finite(e.get('cutout_pm')) else ''
+        out.append({'label': 'Powers off in' if finite(e.get('poweroff')) else 'Cuts out in',
+                    'value': eta.countdown(end - now), 'big': True,
+                    'caption': join(f"at {time.strftime('%H:%M:%S', time.localtime(end))}", pm)})
+    elif kind == 'discharging' and finite(e.get('hours')):
+        out.append({'label': 'Left on battery', 'value': eta.clock(e['hours']), 'big': True,
+                    'caption': join(f"cuts out at <b>{hhmm(now + e['hours'] * 3600)}</b>",
+                                    interval(e.get('low'), e.get('high')))})
+    elif finite(e.get('banked')):
+        out.append({'label': 'On battery, if unplugged now', 'value': eta.clock(e['banked']), 'big': True,
+                    'caption': join(f"cuts out at <b>{hhmm(now + e['banked'] * 3600)}</b>",
+                                    interval(e.get('banked_low'), e.get('banked_high')))})
+    if kind == 'charging' and finite(e.get('hours')):
+        target = f"{e['target']:.0f}%" if finite(e.get('target')) else 'the limit'
+        out.append({'label': f'Full ({target})', 'value': hhmm(now + e['hours'] * 3600), 'big': False,
+                    'caption': join(f"in {eta.clock(e['hours'])}", interval(e.get('low'), e.get('high')))})
+    if kind == 'charging' and finite(e.get('ratio')):
+        spread = (f"80%: ×{e['ratio_low']:.1f}–{e['ratio_high']:.1f}" if finite(e.get('ratio_low'), e.get('ratio_high'))
+                  else '')
+        out.append({'label': 'Charging buys', 'value': f"+{e['ratio']:.1f} min", 'big': False,
+                    'caption': join('of use per minute', spread)})
+    if kind == 'discharging' and finite(e.get('watts')):
+        typical = (e.get('params') or {}).get('typical')
+        out.append({'label': 'Draw now', 'value': f"{abs(e['watts']):.1f} W", 'big': False,
+                    'caption': f'typical {typical:.1f} W' if finite(typical) else ''})
+    asleep = e.get('sleep') if isinstance(e.get('sleep'), dict) else {}
+    if finite(asleep.get('hours')):
+        low, high = asleep.get('low'), asleep.get('high')
+        spread = ('' if not finite(low, high) else f'80%: {round(low)}–{round(high)} h' if low >= 10
+                  else f'80%: {duration(low)}–{duration(high)}')
+        out.append({'label': 'Asleep from now', 'value': f"~{long_duration(asleep['hours'])}", 'big': False,
+                    'caption': join(spread, f"at {asleep['watts']:.2f} W" if finite(asleep.get('watts')) else '')})
+    return out
+
+
+def number_in(value):
+    """The first number in a snapshot value like ' 8.8 W  63%'."""
+    try:
+        return float(str(value).split()[0])
+    except (IndexError, ValueError):
+        return None
+
+
+def share_in(value):
+    """The percentage in a snapshot value like ' 8.8 W  63%' (None without one)."""
+    for word in str(value).split():
+        if word.endswith('%'):
+            try:
+                return float(word[:-1])
+            except ValueError:
+                return None
+    return None
+
+
+def layer_of(name):
+    """The hero's stack layer a snapshot row belongs to: the idle chip, the display, the other devices
+    (rest of system), an app's group, or Other apps for "Everything else"."""
+    if name == report.IDLE or name in ('Display', 'Rest of system'):
+        return name
+    if name in {n for n, _ in report.DEVICES} or name == 'Power delivery & board':
+        return 'Rest of system'
+    if name.startswith('Everything else'):
+        return 'Other apps'
+    return report.group_of(name)
+
+
+def pull_labels(snapshot):
+    """What's pulling now, for the labels on the stack's layers: the collector's live split
+    (snapshot.json's battery rows) as [{'name', 'watts', 'share', 'layer', 'parts': [(name, watts,
+    share)], 'sub'}], and its total and window ('13.9 W', 'the last 6 min on battery'), or None."""
+    battery = (snapshot or {}).get('battery')
+    if not isinstance(battery, dict) or not isinstance(battery.get('rows'), list):
+        return None
+    title = str(battery.get('title') or '')
+    total = number_in(title.rsplit('·', 1)[-1]) if '·' in title else None
+    window = next((p.strip() for p in title.split('·') if p.strip().startswith('last ')), '')
+    rows = []
+    for row in battery['rows']:
+        if not isinstance(row, dict) or not isinstance(row.get('name'), str):
+            continue
+        watts, share = number_in(row.get('value')), share_in(row.get('value'))
+        if watts is None:
+            continue
+        parts = [(p['name'], w, w / total * 100 if total else None) for p in row.get('parts') or []
+                 if isinstance(p, dict) and (w := number_in(p.get('value'))) is not None]
+        entry = {'name': row['name'], 'watts': watts, 'share': share, 'layer': layer_of(row['name']), 'parts': []}
+        if row['name'] == report.IDLE:
+            entry['parts'] = parts
+        elif parts:  # "Everything else": its biggest few as one line.
+            entry['sub'] = ' · '.join(f'{n} {w:.1f}' for n, w, _ in parts)
+        rows.append(entry)
+    if total is None:
+        total = sum(r['watts'] for r in rows)
+    return {'rows': rows, 'total': total, 'window': window}
+
+
+def processes(snapshot, limit=5):
+    """The live CPU list (snapshot.json's `cpu`) with each app's processes as one row: 'Floorp web · PID 627118'
+    and 'Floorp' are Floorp's. [(name, percent, processes)], most CPU first."""
+    totals, counts = collections.defaultdict(float), collections.Counter()
+    rows = [r for r in (snapshot or {}).get('cpu') or [] if isinstance(r, dict) and isinstance(r.get('name'), str)]
+    apps = {r['name'] for r in rows if ' · ' not in r['name']}
+    for row in rows:
+        pct = number_in(str(row.get('value', '')).rstrip('%'))
+        if pct is None:
+            continue
+        # 'Floorp web · PID 627118' and 'Floorp · extensions' are Floorp's, where Floorp has a row of its own.
+        head = row['name'].split(' · ')[0]
+        app = next((a for a in sorted(apps, key=len, reverse=True) if head == a or head.startswith(a + ' ')), head)
+        totals[app] += pct
+        counts[app] += 1
+    ranked = sorted(totals, key=lambda a: -totals[a])[:limit]
+    return [(app, round(totals[app], 1), counts[app]) for app in ranked]
+
+
+def ways(estimates, levers, catalog, quarantine=None):
+    """"Ways to go further": the what-if estimates (closing an app or group, dimming) and the tested settings
+    that would change something now, on one axis of minutes per full charge. Tested ones are only those that
+    surely save (90%, the recommendation's own rule), not risky, not quarantined, and not already set; they
+    carry the `drainhound experiment apply` assignment. {'rows': [...] by gain, 'more': [names of estimates
+    under MIN_WAY], 'already': [(label, minutes)] tested savings already set, 'unclear': [labels] set without a
+    clear effect}."""
+    rows, more, already, unclear = [], [], [], []
+    for e in estimates or []:
+        if not finite(e.get('minutes')):
+            continue
+        if e['minutes'] < MIN_WAY:
+            more.append(e['name'])
+            continue
+        rows.append({'label': e['name'], 'kind': 'estimate', 'minutes': e['minutes'], 'low': e.get('low'),
+                     'high': e.get('high'), 'apply': None})
+    specs = {c['name']: c for c in catalog or [] if isinstance(c, dict) and c.get('name')}
+    for effect in (levers or {}).get('effects') or []:
+        name, spec = effect.get('experiment'), specs.get(effect.get('experiment'))
+        if spec is None or spec.get('error') or not finite(effect.get('minutes')):
+            continue
+        label = spec.get('label', name)
+        set_now = spec.get('saving') is not None and spec.get('current') == spec.get('saving')
+        sure = finite(effect.get('chance'), effect.get('low')) and effect['chance'] >= 0.9 and effect['low'] > 0
+        if set_now:
+            (already.append((label, effect['minutes'])) if sure else unclear.append(label))
+        elif sure and name not in experiment.RISKY and name not in (quarantine or {}):
+            rows.append({'label': label, 'kind': 'tested', 'minutes': effect['minutes'], 'low': effect.get('low'),
+                         'high': effect.get('high'), 'apply': [f'{name}=saving'], 'name': name})
+    rows.sort(key=lambda r: -r['minutes'])
+    return {'rows': rows, 'more': more, 'already': already, 'unclear': unclear}
+
+
+def run_at(run, minute):
+    """A future's charge % `minute` minutes ahead (where it landed, after it ends)."""
+    pts = run['pts']
+    if minute >= pts[-1][0]:
+        return pts[-1][1]
+    for (m0, p0), (m1, p1) in itertools.pairwise(pts):
+        if m1 >= minute:
+            return p0 + (p1 - p0) * (minute - m0) / (m1 - m0) if m1 > m0 else p1
+    return pts[-1][1]
+
+
+def quantile(values, q):
+    s = sorted(values)
+    i = q * (len(s) - 1)
+    lo = math.floor(i)
+    return s[lo] + (i - lo) * (s[min(lo + 1, len(s) - 1)] - s[lo])
+
+
+def readout(futures, minute):
+    """What the futures say `minute` minutes ahead: {'full': (low, high) 80% of charging futures' %,
+    'empty': {'out', 'n', 'low', 'high'}: how many have cut out and where the rest are}."""
+    out = {}
+    full, empty = (futures or {}).get('full'), (futures or {}).get('empty')
+    if full:
+        levels = [run_at(r, minute) for r in full['runs']]
+        out['full'] = (quantile(levels, 0.1), quantile(levels, 0.9))
+    if empty:
+        alive = [run_at(r, minute) for r in empty['runs'] if r['end'] > minute]
+        out['empty'] = {'out': len(empty['runs']) - len(alive), 'n': len(empty['runs']),
+                        'low': min(alive) if alive else None, 'high': max(alive) if alive else None}
+    return out
+
+
+def ghost(scenario, gain, low, high, full_minutes, seed=0):
+    """A change's futures: each run stretched by the minutes the change gives back per full charge, the gain
+    itself drawn from its 90% interval (so the ghost carries both uncertainties). `full_minutes`: a full
+    charge's minutes at the typical draw."""
+    import random
+    rng = random.Random(seed)
+
+    def stretch(z):
+        spread = (gain - low if z < 0 else high - gain) if finite(low, high) else 0.0
+        return (full_minutes + max(0.0, gain + z * spread / 1.6449)) / full_minutes
+
+    runs = []
+    for run in scenario['runs']:
+        f = stretch(rng.gauss(0, 1))
+        runs.append({'end': run['end'] * f, 'pts': [[m * f, p] for m, p in run['pts']]})
+    f = stretch(0.0)
+    median = scenario['median']
+    return {'runs': sorted(runs, key=lambda r: r['end']), 'n': len(runs),
+            'median': {'end': median['end'] * f, 'pts': [[m * f, p] for m, p in median['pts']]}}
+
+
+def time_axis(start, end, x0, x1, now=None):
+    """The hero's time axis, t (epoch s) → x. With `now` inside the period (looking at Now), behind is
+    [start, now] and ahead [now, now + AHEAD]; ahead keeps AHEAD_SHARE of the width in every range, and
+    the scale eases from behind's to ahead's over EASE either side of now (a smoothstep in the drawing
+    speed), so no line gets a corner there. Without `now`, the plain period. The function carries `zoom`
+    (how much wider ahead is drawn), `now`, `start` and `end`."""
+    if now is None:
+        scale = (x1 - x0) / max(end - start, 1)
+        axis = lambda t: x0 + (t - start) * scale
+        axis.zoom, axis.now, axis.start, axis.end = 1.0, None, start, end
+        return axis
+    behind, ahead = max(now - start, 1), AHEAD
+    ratio = AHEAD_SHARE / (1 - AHEAD_SHARE) * behind / ahead
+    w = min(EASE, behind / 4)
+    a = now - w
+
+    def speed_integral(t):
+        if t <= a:
+            return t - start
+        u = min(1.0, (t - a) / (2 * w))
+        return ((a - start) + 2 * w * u + (ratio - 1) * 2 * w * (u ** 3 - u ** 4 / 2)
+                + (ratio * (t - now - w) if t > now + w else 0.0))
+
+    k = (x1 - x0) / speed_integral(now + ahead)
+    axis = lambda t: x0 + k * speed_integral(t)
+    axis.zoom, axis.now, axis.start, axis.end = ratio, now, start, now + ahead
+    return axis
+
+
+def dot_stack(xs, step):
+    """Where each future's landing dot goes: [(x, j)], j the dot's place in its column's stack."""
+    columns, out = collections.Counter(), []
+    for x in sorted(xs):
+        c = round(x / step)
+        out.append((c * step, columns[c]))
+        columns[c] += 1
+    return out
+
+
+def week_sleeps(sleeps, now=None, days=7):
+    """This week's suspends for the Sleep card: [(days ago 6 … 0, %/h)] and the all-history median %/h."""
+    now = now or time.time()
+    today = time.localtime(now)
+    midnight = time.mktime((today.tm_year, today.tm_mon, today.tm_mday, 0, 0, 0, 0, 0, -1))
+    dots = [(min(days - 1, max(0, int((midnight + 86400 - s['end']) // 86400))), s['pct_per_hour'])
+            for s in sleeps or [] if finite(s.get('end'), s.get('pct_per_hour')) and s['end'] >= midnight - (days - 1) * 86400]
+    drains = sorted(s['pct_per_hour'] for s in sleeps or [] if finite(s.get('pct_per_hour')))
+    return dots, drains[len(drains) // 2] if drains else None
 
 
 def check(out=sys.stdout, budget=BUDGET, history=None):

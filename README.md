@@ -27,13 +27,17 @@ and fits what each one saves.
   once, and it learns which settings you notice.
 - **Background apps**: throttle unfocused apps' CPU on battery, or freeze
   long-unused ones completely, the way Android does with cached apps.
-- **A panel** with the timeline, sleep drain, what-if estimates ("close
-  Firefox: +38 min per charge") and the experiments. There's also a Waybar
-  module, and a CLI for everything.
+- **A panel** that leads with the forecast: the battery level behind you runs
+  into 40 sampled futures ahead, each ending in a dot where it lands, so a
+  chance is something you can count. Under it, what is pulling now (labelled on
+  the stack of watts), ways to go further (what-if estimates such as "close
+  Firefox: +38 min per charge" and tested settings, on one axis), sleep drain,
+  and the experiments as a forest plot. There's also a Waybar module, and a CLI
+  for everything.
 
-![The panel's timeline: average watts by part and app group, battery level, sleep](docs/images/timeline.png)
+![The panel's timeline: time left, the battery behind and its sampled futures ahead, what's pulling, ways to go further](docs/images/timeline.png)
 
-![The panel's experiments: each setting's measured gain per full charge, with its 90% interval](docs/images/experiments.png)
+![The panel's experiments: each setting's measured gain per full charge, with its 90% interval, grouped by how automatic runs treat it](docs/images/experiments.png)
 
 <sub>(Synthetic data from `tools/demo.py`.)</sub>
 

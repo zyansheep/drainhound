@@ -84,7 +84,7 @@ class ColorTests(unittest.TestCase):
         six = [(f'Group {i}', (f'g{i}',)) for i in range(6)]
         colors = panel_data.chart_colors(six)
         self.assertEqual([colors[name] for name, _ in six], [*panel_data.GROUP_SLOTS, panel_data.GROUP_SLOTS[0]])
-        self.assertEqual((colors['Other apps'], colors['Display']), (panel_data.DARK_GREEN, panel_data.AMBER))
+        self.assertEqual((colors['Other apps'], colors['Display']), (panel_data.LAVENDER, panel_data.OCHRE))
         with configured({'EDA jobs': ['openroad'], 'Web': ['floorp']}):
             minute = rows(['Floorp', 'openroad', 'rustc'], n=40)[0]
             parts = report.attribute(minute, report.fit_rows(rows(['Floorp', 'openroad', 'rustc'], n=40)))

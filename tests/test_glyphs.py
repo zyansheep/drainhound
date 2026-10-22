@@ -45,14 +45,14 @@ class LabelTests(unittest.TestCase):
 class PanelStyleTests(unittest.TestCase):
     def test_the_palette_is_built_in_and_the_thumbs_font_follows_the_setting(self):
         css = panel.stylesheet(theme=Path('/nonexistent/menu-theme.css'), glyphs='text')
-        self.assertIn(b'@define-color menu_bg #222226;', css)  # Without the theme file: the same colours.
+        self.assertIn(b'@define-color menu_bg #10171a;', css)  # Without the theme file: the same colours.
         self.assertNotIn(b'Font Awesome', css)
         self.assertIn(b'Font Awesome 7 Free', panel.stylesheet(glyphs='fontawesome'))
         with tempfile.NamedTemporaryFile(suffix='.css') as theme:
             theme.write(b'@define-color menu_bg #102030;')
             theme.flush()
             css = panel.stylesheet(theme=Path(theme.name), glyphs='text')
-        self.assertLess(css.index(b'#222226'), css.index(b'#102030'))  # The theme's, after: it wins.
+        self.assertLess(css.index(b'#10171a'), css.index(b'#102030'))  # The theme's, after: it wins.
         self.assertEqual(set(panel.STACK), set(panel.COLORS))
 
 

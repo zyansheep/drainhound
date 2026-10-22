@@ -2,14 +2,14 @@
  * PALETTE: edit this file, or replace it with your desktop's shared palette,
  * to restyle the panel to match other panels. It is optional: without it the
  * panel uses the same values, built in. The panel is dark (its charts are drawn
- * on #222226), so keep these dark too. */
-@define-color menu_bg #222226;
-@define-color menu_card #343437;
-@define-color menu_hover #414144;
-@define-color menu_active #343f4f;
-@define-color menu_active_hover #3a485c;
-@define-color menu_accent #3584e4;
-@define-color menu_fg #ffffff;
-@define-color menu_muted rgba(255, 255, 255, 0.68);
-@define-color menu_border rgba(255, 255, 255, 0.06);
-@define-color menu_border_strong rgba(255, 255, 255, 0.12);
+ * on #10171a and #16211f), so keep these dark too. */
+@define-color menu_bg #10171a;
+@define-color menu_card #16211f;
+@define-color menu_hover #1d2b28;
+@define-color menu_active #253a2b;
+@define-color menu_active_hover #2c4429;
+@define-color menu_accent #8cc084;
+@define-color menu_fg #ece4d4;
+@define-color menu_muted #a3b2a9;
+@define-color menu_border rgba(236, 228, 212, 0.07);
+@define-color menu_border_strong rgba(236, 228, 212, 0.13);
