@@ -1189,15 +1189,26 @@ def dot_stack(xs, step):
     return out
 
 
-def fit_stack(xs, room, r=2.2, least=1.2):
+def fit_stack(xs, room, r=2.2, least=1.6):
     """The landing dots in at most `room` px of stack height: ([(x, j)], radius, row pitch). The dots
-    shrink, down to `least`, before a column outgrows the room."""
+    shrink, down to `least`, before a column outgrows the room; past that, a dot that would overflow its
+    column takes the nearest one with room, so futures that all land at once make a block, not a tower."""
     while True:
-        dots = dot_stack(xs, 2 * r + .8)
-        rows = max((j for _, j in dots), default=-1) + 1
-        if rows * (2 * r + .6) <= room or r <= least:
-            return dots, r, 2 * r + .6
+        step, pitch = 2 * r + .8, 2 * r + .6
+        rows = max(1, int(room // pitch))
+        dots = dot_stack(xs, step)
+        if max((j for _, j in dots), default=-1) < rows:
+            return dots, r, pitch
+        if r <= least:
+            break
         r = max(least, round(r - .2, 2))
+    heights, dots = collections.Counter(), []
+    for x in sorted(xs):
+        c = round(x / step)
+        c = min((c + d for d in range(-len(xs), len(xs) + 1) if heights[c + d] < rows), key=lambda k: (abs(k - c), k))
+        dots.append((c * step, heights[c]))
+        heights[c] += 1
+    return dots, r, pitch
 
 
 def level_segments(levels, sleeps=(), gap=OFF_GAP):

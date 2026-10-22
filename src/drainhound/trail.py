@@ -410,8 +410,10 @@ class HeroChart(Chart):
         trail = [[(X(t), Y(p)) for t, p in segment] for segment in segments]
         taken = []
         if now:
-            zoom = (f'ahead drawn ×{X.zoom:.1f} wider' if X.zoom > 1.05 else
-                    f'ahead drawn {1 / X.zoom:.1f}× narrower' if X.zoom < .95 else '')
+            factor = max(X.zoom, 1 / X.zoom)
+            factor = f'{factor:.1f}' if factor < 10 else f'{factor:.0f}'
+            zoom = (f'ahead drawn {factor}× wider' if X.zoom > 1.05 else
+                    f'ahead drawn {factor}× narrower' if X.zoom < .95 else '')
             text(cr, zoom, width - self.PR - 4, ground - 17, 7, FAINT, italic=True, align='right')
             taken = self.draw_ahead(cr, X, Y, width, ground, futures, (xn, Y(pct)) if finite(pct) else None)
         cr.set_line_cap(cairo.LINE_CAP_ROUND)
@@ -555,6 +557,11 @@ class HeroChart(Chart):
                 cr.pop_group_to_source()
                 cr.paint_with_alpha(a)
         cr.restore()
+        for scenario in (empty, full, ghost):  # Captions keep off the bold lines.
+            for a, b in itertools.pairwise(pts(scenario['median']) if scenario else []):
+                n = max(1, math.ceil(math.dist(a, b) / 6))
+                taken += [(x - 2, y - 2, x + 2, y + 2) for x, y in
+                          ((a[0] + (b[0] - a[0]) * k / n, a[1] + (b[1] - a[1]) * k / n) for k in range(n + 1))]
         cr.set_line_width(1)
         hours = lambda scenario, key: scenario[key] * 60 if finite(scenario.get(key)) else None
         between = lambda low, high: (f'8 in 10 futures between {hhmm(now + low * 60)} and {hhmm(now + high * 60)}'
@@ -647,7 +654,7 @@ class HeroChart(Chart):
                 lines = [(f'Charging: full at {hhmm(now + median * 60)}', 9, BONE, True),
                          (between(low, high), 8, MUTED, False)]
                 tall = [c for c in columns if c[3] - c[1] > 2 * pitch] or columns
-                right = max(c[2] for c in tall) + 8
+                right = max([c[2] for c in tall] + ([here[0] + 13] if here else [])) + 8
                 after = (xm(high) if high is not None else max(ends)) + 10
                 captions.append((lines, [(right, Y(target) - 8, 'left', True), (after, Y(target) + 6, 'left', False),
                                          (min(ends) - 10, Y(target) - 8, 'right', True),
@@ -790,15 +797,22 @@ class PullChart(Chart):
                       self.ahead)
         behind_end = X.now or X.end
         bins, size = self.bins(start, behind_end, width * (1 - .44 if self.at_now else 1))
+        for i, b in enumerate(bins):
+            # A bin unplugged among plugged-in ones (a minute or two off the charger) reads as a stray line.
+            near = [n for n in bins[max(0, i - 1):i + 2] if n is not b and (abs(n['t1'] - b['t']) < 1 or
+                                                                              abs(b['t1'] - n['t']) < 1)]
+            if b['battery'] and near and not any(n['battery'] for n in near):
+                b['battery'] = False
         top = max([sum(b['groups'].values()) for b in bins] + [10]) * 1.08
         step = 10 if top > 25 else 5
         top = math.ceil(top / step) * step
         Y = lambda w: self.TOP + (top - w) / top * (height - self.TOP - 6)
         cr.set_line_width(1)
         w = 0
+        grid_end = X(X.now) if X.now and self.labels else width - self.PR  # Not behind the labels.
         while w <= top:
             cr.move_to(self.PL, round(Y(w)) + .5)
-            cr.line_to(width - self.PR, round(Y(w)) + .5)
+            cr.line_to(grid_end, round(Y(w)) + .5)
             cr.set_source_rgba(*rgb(RULE))
             cr.stroke()
             if w:
@@ -825,7 +839,8 @@ class PullChart(Chart):
             else:
                 runs.append((b['battery'], [b]))
         for battery, run in runs:
-            xs = [X(run[0]['t'])] + [X((b['t'] + b['t1']) / 2) for b in run] + [X(min(behind_end, run[-1]['t1']))]
+            xs = ([X(run[0]['t'])] + [X((b['t'] + min(b['t1'], behind_end)) / 2) for b in run]
+                  + [X(min(behind_end, run[-1]['t1']))])
             if not battery:
                 totals = [sum(b['groups'].values()) for b in run]
                 totals = [totals[0]] + totals + [totals[-1]]

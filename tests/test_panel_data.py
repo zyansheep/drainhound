@@ -932,7 +932,12 @@ class TrailTests(unittest.TestCase):
         dots, r, pitch = panel_data.fit_stack(xs, 40)
         self.assertLess(r, 2.2)
         self.assertLessEqual((max(j for _, j in dots) + 1) * pitch, 40)
-        self.assertEqual(panel_data.fit_stack(xs, 5)[1], 1.2)  # No smaller than that, room or not.
+        dots, r, pitch = panel_data.fit_stack(xs, 8)  # No room for 12 even that small: a block two high.
+        self.assertEqual((r, sorted(j for _, j in dots)), (1.6, [0] * 6 + [1] * 6))
+        self.assertEqual(len({x for x, _ in dots}), 6)
+        self.assertAlmostEqual(sum(x for x, _ in dots) / len(dots), 100, delta=pitch)  # Around where they land.
+        spread = [100.0, 100.0, 140.0]  # Columns with room keep their places.
+        self.assertEqual(panel_data.fit_stack(spread, 8)[0], panel_data.dot_stack(spread, 2 * 1.6 + .8))
 
     def test_the_level_behind_breaks_where_the_laptop_was_off_but_not_asleep(self):
         levels = [(t, 50.0) for t in (0, 300, 600)] + [(t, 40.0) for t in (4200, 4500)] + [(t, 30.0) for t in (9000,)]
