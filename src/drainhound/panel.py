@@ -47,6 +47,12 @@ SURFACE = tuple(int(trail.GROUND[i:i + 2], 16) / 255 for i in (1, 3, 5))
 RANGES = {'6 h': 6 * 3600, 'Day': 24 * 3600, 'Week': 7 * 24 * 3600}
 BATTERY_HOURS = [1, 2, 4, 8, 24]  # Experiment length choices, in hours of battery time.
 DEBOUNCE = 0.15  # s: reloads this close together (holding ← or →) load only the last one.
+# Apply sets a setting now, until reboot, on battery. While automatic experiments are on they own the settings
+# (`drainhound experiment apply` would wait for them and fail), so every Apply is off and says why.
+APPLY_HINT = 'Sets it now, until reboot, on battery: on AC it goes back to stock and returns on battery.'
+OWNED_NOTE = 'Apply is off while automatic experiments are on: they set the settings themselves.'
+OWNED_HINT = ('Automatic experiments own the settings while they are on, and keep the best measured combination '
+              'themselves once more testing stops paying. Turn them off to set things yourself.')
 RUNTIME = config.RUNTIME
 DRAINHOUND = config.self_command()  # The panel's buttons run `drainhound experiment …` and `drainhound vote …`.
 
@@ -119,6 +125,7 @@ class BatteryPanel(Adw.Application):
         self.result, self.best, self.futures, self.full_minutes, self.period_text = None, None, None, None, ''
         self.minutes_hours = 4  # How long freezing experiments run, in hours of battery time.
         self.lever_names, self.lever_widgets, self.hints = None, {}, {}
+        self.apply_base, self.way_applies = {}, []  # Each setting's (can it be applied, why not); Ways' Apply buttons.
         self.unit_names, self.freeze_allowed = [], False
         self.syncing = False  # Set while widgets are updated from state, so they don't echo it back.
         self.note, self.note_until = '', None  # The last command's outcome, under the banner (see set_note).
@@ -320,9 +327,17 @@ class BatteryPanel(Adw.Application):
         self.ways_more = Gtk.Label(xalign=0, wrap=True, max_width_chars=70)
         self.ways_more.add_css_class('cap')
         further.append(self.ways_more)
+        self.ways_key = wrapped(label='Measured: experiments switched it on and off on this laptop. Estimate: the '
+                                      "battery model's share for that use; closing an app often saves less.",
+                                max_width_chars=70)
+        self.ways_key.add_css_class('cap')
+        further.append(self.ways_key)
         self.ways_already = wrapped(max_width_chars=70)
         self.ways_already.add_css_class('already')
         further.append(self.ways_already)
+        self.ways_owned = wrapped(label=OWNED_NOTE, max_width_chars=70, visible=False)
+        self.ways_owned.add_css_class('cap')
+        further.append(self.ways_owned)
         self.timeline_note = wrapped(max_width_chars=70, visible=False)
         self.timeline_note.add_css_class('cap')
         further.append(self.timeline_note)
@@ -424,13 +439,17 @@ class BatteryPanel(Adw.Application):
         self.best_label = wrapped(max_width_chars=30)
         self.best_label.add_css_class('cap')
         goal.append(self.best_label)
-        self.apply_button = Gtk.Button(label='Apply', halign=Gtk.Align.START, visible=False)
+        self.apply_button = Gtk.Button(label='Apply', visible=False)
         self.apply_button.add_css_class('go')
-        self.hint(self.apply_button, 'Until reboot, on battery: on AC they go back to stock and return on '
-                                     'battery. Risky settings and quarantined ones are left out; the note under '
-                                     'the banner says which.')
         self.apply_button.connect('clicked', lambda _b: self.apply_best())
-        goal.append(self.apply_button)
+        slot = self.apply_slot(self.apply_button, lambda: OWNED_HINT if self.owned() else (
+            'Sets the combination now, until reboot, on battery: on AC they go back to stock and return on battery. '
+            'Risky settings and quarantined ones are left out; the note under the banner says which.'))
+        slot.set_halign(Gtk.Align.START)
+        goal.append(slot)
+        self.goal_owned = wrapped(label=OWNED_NOTE, max_width_chars=30, visible=False)
+        self.goal_owned.add_css_class('cap')
+        goal.append(self.goal_owned)
         trio.append(goal)
         worth = self.card('Is more testing worth it?')
         self.worth_chart = trail.WorthChart()
@@ -577,6 +596,34 @@ class BatteryPanel(Adw.Application):
         motion.connect('enter', lambda ctl, *_: self.show_hint(ctl.get_widget(), text() if callable(text) else text))
         motion.connect('leave', lambda *_: self.hint_popover.popdown())
         widget.add_controller(motion)
+
+    def apply_slot(self, button, text):
+        """`button` in a box that carries its hint: an insensitive button gets no pointer events, so a hint on
+        the button itself could never say why it is off."""
+        slot = Gtk.Box(valign=Gtk.Align.CENTER)
+        slot.append(button)
+        self.hint(slot, text)
+        return slot
+
+    def owned(self):
+        """Whether automatic (or manual) experiments own the settings: running, or paused."""
+        return self.experiment_state().get('status') in ('running', 'paused')
+
+    def sync_applies(self):
+        """Every Apply, sensitive only when it can do something: not while experiments own the settings, nor
+        for a setting already saving or kept out (fill_levers' apply_base); and the notes that say so."""
+        owned = self.owned()
+        for name, widgets in self.lever_widgets.items():
+            widgets['apply'].set_sensitive(self.apply_base.get(name, (False, ''))[0] and not owned)
+        for button in self.way_applies:
+            button.set_sensitive(not owned)
+        self.apply_button.set_sensitive(not owned)
+        self.goal_owned.set_visible(owned)
+        self.ways_owned.set_visible(owned and bool(self.way_applies))
+
+    def apply_hint(self, name):
+        can, why = self.apply_base.get(name, (False, ''))
+        return OWNED_HINT if can and self.owned() else why
 
     def show_hint(self, widget, text):
         found, bounds = widget.compute_bounds(self.hint_anchor)
@@ -799,8 +846,10 @@ class BatteryPanel(Adw.Application):
         self.ways_axis.set_scale(scale)
         while (child := self.ways_list.get_first_child()) is not None:
             self.ways_list.remove(child)
+        self.way_applies = []
         for row in rows:
             self.ways_list.append(self.way_row(row, scale))
+        self.sync_applies()
         more = data['more']
         self.ways_more.set_text(f"▸ {len(more)} more estimates under +3 min: {', '.join(more)}." if more else '')
         self.ways_more.set_visible(bool(more))
@@ -831,12 +880,14 @@ class BatteryPanel(Adw.Application):
                           ellipsize=Pango.EllipsizeMode.END)
         lead.append(label)
         tested = row['kind'] == 'tested'
-        tag = Gtk.Label(label='tested' if tested else 'estimate', valign=Gtk.Align.CENTER, width_chars=8)
+        tag = Gtk.Label(label='measured' if tested else 'estimate', valign=Gtk.Align.CENTER, width_chars=8)
         tag.add_css_class('tag')
         if tested:
             tag.add_css_class('tested')
-        self.hint(tag, 'Measured in randomized experiments on this laptop' if tested else
-                  'The battery model with that activity removed: an estimate, not a measurement')
+        self.hint(tag, 'Measured: randomized experiments on this laptop switched it on and off, so the gain is '
+                       'what it did here' if tested else
+                  'Estimate: the battery model\'s share for that activity, as if it used nothing; closing an app '
+                  'often saves less (its work moves elsewhere)')
         lead.append(tag)
         box.append(lead)
         cone = trail.Cone()
@@ -852,12 +903,12 @@ class BatteryPanel(Adw.Application):
         if tested:
             apply = Gtk.Button(label='Apply', valign=Gtk.Align.CENTER)
             apply.add_css_class('go')
-            self.hint(apply, 'Until reboot, on battery: on AC it goes back to stock and returns on battery')
             assignments = list(row['apply'])
             apply.connect('clicked', lambda _b: self.command(
                 [*DRAINHOUND, 'experiment', 'apply', *assignments],
                 done=lambda out, err: apply_note(assignments, out, err)))
-            tail.append(apply)
+            self.way_applies.append(apply)
+            tail.append(self.apply_slot(apply, lambda: OWNED_HINT if self.owned() else APPLY_HINT))
         else:
             tail.append(Gtk.Box(width_request=54))
         box.append(tail)
@@ -1009,13 +1060,12 @@ class BatteryPanel(Adw.Application):
                 widgets['check'].set_sensitive(row['sensitive'])
                 saving, safe = row['saving'], row['group'] not in ('risky', 'quarantined', 'unavailable')
                 widgets['apply'].set_label('Set' if saving else 'Apply')
-                widgets['apply'].set_sensitive(safe and not saving)
-                self.hints[row['name']] = (row['description'], row['include_hint'],
-                                           'Already at its saving value' if saving else
-                                           'Until reboot, on battery: on AC it goes back to stock and returns on '
-                                           'battery' if safe else 'Not from the panel: ' + row['include_hint'])
+                self.apply_base[row['name']] = (safe and not saving, 'Already at its saving value' if saving else
+                                                APPLY_HINT if safe else 'Not from the panel: ' + row['include_hint'])
+                self.hints[row['name']] = (row['description'], row['include_hint'])
         finally:
             self.syncing = False
+        self.sync_applies()
 
     def lever_row(self, name, label, group):
         """One setting's row on the forest plot, and its widgets for fill_levers."""
@@ -1029,7 +1079,7 @@ class BatteryPanel(Adw.Application):
         sub = Gtk.Label(xalign=0, max_width_chars=30, ellipsize=Pango.EllipsizeMode.END)
         sub.add_css_class('cap')
         lead.append(sub)
-        self.hint(lead, lambda: self.hints.get(name, ('', '', ''))[0])
+        self.hint(lead, lambda: self.hints.get(name, ('', ''))[0])
         row.append(lead)
         forest = trail.Forest()
         row.append(forest)
@@ -1049,16 +1099,15 @@ class BatteryPanel(Adw.Application):
         proof.append(comfort)
         row.append(proof)
         check = Gtk.CheckButton(valign=Gtk.Align.CENTER)
-        self.hint(check, lambda: self.hints.get(name, ('', '', ''))[1])
+        self.hint(check, lambda: self.hints.get(name, ('', ''))[1])
         check.connect('toggled', lambda b: self.syncing or self.set_pool(name, b.get_active()))
         row.append(check)
         apply = Gtk.Button(label='Apply', valign=Gtk.Align.CENTER)
         apply.add_css_class('go')
-        self.hint(apply, lambda: self.hints.get(name, ('', '', ''))[2])
         assignment = [f'{name}=saving']
         apply.connect('clicked', lambda _b: self.command([*DRAINHOUND, 'experiment', 'apply', *assignment],
                                                          done=lambda out, err: apply_note(assignment, out, err)))
-        row.append(apply)
+        row.append(self.apply_slot(apply, lambda: self.apply_hint(name)))
         return row, {'sub': sub, 'forest': forest, 'value': value, 'verdict': verdict, 'evidence': evidence,
                      'comfort': comfort, 'check': check, 'apply': apply}
 
@@ -1128,7 +1177,7 @@ class BatteryPanel(Adw.Application):
             lines.append("(Computed here: drainhound eta's recommend.json is missing or over an hour old.)")
         self.best_label.set_text('\n'.join(lines))
         self.apply_button.set_visible(self.best is not None)
-        self.apply_button.set_sensitive(self.experiment_state().get('status') not in ('running', 'paused'))
+        self.sync_applies()
 
     def apply_best(self):
         if self.best:
@@ -1412,6 +1461,7 @@ class BatteryPanel(Adw.Application):
                                         '👍 for anything unexpectedly nice, 👎 when something is off (it restores '
                                         'your settings at once); also next to the battery.'))
         self.resume_button.set_visible(rest > 0)
+        self.sync_applies()
         frozen = ''
         if state.get('units') and status in ('running', 'paused'):
             states = [experiment.freeze_get(u) for u in experiment.live_units(state['units'])]
