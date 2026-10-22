@@ -88,10 +88,7 @@ def measure(cr, string, size=9.5, bold=False):
     return layout.get_pixel_size()
 
 
-def frange(a, b, step):
-    """a to b inclusive, at most `step` apart."""
-    n = max(1, math.ceil((b - a) / step))
-    return [a + (b - a) * k / n for k in range(n + 1)]
+CALLOUT_GAP, CALLOUT_TAIL = 9, 6  # px from the dot's centre to the callout's tip; the tail's length.
 
 
 def caption(cr, lines, spots, taken, bounds):
@@ -162,11 +159,10 @@ def polyline(cr, pts):
         cr.line_to(*p)
 
 
-def here_marker(cr, x, y, label=None, avoid=(), bounds=None, boxes=()):
-    """You are here: a red dot with a soft halo, on the line rather than over it, and a tag joined by a
-    short leader: up and to the left, or the first of a few other places clear of the points in `avoid`
-    (the trail behind), with tag and leader clear of the labels in `boxes` (x0, y0, x1, y1), and inside
-    `bounds`; else where it covers least."""
+def here_callout(cr, x, y, label, taken=(), bounds=None):
+    """You are here: a red dot with a soft halo on the line, and right above it a red callout pointing down
+    at it ("Here, 82%"); shifted aside, or below and pointing up, where that spot is taken (the boxes in
+    `taken`, x0, y0, x1, y1) or outside `bounds`. Returns the callout's box."""
     cr.arc(x, y, 12, 0, 2 * math.pi)
     cr.set_source_rgba(*rgb(HERE, .16))
     cr.fill()
@@ -180,38 +176,59 @@ def here_marker(cr, x, y, label=None, avoid=(), bounds=None, boxes=()):
     cr.set_source_rgba(*rgb(BONE))
     cr.set_line_width(1.3)
     cr.stroke()
-    if not label:
-        return
-    layout = PangoCairo.create_layout(cr)
-    layout.set_font_description(Pango.FontDescription.from_string(f'{FONT} Bold 8'))
-    layout.set_text(label, -1)
-    w, h = layout.get_pixel_size()
-    tw = w + 16
+    w, h = measure(cr, label, 8.5, bold=True)
+    bw, bh = w + 16, h + 6
+    spots = []  # (left, top, pointing up?, the tail's tip): above, centred first; then aside; then below.
+    for below in (False, True):
+        tip = y + CALLOUT_GAP if below else y - CALLOUT_GAP
+        top = tip + CALLOUT_TAIL if below else tip - CALLOUT_TAIL - bh
+        spots += [(left, top, below, tip) for left in (x - bw / 2, x - bw + 14, x - 14)]
 
-    def hits(spot):  # The tag's right end at tx, its middle at ty: what it would cover; outside bounds is worst.
-        tx, ty = spot
-        if bounds and not (bounds[0] <= tx - tw and tx <= bounds[2] and bounds[1] <= ty - 10 and ty + 10 <= bounds[3]):
-            return math.inf
-        covered = sum(tx - tw - 6 <= px <= tx + 6 and ty - 16 <= py <= ty + 16 for px, py in avoid)
-        lx, ly = tx - 8, ty + (-9 if ty > y else 9)
-        leader = [(x + (lx - x) * k / 16, y + (ly - y) * k / 16) for k in range(17)]
-        struck = sum(any(b[0] <= px <= b[2] and b[1] <= py <= b[3] for px, py in leader)
-                     or (b[0] < tx and tx - tw < b[2] and b[1] < ty + 10 and ty - 10 < b[3]) for b in boxes)
-        return covered + 25 * struck
+    def clear(spot):
+        box = (spot[0], spot[1], spot[0] + bw, spot[1] + bh)
+        inside = not bounds or (bounds[0] <= box[0] and box[2] <= bounds[2] and bounds[1] <= box[1]
+                                and box[3] <= bounds[3])
+        return inside and not any(box[0] < t[2] and t[0] < box[2] and box[1] < t[3] and t[1] < box[3] for t in taken)
 
-    spots = [(x + dx, y + dy) for dx, dy in ((-12, -54), (-12, 54), (-40, -88), (-40, 88), (-90, -30), (-90, 34),
-                                             (-12, -120), (-150, -24), (-150, 28))]
-    tx, ty = min(spots, key=lambda spot: (hits(spot), spots.index(spot)))  # The first clear one, else the least covered.
-    cr.move_to(x - 2.5, y + (5.5 if ty > y else -5.5))
-    cr.line_to(tx - 8, ty + (-9 if ty > y else 9))
+    left, top, below, tip = next((spot for spot in spots if clear(spot)), spots[0])
+    # The box and its tail as one red shape, rimmed in the ground's colour to stand off the lines behind.
+    rounded(cr, left, top, bw, bh, bh / 2)
+    base = top if below else top + bh
+    cr.move_to(x - 5, base)
+    cr.line_to(x, tip)
+    cr.line_to(x + 5, base)
+    cr.close_path()
+    cr.set_source_rgba(*rgb(SURFACE))
+    cr.set_line_width(3)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    cr.stroke_preserve()
     cr.set_source_rgba(*rgb(HERE))
-    cr.set_line_width(1.3)
-    cr.stroke()
-    rounded(cr, tx - tw, ty - 10, tw, 20, 10)
     cr.fill()
-    cr.move_to(tx - w - 8, ty - h / 2)
-    cr.set_source_rgba(1, 1, 1, 1)
-    PangoCairo.show_layout(cr, layout)
+    text(cr, label, left + (bw - w) / 2, top + (bh - h) / 2, 8.5, '#ffffff', bold=True)
+    return left, top, left + bw, top + bh
+
+
+def bone(cr, x, y, size, level=None, color=BONE, hole=GROUND):
+    """The panel's mark, centred at x, y in a size-px square: a dog's bone that is a battery, its shaft a
+    window on the charge (`level`, 0-100; the logo's 60 without one). docs/design/logos-2.html, Bone battery."""
+    cr.save()
+    cr.translate(x - size / 2, y - size / 2)
+    cr.scale(size / 64, size / 64)
+    cr.set_source_rgba(*rgb(color))
+    for kx, ky in ((12.9, 24.1), (12.9, 39.9), (51.1, 24.1), (51.1, 39.9)):
+        cr.arc(kx, ky, 8.6, 0, 2 * math.pi)
+        cr.fill()
+    cr.rectangle(12.9, 23.8, 38.2, 16.4)
+    cr.fill()
+    rounded(cr, 17.9, 27.6, 28.2, 8.8, 1.6)
+    cr.set_source_rgba(*rgb(hole))
+    cr.fill_preserve()
+    cr.clip()
+    fill = max(0.0, min(100.0, level if finite(level) else 60.0)) / 100
+    cr.rectangle(17.9, 27.6, 28.2 * fill, 8.8)
+    cr.set_source_rgba(*rgb(RUST if finite(level) and level < 15 else MOSS))
+    cr.fill()
+    cr.restore()
 
 
 def contours(cr, cx, cy, rings=16):
@@ -377,7 +394,7 @@ class HeroChart(Chart):
             cr.set_source(fade)
             cr.fill()
         # Plugged in (moss) and asleep (sky), behind.
-        zones = []  # The zone labels' boxes, for the you-are-here tag to keep clear of.
+        zones = []  # The zone labels' boxes, for the you-are-here callout to keep clear of.
 
         def zone(label, a, b, color):
             w, h = text(cr, label, (X(a) + X(b)) / 2, Y(100) + 4, 8, color, align='center')
@@ -425,14 +442,16 @@ class HeroChart(Chart):
                 gaps += [(levels[-1][0], now)] if levels else []
                 segments.append([(now, pct)])
         trail = [[(X(t), Y(p)) for t, p in segment] for segment in segments]
-        taken = []
+        taken, here = [], None
+        if now and finite(pct):  # Where the callout would sit, right above the dot: the captions leave it free.
+            here = (xn - 42, Y(pct) - CALLOUT_GAP - CALLOUT_TAIL - 24, xn + 42, Y(pct) + 13)
         if now:
             factor = max(X.zoom, 1 / X.zoom)
             factor = f'{factor:.1f}' if factor < 10 else f'{factor:.0f}'
             zoom = (f'ahead drawn {factor}× wider' if X.zoom > 1.05 else
                     f'ahead drawn {factor}× narrower' if X.zoom < .95 else '')
             text(cr, zoom, width - self.PR - 4, ground - 17, 7, FAINT, italic=True, align='right')
-            taken = self.draw_ahead(cr, X, Y, width, ground, futures, (xn, Y(pct)) if finite(pct) else None)
+            taken = self.draw_ahead(cr, X, Y, width, ground, futures, here)
         cr.set_line_cap(cairo.LINE_CAP_ROUND)
         cr.set_line_join(cairo.LINE_JOIN_ROUND)
         # Off (no readings outside a suspend): dotted across, since the level changed unseen.
@@ -457,10 +476,8 @@ class HeroChart(Chart):
         if not self.points:
             text(cr, 'No power-log data in this period', width / 2, Y(55), 10, MUTED, align='center')
         if now and finite(pct):
-            dense = [(a[0] + (b[0] - a[0]) * k / 4, a[1] + (b[1] - a[1]) * k / 4)
-                     for line in trail for a, b in itertools.pairwise(line) for k in range(4)]
-            dense += [(x, y) for x0, y0, x1, y1 in taken for x in frange(x0, x1, 6) for y in frange(y0, y1, 6)]
-            here_marker(cr, xn, Y(pct), f'You are here · {pct:.0f}%', dense, (self.PL, 26, xn, Y(0)), zones)
+            here_callout(cr, xn, Y(pct), f'Here, {pct:.0f}%', [t for t in taken if t != here] + zones,
+                         (self.PL, 26, width - self.PR, ground - 4))
         self.draw_hover(cr, X, Y, width, height, futures)  # Last: over everything.
         # The header row.
         behind = {'6 h': 'BEHIND · LAST 6 H', 'Day': 'BEHIND · TODAY', 'Week': 'BEHIND · THIS WEEK'}.get(
@@ -489,8 +506,8 @@ class HeroChart(Chart):
 
     def draw_ahead(self, cr, X, Y, width, ground, futures, here=None):
         """The futures, their landing dots, brackets around the middle 8 in 10, and what each fan is, its
-        caption placed clear of the dots, the labels, the header and `here` (x, y). Returns the boxes it
-        took (x0, y0, x1, y1), for the you-are-here tag to keep clear of."""
+        caption placed clear of the dots, the labels, the header and `here` (the you-are-here callout's box).
+        Returns the boxes it took (x0, y0, x1, y1), `here` among them."""
         xn = X(X.now)
         now = futures.get('now') if finite((futures or {}).get('now')) else X.now
         xm = lambda m: X(now + m * 60)
@@ -503,7 +520,7 @@ class HeroChart(Chart):
         unplugged = charging or futures.get('status') not in ('Discharging', None)  # The empty fan: if unplugged now.
         taken = [(0, 0, width, 24)]  # The header row.
         if here:
-            taken.append((here[0] - 13, here[1] - 13, here[0] + 13, here[1] + 13))
+            taken.append(here)
         cr.set_line_width(1)
         # Limits: the charge target (charging) and the cutoff.
         # Labelled at the right end, unless the dots land that far (then where ahead begins).
@@ -672,7 +689,7 @@ class HeroChart(Chart):
                 lines = [(f'Charging: full at {hhmm(now + median * 60)}', 9, BONE, True),
                          (between(low, high), 8, MUTED, False)]
                 tall = [c for c in columns if c[3] - c[1] > 2 * pitch] or columns
-                right = max([c[2] for c in tall] + ([here[0] + 13] if here else [])) + 8
+                right = max([c[2] for c in tall] + ([here[2]] if here else [])) + 8
                 after = (xm(high) if high is not None else max(ends)) + 10
                 captions.append((lines, [(right, Y(target) - 8, 'left', True), (after, Y(target) + 6, 'left', False),
                                          (min(ends) - 10, Y(target) - 8, 'right', True),
@@ -1158,12 +1175,18 @@ class ProcessList(Gtk.DrawingArea):
             text(cr, f'{pct:.1f}%', width, y, 8.5, MUTED, align='right')
 
 
-class Paw(Gtk.DrawingArea):
-    """The panel's mark, beside its title."""
+class Mark(Gtk.DrawingArea):
+    """The panel's mark, beside its title: the bone battery, its window showing the charge now."""
 
     def __init__(self):
-        super().__init__(content_width=22, content_height=22, valign=Gtk.Align.CENTER)
-        self.set_draw_func(lambda _a, cr, w, h: paw(cr, w / 2, h / 2 + 1, 1, BONE))
+        super().__init__(content_width=26, content_height=22, valign=Gtk.Align.CENTER)
+        self.level = None
+        self.set_draw_func(lambda _a, cr, w, h: bone(cr, w / 2, h / 2, min(w, h * 1.2), self.level))
+
+    def set_level(self, level):
+        if level != self.level:
+            self.level = level
+            self.queue_draw()
 
 
 class Forest(Gtk.DrawingArea):
