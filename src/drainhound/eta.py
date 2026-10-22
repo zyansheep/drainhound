@@ -1095,10 +1095,8 @@ def icon(glyph):
 
 
 def plus_minus(low, high):
-    """Half the 80% interval as one ± figure (the interval is close to symmetric),
-    with a wavy underline: the forecast's spread. Pango draws it in the label's own
-    colour (red when low), so it carries no colour of its own."""
-    return f"<span size='small' alpha='70%' underline='error'>±{clock((high - low) / 2)}</span>"
+    """Half the 80% interval as one ± figure (the interval is close to symmetric)."""
+    return f"<span size='small' alpha='70%'>±{clock((high - low) / 2)}</span>"
 
 
 RECOMMEND_KEYS = ('text', 'apply', 'change', 'gain', 'interval', 'delight')

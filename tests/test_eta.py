@@ -1384,7 +1384,6 @@ class EtaTests(unittest.TestCase):
 
     def test_plus_minus_is_half_the_interval(self):
         self.assertIn('±0:15', eta.plus_minus(1.0, 1.5))
-        self.assertIn("underline='error'", eta.plus_minus(1.0, 1.5))      # The forecast's spread, wavy.
 
     def test_clock_format(self):
         self.assertEqual(eta.clock(1.5), '1:30')
