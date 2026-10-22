@@ -45,6 +45,11 @@ def rgb(color, alpha=1.0):
     return tuple(int(color[i:i + 2], 16) / 255 for i in (0, 2, 4)) + (alpha,)
 
 
+def mix(a, b, t):
+    """The colour t of the way from a to b, as hex."""
+    return '#' + ''.join(f'{round(255 * (u + (v - u) * t)):02x}' for u, v in zip(rgb(a)[:3], rgb(b)[:3]))
+
+
 def text(cr, string, x, y, size=9.5, color=MUTED, bold=False, align='left', halo=None, italic=False,
          spacing=0.0, width=None, markup=False):
     """Text with its top-left (or top-right, top-centre) at x, y; `halo` paints a ring of that colour
@@ -157,10 +162,11 @@ def polyline(cr, pts):
         cr.line_to(*p)
 
 
-def here_marker(cr, x, y, label=None, avoid=(), bounds=None):
+def here_marker(cr, x, y, label=None, avoid=(), bounds=None, boxes=()):
     """You are here: a red dot with a soft halo, on the line rather than over it, and a tag joined by a
     short leader: up and to the left, or the first of a few other places clear of the points in `avoid`
-    (the trail behind) and inside `bounds` (x0, y0, x1, y1)."""
+    (the trail behind), with tag and leader clear of the labels in `boxes` (x0, y0, x1, y1), and inside
+    `bounds`; else where it covers least."""
     cr.arc(x, y, 12, 0, 2 * math.pi)
     cr.set_source_rgba(*rgb(HERE, .16))
     cr.fill()
@@ -185,8 +191,13 @@ def here_marker(cr, x, y, label=None, avoid=(), bounds=None):
     def hits(spot):  # The tag's right end at tx, its middle at ty: what it would cover; outside bounds is worst.
         tx, ty = spot
         if bounds and not (bounds[0] <= tx - tw and tx <= bounds[2] and bounds[1] <= ty - 10 and ty + 10 <= bounds[3]):
-            return len(avoid) + 1
-        return sum(tx - tw - 6 <= px <= tx + 6 and ty - 16 <= py <= ty + 16 for px, py in avoid)
+            return math.inf
+        covered = sum(tx - tw - 6 <= px <= tx + 6 and ty - 16 <= py <= ty + 16 for px, py in avoid)
+        lx, ly = tx - 8, ty + (-9 if ty > y else 9)
+        leader = [(x + (lx - x) * k / 16, y + (ly - y) * k / 16) for k in range(17)]
+        struck = sum(any(b[0] <= px <= b[2] and b[1] <= py <= b[3] for px, py in leader)
+                     or (b[0] < tx and tx - tw < b[2] and b[1] < ty + 10 and ty - 10 < b[3]) for b in boxes)
+        return covered + 25 * struck
 
     spots = [(x + dx, y + dy) for dx, dy in ((-12, -54), (-12, 54), (-40, -88), (-40, 88), (-90, -30), (-90, 34),
                                              (-12, -120), (-150, -24), (-150, 28))]
@@ -310,8 +321,8 @@ def runs_of(points, start, end, test):
 class HeroChart(Chart):
     """The trail: the battery level behind, and ahead the futures drainhound eta sampled (futures.json),
     each a thin line ending in a dot where it lands; the dots stack into the distribution itself.
-    Charging, the charging futures (moss) and, in rust, what unplugging now would do; on battery, the
-    futures are the trail itself. Hovering ahead reads the futures at that minute; hovering a way to go
+    Charging, the charging futures (moss) and, in rust, what unplugging now would do (that alone when
+    plugged in and not charging); on battery, the futures are the trail itself. Hovering ahead reads the futures at that minute; hovering a way to go
     further (set_ghost) previews it as a sky ghost of the futures."""
     PL, PR, TOP, BOTTOM = 34, 8, 52, 66
 
@@ -366,13 +377,19 @@ class HeroChart(Chart):
             cr.set_source(fade)
             cr.fill()
         # Plugged in (moss) and asleep (sky), behind.
+        zones = []  # The zone labels' boxes, for the you-are-here tag to keep clear of.
+
+        def zone(label, a, b, color):
+            w, h = text(cr, label, (X(a) + X(b)) / 2, Y(100) + 4, 8, color, align='center')
+            zones.append(((X(a) + X(b) - w) / 2, Y(100) + 4, (X(a) + X(b) + w) / 2, Y(100) + 4 + h))
+
         plugged = runs_of(self.points, start, behind_end, lambda p: p.get('st') not in ('D', None))
         for a, b in plugged:
             cr.rectangle(X(a), Y(100), X(b) - X(a), ph)
             cr.set_source_rgba(*rgb(MOSS, .07))
             cr.fill()
             if X(b) - X(a) > 60:
-                text(cr, '⚡ plugged in', (X(a) + X(b)) / 2, Y(100) + 4, 8, MOSS, align='center')
+                zone('⚡ plugged in', a, b, MOSS)
         shown = [(max(start, s['start']), min(behind_end, s['end'])) for s in self.sleeps]
         shown = [(a, b) for a, b in shown if b > a]
         for a, b in shown:
@@ -380,7 +397,7 @@ class HeroChart(Chart):
             cr.set_source_rgba(*rgb(SKY, .08))
             cr.fill()
             if X(b) - X(a) > 40 and len(shown) <= 3:  # A week of nights: the bands say it.
-                text(cr, 'asleep', (X(a) + X(b)) / 2, Y(100) + 4, 8, SKY, align='center')
+                zone('asleep', a, b, SKY)
         cr.restore()
         # Grid: 0 / 50 / 100%, and the time axis.
         cr.set_line_width(1)
@@ -428,7 +445,7 @@ class HeroChart(Chart):
             cr.stroke()
             cr.set_dash([])
             if X(b) - X(a) > 30 and len(gaps) <= 3:  # A week of nights: the dotted lines say it.
-                text(cr, 'off', (X(a) + X(b)) / 2, Y(100) + 4, 8, MUTED, align='center')
+                zone('off', a, b, MUTED)
         for line in trail:
             for w, a in ((6, .09), (2.2, 1)):
                 smooth(cr, line)
@@ -443,7 +460,7 @@ class HeroChart(Chart):
             dense = [(a[0] + (b[0] - a[0]) * k / 4, a[1] + (b[1] - a[1]) * k / 4)
                      for line in trail for a, b in itertools.pairwise(line) for k in range(4)]
             dense += [(x, y) for x0, y0, x1, y1 in taken for x in frange(x0, x1, 6) for y in frange(y0, y1, 6)]
-            here_marker(cr, xn, Y(pct), f'You are here · {pct:.0f}%', dense, (self.PL, 26, xn, Y(0)))
+            here_marker(cr, xn, Y(pct), f'You are here · {pct:.0f}%', dense, (self.PL, 26, xn, Y(0)), zones)
         self.draw_hover(cr, X, Y, width, height, futures)  # Last: over everything.
         # The header row.
         behind = {'6 h': 'BEHIND · LAST 6 H', 'Day': 'BEHIND · TODAY', 'Week': 'BEHIND · THIS WEEK'}.get(
@@ -483,6 +500,7 @@ class HeroChart(Chart):
         full, empty = futures.get('full'), futures.get('empty')
         cutoff, target = futures.get('cutoff_pct') or 0.0, futures.get('target') or 100
         charging = full is not None
+        unplugged = charging or futures.get('status') not in ('Discharging', None)  # The empty fan: if unplugged now.
         taken = [(0, 0, width, 24)]  # The header row.
         if here:
             taken.append((here[0] - 13, here[1] - 13, here[0] + 13, here[1] + 13))
@@ -516,10 +534,10 @@ class HeroChart(Chart):
                 cr.stroke()
             cr.set_dash([])
         if empty:
-            color = RUST if charging else BONE
+            color = RUST if unplugged else BONE
             for run in empty['runs']:
                 polyline(cr, pts(run))
-                cr.set_source_rgba(*rgb(color, .2 if charging else .17))
+                cr.set_source_rgba(*rgb(color, .2 if unplugged else .17))
                 cr.stroke()
         if full:
             for run in full['runs']:
@@ -535,11 +553,11 @@ class HeroChart(Chart):
             cr.stroke()
             cr.set_dash([])
         if empty:
-            if charging:
+            if unplugged:
                 cr.set_dash([5, 3])
             polyline(cr, pts(empty['median']))
-            cr.set_source_rgba(*rgb(RUST if charging else BONE))
-            cr.set_line_width(1.8 if charging else 2.2)
+            cr.set_source_rgba(*rgb(RUST if unplugged else BONE))
+            cr.set_line_width(1.8 if unplugged else 2.2)
             cr.stroke()
             cr.set_dash([])
         if full:
@@ -605,9 +623,9 @@ class HeroChart(Chart):
                 cr.stroke()
                 taken.append((xm(low) - 1, y - 5, xm(high) + 1, y + 1))
             if median is not None:
-                title = (f'If unplugged now: cuts out at {hhmm(now + median * 60)}' if charging else
+                title = (f'If unplugged now: cuts out at {hhmm(now + median * 60)}' if unplugged else
                          f'Cuts out at {hhmm(now + median * 60)}')
-                lines = [(title, 9, RUST if charging else BONE, True), (between(low, high), 8, MUTED, False)]
+                lines = [(title, 9, RUST if unplugged else BONE, True), (between(low, high), 8, MUTED, False)]
                 first, last = min(ends) - 10, max(ends) + 10
                 below, above = Y(cutoff) + 6, Y(cutoff) - 8
                 captions.append((lines, [(first, below, 'right', False), (last, below, 'left', False),
@@ -716,10 +734,11 @@ class HeroChart(Chart):
             lines.append((f'{low:.0f}–{high:.0f}%', 'charging (8 in 10)'))
         if 'empty' in said:
             e = said['empty']
-            unplugged = 'unplugged' if 'full' in said else 'on battery'
+            plugged = 'full' in said or futures.get('status') not in ('Discharging', None)
+            unplugged = 'unplugged' if plugged else 'on battery'
             if e['low'] is not None:
                 rounded(cr, x - 3, Y(e['high']), 6, max(4, Y(e['low']) - Y(e['high'])), 3)
-                cr.set_source_rgba(*rgb(RUST if 'full' in said else BONE))
+                cr.set_source_rgba(*rgb(RUST if plugged else BONE))
                 cr.fill()
                 lines.append((f"{e['out']} of {e['n']}", f"cut out {unplugged}; the rest at {e['low']:.0f}–{e['high']:.0f}%"))
             else:
@@ -819,6 +838,8 @@ class PullChart(Chart):
                 text(cr, f'{w} W', self.PL - 6, Y(w) - 7, 7.5, FAINT, align='right')
             w += step
         for t, _label, major in ticks(start, behind_end, X.now, self.ahead):
+            if self.labels and X.now and t > X.now:
+                continue  # Not behind the labels.
             cr.move_to(round(X(t)) + .5, self.TOP)
             cr.line_to(round(X(t)) + .5, height - 6)
             cr.set_source_rgba(*rgb(RULE, .55 if major else .3))
@@ -900,8 +921,11 @@ class PullChart(Chart):
         y = self.TOP + 2
         order = {name: i for i, name in enumerate(reversed(STACK))}
         rows = sorted(self.labels['rows'], key=lambda r: (order.get(r['layer'], 99), -r['watts']))
+        seen = {}
         for row in rows:
-            color = COLORS.get(row['layer'], COLORS['Other apps'])
+            # Apps sharing a layer (T3 Code and nix, both coding tools): each further one a lighter shade.
+            seen[row['layer']] = seen.get(row['layer'], -1) + 1
+            color = mix(COLORS.get(row['layer'], COLORS['Other apps']), BONE, min(.6, .3 * seen[row['layer']]))
             if row['layer'] in anchors:
                 ay = Y(anchors[row['layer']])
                 cr.move_to(anchor_x + 2, ay)
