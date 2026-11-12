@@ -192,7 +192,20 @@ workload, instead of by rule.
 nix develop                  # or any Python 3.14 with numpy, scipy (and PyGObject for the panel)
 python -m unittest discover -s tests -t .
 bash helper/test-helper.sh helper/drainhound-helper
-nix flake check              # the tests, the helper's tests and shellcheck, the NixOS module
+nix flake check              # the tests, the helper's tests and shellcheck, the NixOS module,
+                             # ruff and basedpyright, and the session tests
+```
+
+The session tests (`tests/test_session.py`) run drainhound in a desktop of its own:
+niri nested in a headless sway, with waybar running the bar modules, the panel
+opening and switching tabs, and niri's event stream read as the throttle reads it.
+Nothing reaches your own session. They need sway, niri, waybar, grim and foot, and
+run only when `DRAINHOUND_SESSION` names the drainhound to test:
+
+```sh
+nix build .#checks.x86_64-linux.session && ls result/   # in the sandbox; its screenshots
+nix build && DRAINHOUND_SESSION=$PWD/result/bin/drainhound DRAINHOUND_SESSION_SHOTS=/tmp/shots \
+  python -m unittest tests.test_session                 # here, keeping screenshots in /tmp/shots
 ```
 
 ## License

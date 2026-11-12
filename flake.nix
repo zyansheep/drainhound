@@ -49,6 +49,33 @@
           basedpyright --pythonpath ${python}/bin/python
           touch $out
         '';
+      # drainhound in a desktop of its own (tests/session.py): niri nested in a headless sway,
+      # drawn by Mesa on the CPU, with waybar running its modules and the panel opening.
+      # Its screenshots are the output: `nix build .#checks.<system>.session` and look.
+      session = let
+        python = (python3PackagesOf pkgs).python.withPackages (ps: [ps.numpy ps.scipy]);
+        # The fonts, and fontconfig's own rules (a sandbox has no /etc/fonts/conf.d): without
+        # them "sans-serif" is whichever font comes first.
+        fonts = pkgs.writeText "fonts.conf" ''
+          <?xml version="1.0"?>
+          <!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
+          <fontconfig>
+            <include>${pkgs.makeFontsConf {fontDirectories = with pkgs; [dejavu_fonts noto-fonts-color-emoji font-awesome];}}</include>
+            <include>${pkgs.fontconfig.out}/etc/fonts/conf.d</include>
+          </fontconfig>
+        '';
+      in
+        pkgs.runCommand "drainhound-session" {
+          nativeBuildInputs = with pkgs; [sway niri waybar grim foot dbus];
+        } ''
+          cp -r ${self} src && chmod -R u+w src && cd src
+          mkdir -p $out
+          export HOME=$TMPDIR XDG_RUNTIME_DIR=$TMPDIR PYTHONPATH=$PWD/src
+          export __EGL_VENDOR_LIBRARY_DIRS=${pkgs.mesa}/share/glvnd/egl_vendor.d LIBGL_DRIVERS_PATH=${pkgs.mesa}/lib/dri
+          export FONTCONFIG_FILE=${fonts}
+          export DRAINHOUND_SESSION=${drainhound}/bin/drainhound DRAINHOUND_SESSION_SHOTS=$out
+          ${python.interpreter} -m unittest -v tests.test_session
+        '';
       # The NixOS module evaluates, with the helper's sudo rule and suspend hooks.
       module = let
         system = nixpkgs.lib.nixosSystem {
