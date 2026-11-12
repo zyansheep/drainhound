@@ -46,5 +46,18 @@ drainhound = ["menu-theme.css"]
 line-length = 120
 target-version = "py314"
 
+[tool.ruff.lint]
+# Named rather than ruff's defaults, which change between versions. CI runs `ruff check`.
+select = ["E4", "E7", "E9", "F", "B"]
+# Lambdas bound to names and `a; b` lines are this code's style; zip(strict=) would change behaviour.
+ignore = ["E731", "E702", "B905"]
+
 [tool.ruff.format]
 quote-style = "single"
+
+[tool.basedpyright]
+# Type checking (CI: `basedpyright`, the flake's lint check). Errors the code had when this
+# was added are in .basedpyright/baseline.json; new ones fail. Fixing old ones shrinks it.
+include = ["src", "tests", "tools"]
+pythonVersion = "3.14"
+typeCheckingMode = "standard"

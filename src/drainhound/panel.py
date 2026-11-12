@@ -26,7 +26,7 @@ try:  # Optional: without it (or a compositor that has it) the panel is a normal
 except (ValueError, ImportError):
     GtkLayerShell = None
 
-from . import config
+from . import config  # noqa: E402
 from . import eta  # noqa: E402,F401 - first: it limits BLAS threads before numpy loads
 from . import experiment  # noqa: E402
 from . import qol  # noqa: E402
@@ -1537,7 +1537,7 @@ popover.hint > contents { background: @menu_card; color: @menu_fg; padding: 6px 
 """
 
 
-def stylesheet(theme=Path(__file__).with_name('menu-theme.css'), glyphs=None):
+def stylesheet(theme=Path(__file__).with_name('menu-theme.css'), glyphs=None):  # noqa: B008 (a constant)
     """PALETTE, then a theme's colours if there is one (a later @define-color wins), then the rules."""
     glyphs = config.get('waybar', 'glyphs') if glyphs is None else glyphs
     try:

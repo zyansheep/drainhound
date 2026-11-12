@@ -613,7 +613,7 @@ class TextTests(unittest.TestCase):
     def test_quarantine_is_read_from_the_runner_and_interactions_must_be_clear(self):
         for found, expected in (({'aspm': {'reason': 'xHCI controller died', 'since': 1.0, 'event': 1.0}},
                                  {'aspm': 'xHCI controller died'}), ({'apst': {}}, {'apst': ''}), (None, {})):
-            with mock.patch.object(experiment, 'preferences', lambda: {'quarantine': found}):
+            with mock.patch.object(experiment, 'preferences', lambda found=found: {'quarantine': found}):
                 self.assertEqual(panel_data.quarantined(), expected, found)
         # Only lever_effects' multiplicity-corrected `clear`: an interval that excludes 0 alone isn't enough.
         self.assertTrue(panel_data.interaction_clear({'watts_low': 0.1, 'watts_high': 0.4, 'p': 0.001, 'clear': True}))

@@ -109,7 +109,8 @@ class PowerTests(unittest.TestCase):
             self.assertEqual((values['max_mhz'], values['cpu_max_mhz'], values['gpu_dpm']), (2000, 4972, 'low'))
 
     def test_throttle_is_on_only_while_its_process_lives(self):
-        import json, os
+        import json
+        import os
         from drainhound.power import throttle_state
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'throttle.json'

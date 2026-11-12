@@ -39,6 +39,16 @@
         ${pkgs.bash}/bin/bash ${./helper/test-helper.sh} ${drainhound}/bin/drainhound-helper
         touch $out
       '';
+      # ruff, and basedpyright against the errors in .basedpyright/baseline.json: new ones fail.
+      lint = let
+        python = (python3PackagesOf pkgs).python.withPackages (ps: with ps; [numpy scipy pygobject3 pycairo pygobject-stubs]);
+      in
+        pkgs.runCommand "drainhound-lint" {nativeBuildInputs = [pkgs.ruff pkgs.basedpyright];} ''
+          cp -r ${self} src && chmod -R u+w src && cd src
+          ruff check --no-cache src tests tools
+          basedpyright --pythonpath ${python}/bin/python
+          touch $out
+        '';
       # The NixOS module evaluates, with the helper's sudo rule and suspend hooks.
       module = let
         system = nixpkgs.lib.nixosSystem {
@@ -76,7 +86,7 @@
     devShells = forAll (pkgs: {
       default = pkgs.mkShell {
         inputsFrom = [self.packages.${pkgs.stdenv.hostPlatform.system}.drainhound];
-        packages = [pkgs.ruff pkgs.shellcheck];
+        packages = [pkgs.ruff pkgs.shellcheck pkgs.basedpyright (python3PackagesOf pkgs).pygobject-stubs];
         shellHook = ''export PYTHONPATH=$PWD/src''${PYTHONPATH:+:$PYTHONPATH}'';
       };
     });

@@ -13,10 +13,10 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Pango", "1.0")
 gi.require_version("PangoCairo", "1.0")
-from gi.repository import Gtk, Pango, PangoCairo
+from gi.repository import Gtk, Pango, PangoCairo  # noqa: E402
 
-from . import report
-from .panel_data import (
+from . import report  # noqa: E402
+from .panel_data import (  # noqa: E402
     AHEAD,
     OFF_GAP,
     ahead_of,

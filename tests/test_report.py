@@ -683,7 +683,7 @@ def setting_minutes(blocks, seed, saves=None, names=('aspm', 'apst', 'wifi-ps', 
                - sum(saves.get(n, 0) * on for n, on in config.items()))
         if pair:
             bat -= pair[1] * all(config[n] for n in pair[0])
-        for i, m in enumerate(block_minutes(T0 + 240 * block, config, block, run=run, bat=0)):
+        for m in block_minutes(T0 + 240 * block, config, block, run=run, bat=0):
             m['bat'] = bat + rng.normal(0, .3)
             m['exp'][1], m['exp'][5] = '+'.join(names), None
             m['set'] = dict(m['set'], abm=3 if config.get('abm') else 0)
