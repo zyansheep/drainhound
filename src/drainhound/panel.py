@@ -1559,6 +1559,12 @@ def main(argv):
         os.environ['LD_PRELOAD'] = os.environ.pop('DRAINHOUND_PRELOADED', os.environ.get('LD_PRELOAD', ''))
         if not os.environ['LD_PRELOAD']:
             del os.environ['LD_PRELOAD']
+        # No display to show on: fail, for the unit to restart once there is one. The
+        # app would otherwise hold itself and wait forever, its startup failed. (PyGObject's
+        # Gtk.init_check() says True without one: it was tried on import.)
+        if Gdk.Display.get_default() is None:
+            print('drainhound panel: no display to open (WAYLAND_DISPLAY, DISPLAY)', file=sys.stderr)
+            return 1
         # Hidden until toggled (the unit's ExecStart); --open shows it at once, on TAB if given.
         app = BatteryPanel()
         if argv[1:2] == ['--open']:
