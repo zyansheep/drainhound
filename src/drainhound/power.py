@@ -750,7 +750,7 @@ class GpuClients:
     def fd_count(self, pid):
         """Open fds: /proc/PID/fd's size (Linux 6.2+; 0 before, which leaves the periodic rescan)."""
         try:
-            return os.stat(self.proc / str(pid) / 'fd').st_size
+            return os.stat(f'{self.proc}/{pid}/fd').st_size
         except OSError:
             return None
 
@@ -843,8 +843,8 @@ def process_io(proc, keys):
     for key in keys:
         try:
             counters = {}
-            with open(proc / str(key[0]) / 'io') as source:
-                for line in source:
+            with open(f'{proc}/{key[0]}/io', 'rb', buffering=0) as source:
+                for line in source.read().decode().splitlines():
                     name, _, value = line.partition(':')
                     if name in ('read_bytes', 'write_bytes'):
                         counters['io_r' if name == 'read_bytes' else 'io_w'] = int(value)
@@ -1408,7 +1408,7 @@ class Monitor:
         gpu = self.gpu.sample(boot, processes)
         io = self.io.sample(boot, process_io(self.proc, processes), apps_of)
         apps = collections.defaultdict(dict)
-        for key, entry in processes.items():
+        for entry in processes.values():
             app = apps[entry[3]]
             app['n'] = app.get('n', 0) + 1
             app['rss'] = app.get('rss', 0) + entry[2] / 2**20

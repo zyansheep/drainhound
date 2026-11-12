@@ -45,6 +45,39 @@ class MonitorTests(unittest.TestCase):
                 (directory / 'cmdline').write_bytes(cmdline)
             self.assertEqual(processes(root)[(51, 100)][3], 'Vesktop')
 
+    def test_identities_are_cached_once_settled_and_reread_after_an_exec(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            directory = root / '60'
+            directory.mkdir()
+            fields = ['0'] * 22
+            fields[0], fields[1], fields[19], fields[21] = 'S', '1', str(100 * TICKS), '4'  # Started at 100 s.
+
+            def run(comm, cmdline, now):
+                (directory / 'stat').write_text(f'60 ({comm}) ' + ' '.join(fields))
+                (directory / 'cmdline').write_bytes(cmdline)
+                return processes(root, cache=cache, now=now)[(60, 100 * TICKS)][0]
+
+            (directory / 'exe').symlink_to('/nix/store/example-electron/bin/electron')
+            cache = {}
+            # Just forked from a zygote: not cached until its --type= has had time to settle.
+            self.assertEqual(run('electron', b'electron\0--type=zygote\0', 100.2), 'Electron · process launcher')
+            self.assertEqual(cache, {})
+            self.assertEqual(run('electron', b'electron\0--type=renderer\0', 102), 'Electron · renderer')
+            self.assertEqual(cache, {(60, 100 * TICKS, 'electron'): ('Electron', 'renderer')})
+            # Cached: the files aren't read again.
+            self.assertEqual(run('electron', b'electron\0--type=utility\0', 104), 'Electron · renderer')
+            # An exec changes the comm, so the identity is read again; the old one goes.
+            (directory / 'exe').unlink()
+            (directory / 'exe').symlink_to('/nix/store/example-floorp/bin/.floorp-wrapped')
+            self.assertEqual(run('.floorp-wrapped', b'', 106), 'Floorp')
+            self.assertEqual(list(cache), [(60, 100 * TICKS, '.floorp-wrapped')])
+            # Exited processes are forgotten.
+            for name in ('stat', 'cmdline', 'exe'):
+                (directory / name).unlink()
+            processes(root, cache=cache, now=108)
+            self.assertEqual(cache, {})
+
     def test_browser_ancestry_when_executable_links_are_inaccessible(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)
@@ -141,6 +174,24 @@ class MonitorTests(unittest.TestCase):
             (chip/'temp1_input').write_text('42000');(chip/'temp1_label').write_text('Package')
             (chip/'temp2_input').write_text('invalid')
             self.assertEqual(temperatures(root,root), [{'name':'cpu · Package','value':'42.0 °C'}])
+
+    def test_sensors_are_looked_for_once_a_minute_and_read_every_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            chip = root / 'hwmon0'; chip.mkdir(); (chip / 'name').write_text('cpu')
+            (chip / 'temp1_input').write_text('42000'); (chip / 'temp1_label').write_text('Package')
+            clock = [0.0]
+            readings = collector.Temperatures(clock=lambda: clock[0], hwmon=root, thermal=root)
+            self.assertEqual(readings(), [{'name': 'cpu · Package', 'value': '42.0 °C'}])
+            (chip / 'temp1_input').write_text('43500')
+            other = root / 'hwmon1'; other.mkdir(); (other / 'name').write_text('nvme')
+            (other / 'temp1_input').write_text('30000')
+            clock[0] = 59
+            self.assertEqual(readings(), [{'name': 'cpu · Package', 'value': '43.5 °C'}])  # New value, same sensors.
+            clock[0] = 60
+            self.assertEqual([r['name'] for r in readings()], ['cpu · Package', 'nvme · temp1'])
+            (chip / 'temp1_input').unlink()  # A sensor that went away is skipped until the next look.
+            self.assertEqual([r['name'] for r in readings()], ['nvme · temp1'])
 
     def test_power_log_groups_kernel_threads_and_drops_browser_detail(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -2,6 +2,7 @@
 """Bounded, local cache for Waybar's native hover panels; no command lines stored."""
 import collections
 import fcntl
+import functools
 import json
 import os
 from pathlib import Path
@@ -70,21 +71,22 @@ ELECTRON_APPS = ('vesktop', 'discord', 'obsidian', 't3code', 'codium', 'vscodium
 
 
 def executable_name(value):
-    name = Path(value).name.removesuffix(' (deleted)').lstrip('.')
+    # String operations, not pathlib: this runs about three times per process per scan.
+    name = value.rpartition('/')[2].removesuffix(' (deleted)').lstrip('.')
     return name.removesuffix('-wrapped')
 
 
 def process_identity(directory, comm):
     """Read only identity metadata. Arguments are never retained in the cache."""
     try:
-        exe = executable_name(str((directory / 'exe').readlink()))
+        exe = executable_name(os.readlink(os.path.join(directory, 'exe')))
     except OSError:
         exe = executable_name(comm)
     app = APP_NAMES.get(exe.lower())
     args = []
     if exe.lower().startswith('electron') or app in CHROMIUMS:
         try:
-            with (directory / 'cmdline').open('rb') as command:
+            with open(os.path.join(directory, 'cmdline'), 'rb') as command:
                 args = command.read(16384).decode(errors='replace').split('\0')
         except OSError:
             pass
@@ -124,27 +126,57 @@ def process_label(pid, comm, app, role):
     return app or APP_NAMES.get(executable_name(comm).lower(), executable_name(comm))
 
 
-def processes(root=Path('/proc')):
+SETTLED = 1.0  # Seconds after its start before a process's identity is cached.
+
+
+def read_small(path):
+    """A small /proc or /sys file in one read, without a buffered text file: half the cost,
+    for every process and sensor every scan."""
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        return os.read(descriptor, 4096).decode(errors='replace')
+    finally:
+        os.close(descriptor)
+
+
+def processes(root=Path('/proc'), cache=None, now=None):
+    """Every process: {(pid, start): (label, cpu seconds, rss, coarse app)}. With `cache`
+    (a dict kept between scans), a process's identity is read once: an exec changes
+    its comm, which is in the key, and one younger than SETTLED is read again (a
+    zygote's child rewrites its --type= just after the fork)."""
     result = {}
     metadata = {}
-    for directory in root.iterdir():
-        if not directory.name.isdecimal():
-            continue
+    alive = set()
+    now = time.clock_gettime(time.CLOCK_BOOTTIME) if now is None else now
+    with os.scandir(root) as entries:
+        listing = [entry for entry in entries if entry.name.isdecimal()]
+    for entry in listing:
         try:
-            stat = (directory / 'stat').read_text()
+            stat = read_small(f'{entry.path}/stat')
             # comm may contain spaces and parentheses; fields after its final ')'
             # begin with field 3 (state).
             end = stat.rindex(')')
             fields = stat[end + 2:].split()
             name = stat[stat.index('(') + 1:end]
-            start = int(fields[19])
-            app, role = process_identity(directory, name)
-            metadata[int(directory.name)] = (int(fields[1]), app, role, name)
-            result[(int(directory.name), start)] = (
+            pid, start = int(entry.name), int(fields[19])
+            key = (pid, start, name)
+            if cache is not None and key in cache:
+                identity = cache[key]
+            else:
+                identity = process_identity(entry.path, name)
+                if cache is not None and now - start / TICKS >= SETTLED:
+                    cache[key] = identity
+            alive.add(key)
+            app, role = identity
+            metadata[pid] = (int(fields[1]), app, role, name)
+            result[(pid, start)] = (
                 name, (int(fields[11]) + int(fields[12])) / TICKS,
                 max(0, int(fields[21])) * PAGE)
         except (OSError, ValueError, IndexError):
             continue  # Exited process or inaccessible task; never fail the sample.
+    if cache is not None:  # Forget exited processes.
+        for key in cache.keys() - alive:
+            del cache[key]
     def application(pid, seen=None):
         seen = set() if seen is None else seen
         if pid in seen or pid not in metadata or len(seen) > 12:
@@ -168,7 +200,8 @@ def processes(root=Path('/proc')):
     return result
 
 
-def temperatures(hwmon=Path('/sys/class/hwmon'), thermal=Path('/sys/class/thermal')):
+def find_sensors(hwmon=Path('/sys/class/hwmon'), thermal=Path('/sys/class/thermal')):
+    """Every temperature sensor: [(name, file in millidegrees)]."""
     result = []
     for directory in sorted(hwmon.glob('hwmon*')):
         try:
@@ -176,23 +209,47 @@ def temperatures(hwmon=Path('/sys/class/hwmon'), thermal=Path('/sys/class/therma
         except OSError:
             chip = directory.name
         for sensor in sorted(directory.glob('temp*_input')):
+            label = sensor.with_name(sensor.name.replace('_input', '_label'))
             try:
-                value = float(sensor.read_text()) / 1000
-                label = sensor.with_name(sensor.name.replace('_input', '_label'))
                 name = label.read_text().strip() if label.exists() else sensor.stem.replace('_input', '')
-                if -273.15 < value < 300:
-                    result.append({'name': f'{chip} · {name}', 'value': f'{value:.1f} °C'})
-            except (OSError, ValueError):
+            except OSError:
                 continue
+            result.append((f'{chip} · {name}', sensor))
     for zone in sorted(thermal.glob('thermal_zone*')):
         try:
-            value = float((zone / 'temp').read_text()) / 1000
-            if -273.15 < value < 300:
-                result.append({'name': f"{(zone / 'type').read_text().strip()} · {zone.name}",
-                               'value': f'{value:.1f} °C'})
-        except (OSError, ValueError):
+            result.append((f"{(zone / 'type').read_text().strip()} · {zone.name}", zone / 'temp'))
+        except OSError:
             continue
     return result
+
+
+def temperatures(hwmon=Path('/sys/class/hwmon'), thermal=Path('/sys/class/thermal'), found=None):
+    """The sensors' readings (of `found`, else of every sensor there is now)."""
+    result = []
+    for name, path in find_sensors(hwmon, thermal) if found is None else found:
+        try:
+            value = float(read_small(path)) / 1000
+        except (OSError, ValueError):
+            continue
+        if -273.15 < value < 300:
+            result.append({'name': name, 'value': f'{value:.1f} °C'})
+    return result
+
+
+class Temperatures:
+    """temperatures() with the sensors looked for once a minute, not every scan:
+    the globs and labels cost most of the reading."""
+    REFRESH = 60
+
+    def __init__(self, clock=time.monotonic, **roots):
+        self.clock, self.roots = clock, roots
+        self.found, self.since = None, None
+
+    def __call__(self):
+        now = self.clock()
+        if self.found is None or now - self.since >= self.REFRESH:
+            self.found, self.since = find_sensors(**self.roots), now
+        return temperatures(found=self.found)
 
 
 class History:
@@ -337,10 +394,12 @@ def main(argv=()):
     power = Monitor(log, experiment=directory / 'experiment.json', throttle=directory / 'throttle.json')
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     history = History()
+    scan = functools.partial(processes, cache={})  # Identities, kept between scans.
+    readings = Temperatures()
     try:
         while True:
             began = time.clock_gettime(time.CLOCK_BOOTTIME)
-            if collect(power, history, directory, began) is not None:
+            if collect(power, history, directory, began, scan=scan, sensors=readings) is not None:
                 power.maintain()  # Deferred database work (a migration's recompute), a piece per loop.
             # Battery current and chip power change faster than the process scan.
             while (remaining := began + 2 - time.clock_gettime(time.CLOCK_BOOTTIME)) > .1:
