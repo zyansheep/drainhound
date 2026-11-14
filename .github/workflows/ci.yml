@@ -36,7 +36,7 @@ jobs:
       # The session check's screenshots (already built by the flake check), to see the panel and waybar
       # without building them. Only from a passing check: Nix keeps no output of a failed one.
       - run: nix build .#checks.x86_64-linux.session -o session && cp -rL session screenshots
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v6
         with:
           name: session-screenshots
           path: screenshots
