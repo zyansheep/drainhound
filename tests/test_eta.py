@@ -704,8 +704,8 @@ class EtaTests(unittest.TestCase):
 
     def test_the_last_minutes_count_down_to_the_second_and_warn(self):
         battery(self.root, **dict(LOW, charge_now=80000, capacity=3))
-        notes, clock = [], Clock()
-        live = make_live(self.root, clock, notify=lambda *note: notes.append(note))
+        notes, closed, clock = [], [], Clock()
+        live = make_live(self.root, clock, notify=lambda *note: notes.append(note) or len(notes), close=closed.append)
         live.params = dict(self.params, volts=[13.8] * 101, cutoff=0.056, cutoff_spread=0.0018)
         # Two minutes of the gauge falling 0.2 mAh/s, to 80 mAh now: 120 s to the cutoff.
         for i in range(60, 0, -1):
@@ -726,7 +726,10 @@ class EtaTests(unittest.TestCase):
         self.assertEqual((gasp['boot'], gasp['charge'], gasp['t']), ('cc72fcaf', 0.08, clock.t))
         (self.root / 'class/power_supply/BAT1/status').write_text('Charging')
         live.estimate()
-        self.assertFalse((self.root / 'lastgasp.json').exists())       # Plugged in: not a death.
+        self.assertFalse((self.root / 'lastgasp.json').exists())       # Plugged in: not a death,
+        self.assertEqual(closed, [1])                                  # and the warning comes down,
+        live.estimate()
+        self.assertEqual(closed, [1])                                  # once.
 
     def test_below_low_battery_the_gauge_times_the_warnings(self):
         # The gauge falls 0.12 mAh/s while the current says half that (it falls faster near empty).

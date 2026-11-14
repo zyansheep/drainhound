@@ -1190,7 +1190,7 @@ class Live:
 
     def __init__(self, sys_root=Path('/sys'), proc=Path('/proc'), gasp=None, notify=None, poweroff=None,
                  deaths=None, models=None, db=None, runtime=None, endings=None, clock=time.time, monotonic=boottime,
-                 allow_poweroff=None, allow_notify=None):
+                 allow_poweroff=None, allow_notify=None, close=None):
         self.supplies = sys_root / 'class/power_supply'
         self.absent, self.unit, self.nominal = False, None, None  # The battery's unit and voltage_min_design, once read.
         # The batteries the samples are of: (names, unit); None before the first reading, () with none.
@@ -1204,6 +1204,8 @@ class Live:
         self.allow_poweroff = battery_switch('poweroff') if allow_poweroff is None else allow_poweroff
         self.allow_notify = battery_switch('notify') if allow_notify is None else allow_notify
         self.notify, self.warned = notify or send_notification, set()
+        # What notify returned for each notification still up, for close to take down on a plug-in.
+        self.close, self.shown = close or close_notification, []
         self.poweroff, self.due, self.powering_off, self.retry_at = poweroff or power_off, None, False, 0.0
         self.last, self.low, self.complaints = None, False, set()
         self.mains_since = None  # Boot time mains came online while the battery went on discharging.
@@ -1414,8 +1416,12 @@ class Live:
             self.complain('last gasp', error)
 
     def clear_gasp(self):
-        """Plugged in: not a death, and the warnings start over."""
+        """Plugged in: not a death, the warnings start over, and those still up
+        (critical: they stay until dismissed) come down."""
         self.warned.clear()
+        for shown in self.shown:
+            self.close(shown)
+        self.shown.clear()
         self.due, self.powering_off = None, False
         self.gasp.unlink(missing_ok=True)
 
@@ -1427,8 +1433,8 @@ class Live:
 
     def say(self, title, body):
         """A desktop notification, unless [battery] notify is off."""
-        if self.allow_notify:
-            self.notify(title, body)
+        if self.allow_notify and (shown := self.notify(title, body)) is not None:
+            self.shown.append(shown)
 
     def warn(self, early, likely, weak=False):
         """A notification as the early edge of the end (`early` s away; `likely` its
@@ -1744,11 +1750,29 @@ def battery_switch(key):
 
 
 def send_notification(title, body):
+    """A critical notification, without waiting on it: the notify-send printing
+    its id (for close_notification), or None if it didn't start."""
     try:
-        subprocess.Popen(['notify-send', '-u', 'critical', '-a', 'Battery', '-i', 'battery-empty', title, body],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return subprocess.Popen(['notify-send', '-p', '-u', 'critical', '-a', 'Battery', '-i', 'battery-empty',
+                                 title, body], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
     except OSError as error:
         print(f'drainhound eta: notify-send: {error}', file=sys.stderr)
+        return None
+
+
+def close_notification(sent, timeout=2):
+    """Take down a notification send_notification put up (already dismissed: nothing happens)."""
+    try:
+        ident = int(sent.communicate(timeout=timeout)[0].split()[0])
+    except (subprocess.SubprocessError, ValueError, IndexError):
+        sent.kill()
+        return
+    try:
+        subprocess.run(['busctl', '--user', 'call', 'org.freedesktop.Notifications', '/org/freedesktop/Notifications',
+                        'org.freedesktop.Notifications', 'CloseNotification', 'u', str(ident)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as error:
+        print(f'drainhound eta: closing a notification: {error}', file=sys.stderr)
 
 
 def single_instance(path):
