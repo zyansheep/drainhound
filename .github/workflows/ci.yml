@@ -3,12 +3,21 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
+# A new push to a pull request cancels its older run; pushes to a branch never cancel each other.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   python:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.14"
       - run: pip install numpy scipy
@@ -19,7 +28,16 @@ jobs:
 
   nix:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: cachix/install-nix-action@v31
       - run: nix flake check -L
+      # The session check's screenshots (already built by the flake check), to see the panel and waybar
+      # without building them. Only from a passing check: Nix keeps no output of a failed one.
+      - run: nix build .#checks.x86_64-linux.session -o session && cp -rL session screenshots
+      - uses: actions/upload-artifact@v5
+        with:
+          name: session-screenshots
+          path: screenshots
+          if-no-files-found: error
